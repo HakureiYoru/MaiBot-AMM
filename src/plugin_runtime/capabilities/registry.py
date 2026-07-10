@@ -109,4 +109,6 @@ def register_capability_impls(manager: "PluginRuntimeManager", supervisor: "Plug
     _register("statistics.local.tool_trend", manager._cap_statistics_local_tool_trend)
     _register("statistics.local.online_time_trend", manager._cap_statistics_local_online_time_trend)
     _register("render.html2png", manager._cap_render_html2png)
+    _register("mcp.call", manager._cap_mcp_call)
+    _register("mcp.list_tools", manager._cap_mcp_list_tools)
     logger.debug("已注册全部主程序能力实现")

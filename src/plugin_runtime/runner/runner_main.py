@@ -756,6 +756,7 @@ class PluginRunner:
         )
         self._warn_legacy_plugin_data_dir(plugin_id, plugin_dir, plugin_paths.data_dir)
         self._ensure_context_llm_helpers(ctx)
+        self._ensure_context_mcp_helpers(ctx)
         cast(_ContextAwarePlugin, instance)._set_context(ctx)
         logger.debug(f"已为插件 {plugin_id} 注入 PluginContext")
 
@@ -853,6 +854,35 @@ class PluginRunner:
             return await ctx.call_capability("llm.transcribe_audio", **payload)
 
         llm_proxy.transcribe_audio = _transcribe_audio
+
+    @staticmethod
+    def _ensure_context_mcp_helpers(ctx: Any) -> None:
+        """为旧版 SDK 的 MCP 代理补齐 call / list_tools 便捷方法。"""
+
+        if getattr(ctx, "mcp", None) is not None:
+            return
+
+        class _MCPProxy:
+            def __init__(self, context: Any) -> None:
+                self._ctx = context
+
+            async def call(
+                self,
+                tool_name: str,
+                arguments: Dict[str, Any] | None = None,
+                **kwargs: Any,
+            ) -> Any:
+                payload = dict(arguments or kwargs)
+                return await self._ctx.call_capability(
+                    "mcp.call",
+                    tool_name=tool_name,
+                    arguments=payload,
+                )
+
+            async def list_tools(self) -> Any:
+                return await self._ctx.call_capability("mcp.list_tools")
+
+        ctx.mcp = _MCPProxy(ctx)
 
     def _apply_plugin_config(self, meta: PluginMeta, config_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """在 Runner 侧为插件实例注入当前插件配置。

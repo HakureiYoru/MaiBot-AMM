@@ -41,6 +41,7 @@ from src.plugin_runtime.capabilities import (
     RuntimeComponentCapabilityMixin,
     RuntimeCoreCapabilityMixin,
     RuntimeDataCapabilityMixin,
+    RuntimeMCPCapabilityMixin,
     RuntimeRenderCapabilityMixin,
 )
 from src.plugin_runtime.capabilities.registry import register_capability_impls
@@ -85,6 +86,7 @@ class PluginRuntimeManager(
     RuntimeCoreCapabilityMixin,
     RuntimeDataCapabilityMixin,
     RuntimeComponentCapabilityMixin,
+    RuntimeMCPCapabilityMixin,
     RuntimeRenderCapabilityMixin,
 ):
     """插件运行时管理器（单例）
@@ -116,6 +118,8 @@ class PluginRuntimeManager(
             lambda: self.supervisors,
             hook_spec_registry=self._hook_spec_registry,
         )
+        self._plugin_mcp_manager = None
+        self._plugin_mcp_lock = asyncio.Lock()
 
     async def _dispatch_platform_inbound(self, envelope: InboundMessageEnvelope) -> None:
         """接收 Platform IO 审核后的入站消息并送入主消息链。
@@ -650,6 +654,7 @@ class PluginRuntimeManager(
                 logger.info("插件运行时已停止")
         finally:
             await self._hook_dispatcher.stop()
+            await self._close_plugin_mcp_manager()
             self._started = False
             self._builtin_supervisor = None
             self._third_party_supervisor = None
