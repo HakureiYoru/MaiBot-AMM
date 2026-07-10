@@ -516,8 +516,9 @@ class ComponentQueryService:
                 "matched_groups": matched_groups if isinstance(matched_groups, dict) else {},
             }
             if message is not None:
+                # 命令可能需要转发同条消息里的图片/表情，保留二进制或 hash 回读信息
                 invoke_args["message"] = dict(
-                    PluginMessageUtils._session_message_to_dict(message, include_binary_data=False)
+                    PluginMessageUtils._session_message_to_dict(message, include_binary_data=True)
                 )
             if isinstance(plugin_config, dict):
                 invoke_args["plugin_config"] = plugin_config

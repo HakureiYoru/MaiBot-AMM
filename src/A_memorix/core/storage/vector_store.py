@@ -24,7 +24,7 @@ except ImportError:
 
 from src.common.logger import get_logger
 from ..utils.quantization import QuantizationType
-from ..utils.io import atomic_write, atomic_save_path
+from ..utils.io import atomic_save_path, atomic_write, call_with_ascii_path
 
 logger = get_logger("A_Memorix.VectorStore")
 
@@ -847,7 +847,8 @@ class VectorStore:
             if self._is_trained:
                 if idx_path.exists():
                     try:
-                        self._index = faiss.read_index(str(idx_path))
+                        # Windows 下 FAISS C API 无法打开含非 ASCII 的路径，需经 ASCII 临时目录桥接
+                        self._index = call_with_ascii_path(idx_path, faiss.read_index)
                         if not isinstance(self._index, faiss.IndexIDMap2):
                             logger.warning("Loaded index type mismatch. Rebuilding...")
                             self._init_index()

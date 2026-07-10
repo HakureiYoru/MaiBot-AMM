@@ -4,11 +4,37 @@ IO Utilities
 提供原子文件写入等IO辅助功能。
 """
 
+from pathlib import Path
+from typing import Callable, TypeVar, Union
+
+import contextlib
 import os
 import shutil
-import contextlib
-from pathlib import Path
-from typing import Union
+import tempfile
+
+_T = TypeVar("_T")
+
+
+def _path_needs_ascii_bridge(path: Path) -> bool:
+    """FAISS 等 C API 在 Windows 上无法可靠打开含非 ASCII 字符的路径。"""
+    try:
+        os.fsdecode(os.fsencode(str(path))).encode("ascii")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+def _replace_file(src: Path, dst: Path) -> None:
+    """尽量原子替换；跨卷时回退到 copy+remove。"""
+    try:
+        os.replace(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+        try:
+            os.remove(src)
+        except OSError:
+            pass
+
 
 @contextlib.contextmanager
 def atomic_write(file_path: Union[str, Path], mode: str = "w", encoding: str = None, **kwargs):
@@ -58,6 +84,9 @@ def atomic_write(file_path: Union[str, Path], mode: str = "w", encoding: str = N
 def atomic_save_path(file_path: Union[str, Path]):
     """
     提供临时路径用于原子保存 (针对只接受路径的API，如Faiss)
+
+    若目标路径含非 ASCII 字符（常见于 Windows 中文目录），临时文件会写到
+    系统 ASCII 临时目录，再搬回目标路径，避免 FAISS C API 打不开文件。
     
     Args:
         file_path: 最终目标路径
@@ -67,13 +96,19 @@ def atomic_save_path(file_path: Union[str, Path]):
     """
     path = Path(file_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
+
+    bridge_dir = None
+    if _path_needs_ascii_bridge(path):
+        bridge_dir = tempfile.mkdtemp(prefix="faiss_io_")
+        tmp_path = Path(bridge_dir) / f"{path.name}.tmp"
+    else:
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
     
     try:
         yield str(tmp_path)
         
         if Path(tmp_path).exists():
-            os.replace(tmp_path, path)
+            _replace_file(Path(tmp_path), path)
             
     except Exception as e:
         if Path(tmp_path).exists():
@@ -82,3 +117,25 @@ def atomic_save_path(file_path: Union[str, Path]):
             except:
                 pass
         raise e
+    finally:
+        if bridge_dir is not None:
+            shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+def call_with_ascii_path(file_path: Union[str, Path], reader: Callable[[str], _T]) -> _T:
+    """
+    对只接受路径字符串的 C API（如 faiss.read_index）做非 ASCII 路径桥接。
+
+    路径可被 ASCII 编码时直接调用；否则先复制到系统临时目录再读。
+    """
+    path = Path(file_path)
+    if not _path_needs_ascii_bridge(path):
+        return reader(str(path))
+
+    bridge_dir = tempfile.mkdtemp(prefix="faiss_io_")
+    try:
+        tmp_path = Path(bridge_dir) / path.name
+        shutil.copy2(path, tmp_path)
+        return reader(str(tmp_path))
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)

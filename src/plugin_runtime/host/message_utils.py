@@ -182,11 +182,18 @@ class PluginMessageUtils:
             from src.common.database.database_model import Images, ImageType
             from src.common.utils.image_path import resolve_stored_image_path
 
-            target_image_type = ImageType.IMAGE if image_type == "image" else ImageType.EMOJI
+            # 优先按组件声明类型查；查不到再回退另一类（QQ 表情有时被记成 image/emoji 不一致）
+            primary_type = ImageType.IMAGE if image_type == "image" else ImageType.EMOJI
+            fallback_type = ImageType.EMOJI if primary_type == ImageType.IMAGE else ImageType.IMAGE
             with get_db_session(auto_commit=False) as db:
-                statement = select(Images).filter_by(image_hash=binary_hash, image_type=target_image_type).limit(1)
-                image_record = db.exec(statement).first()
-            if image_record is None or image_record.no_file_flag:
+                image_record = None
+                for candidate_type in (primary_type, fallback_type):
+                    statement = select(Images).filter_by(image_hash=binary_hash, image_type=candidate_type).limit(1)
+                    image_record = db.exec(statement).first()
+                    if image_record is not None and not image_record.no_file_flag:
+                        break
+                    image_record = None
+            if image_record is None:
                 return ""
 
             image_path = resolve_stored_image_path(image_record.full_path)
