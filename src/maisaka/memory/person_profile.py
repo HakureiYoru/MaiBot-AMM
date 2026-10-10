@@ -11,6 +11,7 @@ from src.common.data_models.message_component_data_model import AtComponent, Rep
 from src.common.logger import get_logger
 from src.config.config import global_config
 from src.person_info.person_info import resolve_person_id_for_memory
+from src.services.bot_account_service import is_bot_self
 from src.services.memory_service import memory_service
 
 logger = get_logger("maisaka_person_profile_injector")
@@ -41,9 +42,8 @@ def _candidate_name(*values: object) -> str:
     return ""
 
 
-def _is_bot_user_id(user_id: str) -> bool:
-    bot_user_id = _clean_text(getattr(global_config.bot, "qq_account", ""))
-    return bool(user_id and bot_user_id and user_id == bot_user_id)
+def _is_bot_user_id(platform: str, user_id: str) -> bool:
+    return is_bot_self(platform, user_id)
 
 
 def _resolve_candidate(
@@ -56,7 +56,7 @@ def _resolve_candidate(
     clean_platform = _clean_text(platform)
     clean_user_id = _clean_text(user_id)
     clean_person_name = _clean_text(person_name)
-    if _is_bot_user_id(clean_user_id):
+    if _is_bot_user_id(clean_platform, clean_user_id):
         return None
 
     try:
@@ -70,7 +70,9 @@ def _resolve_candidate(
         else:
             person_id = ""
     except Exception as exc:
-        logger.debug(f"解析人物画像候选失败: source={source} user_id={clean_user_id!r} name={clean_person_name!r} err={exc}")
+        logger.debug(
+            f"解析人物画像候选失败: source={source} user_id={clean_user_id!r} name={clean_person_name!r} err={exc}"
+        )
         return None
 
     if not person_id:
@@ -213,6 +215,10 @@ def _format_profile_reference_block(blocks: Sequence[str]) -> str:
     )
 
 
+def _format_profile_person_block(display_name: str, profile_text: str) -> str:
+    return f"{display_name}：\n  {_truncate_profile_text(profile_text)}"
+
+
 async def build_person_profile_injection_messages(
     *,
     anchor_message: SessionMessage,
@@ -236,6 +242,11 @@ async def build_person_profile_injection_messages(
     if not candidates:
         return []
 
+    context_text = "\n".join(
+        str(message.processed_plain_text or "").strip()
+        for message in [anchor_message, *(pending_messages or ())]
+        if str(message.processed_plain_text or "").strip()
+    )[:1000]
     blocks: list[str] = []
     for candidate in candidates:
         try:
@@ -243,6 +254,7 @@ async def build_person_profile_injection_messages(
                 action="query",
                 person_id=candidate.person_id,
                 limit=PROFILE_QUERY_LIMIT,
+                context_text=context_text,
             )
         except Exception as exc:
             logger.debug(f"查询人物画像注入内容失败: person_id={candidate.person_id!r} err={exc}")
@@ -253,16 +265,20 @@ async def build_person_profile_injection_messages(
             logger.debug(f"人物画像注入跳过: person_id={candidate.person_id!r} error={error}")
             continue
 
-        profile_text = build_profile_injection_text(_extract_profile_text(payload))
+        uncertain_candidates = [
+            str(item.get("text", "")) for item in payload.get("uncertain_candidates", []) if isinstance(item, dict)
+        ]
+        profile_text = build_profile_injection_text(
+            _extract_profile_text(payload),
+            uncertain_candidates=uncertain_candidates,
+            include_uncertain_fallback=False,
+        )
         if not profile_text:
             logger.debug(f"人物画像注入跳过空画像: person_id={candidate.person_id!r}")
             continue
 
         display_name = _profile_display_name(candidate, payload)
-        blocks.append(
-            f"- {display_name}（person_id: {candidate.person_id}，来源: {candidate.source}）\n"
-            f"  {_truncate_profile_text(profile_text)}"
-        )
+        blocks.append(_format_profile_person_block(display_name, profile_text))
 
     reference_block = _format_profile_reference_block(blocks)
     return [reference_block] if reference_block else []

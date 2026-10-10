@@ -3,7 +3,7 @@
  *
  * 管理 WebSocket 订阅与事件流的状态。
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useSyncExternalStore } from 'react'
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 
 import type { MaisakaMonitorEvent } from '@/lib/maisaka-monitor-client'
@@ -13,6 +13,8 @@ import { maisakaMonitorClient } from '@/lib/maisaka-monitor-client'
 export interface TimelineEntry {
   /** 唯一 ID */
   id: string
+  /** 后端事件账本 ID */
+  eventId?: number
   /** 事件类型 */
   type: MaisakaMonitorEvent['type']
   /** 原始事件数据 */
@@ -51,9 +53,9 @@ const MAX_TIMELINE_ENTRIES = 3000
 /** IndexedDB 中最多持久化的时间线条目数。 */
 const MAX_PERSISTED_TIMELINE_ENTRIES = 10000
 const PERSIST_PRUNE_INTERVAL = 200
-const BACKGROUND_COLLECTION_STORAGE_KEY = 'maisaka-monitor-background-collection'
+const LAST_EVENT_ID_STORAGE_KEY = 'maisaka-monitor-last-event-id'
 const MONITOR_DB_NAME = 'maisaka-monitor-db'
-const MONITOR_DB_VERSION = 1
+const MONITOR_DB_VERSION = 2
 
 function resolveSessionDisplayName({
   fallbackName,
@@ -88,16 +90,24 @@ function resolveSessionDisplayName({
 
 let entryCounter = 0
 let cachedTimeline: TimelineEntry[] = []
+const emptyTimeline: TimelineEntry[] = []
+const timelinesBySession = new Map<string, TimelineEntry[]>()
+const entriesById = new Map<string, TimelineEntry>()
+const messageEntryIds = new Map<string, string>()
+const plannerEntryIds = new Map<string, string>()
+let cachedLatestMessages = new Map<string, TimelineEntry>()
 let cachedSessions: Map<string, SessionInfo> = new Map()
 let cachedStageStatuses: Map<string, StageStatusInfo> = new Map()
 let cachedSelectedSession: string | null = null
+let cachedLastEventId = loadLastEventIdFromStorage()
+let cachedSeenEventIds = new Set<number>()
 let cachedConnected = false
-let backgroundCollectionEnabled = false
-let backgroundCollectionPreferenceLoaded = false
 let activeConsumerCount = 0
 let monitorSubscriptionStarted = false
 let monitorSubscriptionPromise: Promise<void> | null = null
 let monitorUnsubscribe: (() => Promise<void>) | null = null
+let monitorConnectionUnsubscribe: (() => void) | null = null
+let monitorInitialSyncPending = false
 const storeListeners = new Set<() => void>()
 let persistSnapshotTimer: ReturnType<typeof setTimeout> | null = null
 let monitorDbPromise: Promise<IDBPDatabase<MaisakaMonitorDb>> | null = null
@@ -134,6 +144,27 @@ interface MaisakaMonitorDb extends DBSchema {
   }
 }
 
+maisakaMonitorClient.setInitialReplayCursor(cachedLastEventId)
+
+function loadLastEventIdFromStorage() {
+  if (typeof window === 'undefined') {
+    return 0
+  }
+  const rawValue = window.localStorage.getItem(LAST_EVENT_ID_STORAGE_KEY)
+  if (!rawValue) {
+    return 0
+  }
+  const parsedValue = Number(rawValue)
+  return Number.isFinite(parsedValue) && parsedValue > 0 ? Math.floor(parsedValue) : 0
+}
+
+function persistLastEventIdToStorage() {
+  if (typeof window === 'undefined') {
+    return
+  }
+  window.localStorage.setItem(LAST_EVENT_ID_STORAGE_KEY, String(cachedLastEventId))
+}
+
 function toStageStatusInfo(raw: Record<string, unknown>): StageStatusInfo | null {
   const sessionId = typeof raw.session_id === 'string' ? raw.session_id : ''
   if (!sessionId) {
@@ -146,25 +177,20 @@ function toStageStatusInfo(raw: Record<string, unknown>): StageStatusInfo | null
     detail: typeof raw.detail === 'string' ? raw.detail : '',
     roundText: typeof raw.round_text === 'string' ? raw.round_text : '',
     agentState: typeof raw.agent_state === 'string' ? raw.agent_state : '',
-    stageStartedAt: typeof raw.stage_started_at === 'number' ? raw.stage_started_at : Date.now() / 1000,
+    stageStartedAt:
+      typeof raw.stage_started_at === 'number' ? raw.stage_started_at : Date.now() / 1000,
     updatedAt: typeof raw.updated_at === 'number' ? raw.updated_at : Date.now() / 1000,
   }
 }
 
 function notifyStoreListeners() {
+  // 首次订阅会连续补发积压事件。此时只更新模块缓存，待订阅完成后一次性刷新界面，
+  // 避免会话列表反复重排、时间线逐条自动滚动。
+  if (monitorInitialSyncPending) {
+    return
+  }
+  publishSnapshots()
   storeListeners.forEach((listener) => listener())
-}
-
-function loadBackgroundCollectionPreference() {
-  if (backgroundCollectionPreferenceLoaded) {
-    return backgroundCollectionEnabled
-  }
-
-  backgroundCollectionPreferenceLoaded = true
-  if (typeof window !== 'undefined') {
-    backgroundCollectionEnabled = window.localStorage.getItem(BACKGROUND_COLLECTION_STORAGE_KEY) === 'true'
-  }
-  return backgroundCollectionEnabled
 }
 
 function getMonitorDb() {
@@ -173,11 +199,23 @@ function getMonitorDb() {
   }
 
   monitorDbPromise ??= openDB<MaisakaMonitorDb>(MONITOR_DB_NAME, MONITOR_DB_VERSION, {
-    upgrade(db) {
-      const timelineStore = db.createObjectStore('timeline', { keyPath: 'id' })
-      timelineStore.createIndex('by-timestamp', 'timestamp')
-      db.createObjectStore('sessions', { keyPath: 'sessionId' })
-      db.createObjectStore('meta', { keyPath: 'key' })
+    upgrade(db, oldVersion, _newVersion, transaction) {
+      if (!db.objectStoreNames.contains('timeline')) {
+        const timelineStore = db.createObjectStore('timeline', { keyPath: 'id' })
+        timelineStore.createIndex('by-timestamp', 'timestamp')
+      }
+      if (!db.objectStoreNames.contains('sessions')) {
+        db.createObjectStore('sessions', { keyPath: 'sessionId' })
+      }
+      if (!db.objectStoreNames.contains('meta')) {
+        db.createObjectStore('meta', { keyPath: 'key' })
+      }
+
+      if (oldVersion > 0 && oldVersion < 2) {
+        transaction.objectStore('timeline').clear()
+        transaction.objectStore('sessions').clear()
+        transaction.objectStore('meta').clear()
+      }
     },
   })
 
@@ -187,6 +225,7 @@ function getMonitorDb() {
 function toTimelineEntry(entry: PersistedTimelineEntry): TimelineEntry {
   return {
     id: entry.id,
+    eventId: entry.eventId,
     type: entry.type,
     data: entry.data,
     timestamp: entry.timestamp,
@@ -206,19 +245,40 @@ async function loadMonitorSnapshot() {
     }
 
     const db = await dbPromise
-    const [timelineRecords, sessionRecords, selectedSessionMeta, entryCounterMeta] = await Promise.all([
+    const [
+      timelineRecords,
+      sessionRecords,
+      selectedSessionMeta,
+      entryCounterMeta,
+      lastEventIdMeta,
+    ] = await Promise.all([
       db.getAllFromIndex('timeline', 'by-timestamp'),
       db.getAll('sessions'),
       db.get('meta', 'selectedSession'),
       db.get('meta', 'entryCounter'),
+      db.get('meta', 'lastEventId'),
     ])
 
     cachedTimeline = timelineRecords
-      .slice(-MAX_TIMELINE_ENTRIES)
       .map(toTimelineEntry)
+      .sort(compareTimelineEntries)
+      .slice(-MAX_TIMELINE_ENTRIES)
+    rebuildTimelineIndexes()
+    cachedSeenEventIds = new Set(
+      cachedTimeline
+        .map((entry) => entry.eventId)
+        .filter((eventId): eventId is number => typeof eventId === 'number' && eventId > 0)
+    )
     cachedSessions = new Map(sessionRecords.map((session) => [session.sessionId, session]))
-    cachedSelectedSession = typeof selectedSessionMeta?.value === 'string' ? selectedSessionMeta.value : null
-    entryCounter = typeof entryCounterMeta?.value === 'number' ? entryCounterMeta.value : cachedTimeline.length
+    cachedSelectedSession =
+      typeof selectedSessionMeta?.value === 'string' ? selectedSessionMeta.value : null
+    entryCounter =
+      typeof entryCounterMeta?.value === 'number' ? entryCounterMeta.value : cachedTimeline.length
+    if (typeof lastEventIdMeta?.value === 'number') {
+      cachedLastEventId = Math.max(cachedLastEventId, lastEventIdMeta.value)
+      persistLastEventIdToStorage()
+      maisakaMonitorClient.setInitialReplayCursor(cachedLastEventId)
+    }
     notifyStoreListeners()
   } catch (error) {
     console.warn('读取 MaiSaka 观察 IndexedDB 缓存失败，已忽略:', error)
@@ -255,7 +315,12 @@ async function flushMonitorSnapshot() {
     pendingPersistSessionIds = new Set()
     pendingPersistMeta = false
 
-    if (entries.length === 0 && updatedEntryIds.length === 0 && sessionIds.length === 0 && !shouldPersistMeta) {
+    if (
+      entries.length === 0 &&
+      updatedEntryIds.length === 0 &&
+      sessionIds.length === 0 &&
+      !shouldPersistMeta
+    ) {
       return
     }
 
@@ -266,7 +331,7 @@ async function flushMonitorSnapshot() {
       await tx.objectStore('timeline').put({ ...entry, persistedAt })
     }
     for (const entryId of updatedEntryIds) {
-      const entry = cachedTimeline.find((item) => item.id === entryId)
+      const entry = entriesById.get(entryId)
       if (entry) {
         await tx.objectStore('timeline').put({ ...entry, persistedAt })
       }
@@ -279,6 +344,7 @@ async function flushMonitorSnapshot() {
     }
     await tx.objectStore('meta').put({ key: 'selectedSession', value: cachedSelectedSession })
     await tx.objectStore('meta').put({ key: 'entryCounter', value: entryCounter })
+    await tx.objectStore('meta').put({ key: 'lastEventId', value: cachedLastEventId })
     await tx.done
 
     persistedEntryCountSincePrune += entries.length
@@ -333,14 +399,96 @@ function schedulePersistMonitorSnapshot(entry?: TimelineEntry, sessionId?: strin
 void loadMonitorSnapshot()
 
 function shouldKeepMonitorActive() {
-  return activeConsumerCount > 0 || backgroundCollectionEnabled
+  return activeConsumerCount > 0
 }
 
 function appendTimelineEntry(entry: TimelineEntry) {
-  const next = [...cachedTimeline, entry].sort(compareTimelineEntries)
-  cachedTimeline = next.length > MAX_TIMELINE_ENTRIES
-    ? next.slice(next.length - MAX_TIMELINE_ENTRIES)
-    : next
+  cachedTimeline = insertTimelineEntry(cachedTimeline, entry)
+  timelinesBySession.set(
+    entry.sessionId,
+    insertTimelineEntry(timelinesBySession.get(entry.sessionId) ?? emptyTimeline, entry)
+  )
+  indexTimelineEntry(entry)
+  if (cachedTimeline.length > MAX_TIMELINE_ENTRIES) {
+    const removed = cachedTimeline[0]
+    cachedTimeline = cachedTimeline.slice(1)
+    const sessionTimeline = timelinesBySession.get(removed.sessionId)!
+    timelinesBySession.set(removed.sessionId, sessionTimeline.filter((item) => item !== removed))
+    entriesById.delete(removed.id)
+    const key = getEntryLookupKey(removed)
+    if (key) {
+      const index = isMessageEntry(removed) ? messageEntryIds : plannerEntryIds
+      if (index.get(key) === removed.id) index.delete(key)
+    }
+  }
+}
+
+/** 正常实时事件直接追加；回放乱序时二分插入，不为每条事件重排全部历史。 */
+function insertTimelineEntry(timeline: TimelineEntry[], entry: TimelineEntry) {
+  const last = timeline.at(-1)
+  if (!last || compareTimelineEntries(last, entry) <= 0) return [...timeline, entry]
+  let low = 0
+  let high = timeline.length
+  while (low < high) {
+    const mid = (low + high) >>> 1
+    if (compareTimelineEntries(timeline[mid], entry) <= 0) low = mid + 1
+    else high = mid
+  }
+  return [...timeline.slice(0, low), entry, ...timeline.slice(low)]
+}
+
+function isMessageEntry(entry: TimelineEntry) {
+  return entry.type === 'message.ingested' || entry.type === 'message.sent'
+}
+
+function getEntryLookupKey(entry: TimelineEntry): string | null {
+  const data = entry.data as unknown as Record<string, unknown>
+  if (isMessageEntry(entry)) return JSON.stringify([entry.sessionId, data.message_id])
+  if (
+    (entry.type === 'planner.progress' || entry.type === 'planner.finalized') &&
+    typeof data.run_id === 'string' &&
+    data.run_id.length > 0
+  ) {
+    return JSON.stringify([entry.sessionId, data.run_id, data.cycle_id])
+  }
+  return null
+}
+
+function indexTimelineEntry(entry: TimelineEntry) {
+  entriesById.set(entry.id, entry)
+  const key = getEntryLookupKey(entry)
+  if (key) (isMessageEntry(entry) ? messageEntryIds : plannerEntryIds).set(key, entry.id)
+  if (isMessageEntry(entry)) {
+    const latest = cachedLatestMessages.get(entry.sessionId)
+    if (!latest || latest.id === entry.id || compareTimelineEntries(latest, entry) < 0) {
+      cachedLatestMessages = new Map(cachedLatestMessages).set(entry.sessionId, entry)
+    }
+  }
+}
+
+function rebuildTimelineIndexes() {
+  timelinesBySession.clear()
+  entriesById.clear()
+  messageEntryIds.clear()
+  plannerEntryIds.clear()
+  cachedLatestMessages = new Map()
+  for (const entry of cachedTimeline) {
+    const sessionTimeline = timelinesBySession.get(entry.sessionId) ?? []
+    sessionTimeline.push(entry)
+    timelinesBySession.set(entry.sessionId, sessionTimeline)
+    indexTimelineEntry(entry)
+  }
+}
+
+/** 只替换所属会话的数组，其他会话保留引用，详情订阅不会被无关更新唤醒。 */
+function replaceTimelineEntry(existing: TimelineEntry, updated: TimelineEntry) {
+  const next = cachedTimeline.slice()
+  next[next.indexOf(existing)] = updated
+  cachedTimeline = next
+  const sessionTimeline = timelinesBySession.get(existing.sessionId)!.slice()
+  sessionTimeline[sessionTimeline.indexOf(existing)] = updated
+  timelinesBySession.set(existing.sessionId, sessionTimeline)
+  indexTimelineEntry(updated)
 }
 
 function schedulePersistUpdatedTimelineEntry(entryId: string, sessionId?: string) {
@@ -367,23 +515,54 @@ function getTimelineEntrySequence(entry: TimelineEntry) {
 }
 
 function compareTimelineEntries(a: TimelineEntry, b: TimelineEntry) {
+  // 事件号代表实际广播/写入顺序，优先于消息自身时间戳。
+  // message.sent 的 timestamp 是原始消息时间，可能早于 Planner 和工具事件。
+  if (a.eventId !== undefined && b.eventId !== undefined && a.eventId !== b.eventId) {
+    return a.eventId - b.eventId
+  }
+  if (a.eventId !== undefined && b.eventId === undefined) {
+    return -1
+  }
+  if (a.eventId === undefined && b.eventId !== undefined) {
+    return 1
+  }
   if (a.timestamp !== b.timestamp) {
     return a.timestamp - b.timestamp
   }
   return getTimelineEntrySequence(a) - getTimelineEntrySequence(b)
 }
 
+function getMonitorEventId(dataRecord: Record<string, unknown>) {
+  const eventId = dataRecord.event_id
+  if (typeof eventId === 'number' && Number.isFinite(eventId) && eventId > 0) {
+    return Math.floor(eventId)
+  }
+  return null
+}
+
+function markMonitorEventSeen(eventId: number | null) {
+  if (eventId === null) {
+    return true
+  }
+  if (cachedSeenEventIds.has(eventId)) {
+    return false
+  }
+  cachedSeenEventIds.add(eventId)
+  cachedLastEventId = Math.max(cachedLastEventId, eventId)
+  persistLastEventIdToStorage()
+  maisakaMonitorClient.updateReplayCursor(cachedLastEventId)
+  return true
+}
+
 function updateSessionInfo(event: MaisakaMonitorEvent, sessionId: string, timestamp: number) {
   const dataRecord = event.data as unknown as Record<string, unknown>
-  const isGroupChat = typeof dataRecord.is_group_chat === 'boolean'
-    ? dataRecord.is_group_chat
-    : undefined
+  const isGroupChat =
+    typeof dataRecord.is_group_chat === 'boolean' ? dataRecord.is_group_chat : undefined
   const groupId = typeof dataRecord.group_id === 'string' ? dataRecord.group_id : null
   const userId = typeof dataRecord.user_id === 'string' ? dataRecord.user_id : null
   const platform = typeof dataRecord.platform === 'string' ? dataRecord.platform : undefined
-  const sessionName = typeof dataRecord.session_name === 'string'
-    ? dataRecord.session_name
-    : undefined
+  const sessionName =
+    typeof dataRecord.session_name === 'string' ? dataRecord.session_name : undefined
 
   const next = new Map(cachedSessions)
   const existing = next.get(sessionId)
@@ -402,7 +581,7 @@ function updateSessionInfo(event: MaisakaMonitorEvent, sessionId: string, timest
       groupId,
       userId,
       platform,
-      lastActivity: timestamp,
+      lastActivity: Math.max(existing?.lastActivity ?? 0, timestamp),
       eventCount: (existing?.eventCount ?? 0) + 1,
     })
   } else {
@@ -419,7 +598,7 @@ function updateSessionInfo(event: MaisakaMonitorEvent, sessionId: string, timest
       groupId: groupId ?? existing.groupId,
       userId: userId ?? existing.userId,
       platform: platform ?? existing.platform,
-      lastActivity: timestamp,
+      lastActivity: Math.max(existing.lastActivity, timestamp),
       eventCount: existing.eventCount + 1,
     })
   }
@@ -492,48 +671,40 @@ function updateTimelineMessageContent(event: MaisakaMonitorEvent, sessionId: str
     return false
   }
 
-  let updatedEntryId = ''
-  const nextTimeline = cachedTimeline.map((entry) => {
-    if (
-      entry.sessionId !== sessionId
-      || (entry.type !== 'message.ingested' && entry.type !== 'message.sent')
-    ) {
-      return entry
+  const entryId = messageEntryIds.get(JSON.stringify([sessionId, messageId]))
+  const entry = entryId ? entriesById.get(entryId) : undefined
+  if (!entry) {
+    // 历史裁剪不清除侧栏摘要；迟到的识图结果仍须更新该群保留的最新消息。
+    const latest = cachedLatestMessages.get(sessionId)
+    if (latest && (latest.data as unknown as Record<string, unknown>).message_id === messageId) {
+      cachedLatestMessages = new Map(cachedLatestMessages).set(sessionId, {
+        ...latest,
+        data: { ...latest.data, content, reply_to: replyTo, media } as TimelineEntry['data'],
+      })
     }
-
-    const entryData = entry.data as unknown as Record<string, unknown>
-    if (entryData.message_id !== messageId) {
-      return entry
-    }
-
-    updatedEntryId = entry.id
-    return {
-      ...entry,
-      data: {
-        ...entryData,
-        content,
-        reply_to: replyTo,
-        media,
-      } as TimelineEntry['data'],
-    }
-  })
-
-  if (!updatedEntryId) {
     return false
   }
 
-  cachedTimeline = nextTimeline
-  schedulePersistUpdatedTimelineEntry(updatedEntryId, sessionId)
+  replaceTimelineEntry(entry, {
+    ...entry,
+    data: { ...entry.data, content, reply_to: replyTo, media } as TimelineEntry['data'],
+  })
+  schedulePersistUpdatedTimelineEntry(entry.id, sessionId)
   return true
 }
 
 function handleMonitorEvent(event: MaisakaMonitorEvent) {
   const dataRecord = event.data as unknown as Record<string, unknown>
+  const eventId = getMonitorEventId(dataRecord)
+  if (!markMonitorEventSeen(eventId)) {
+    return
+  }
   const sessionId = dataRecord.session_id as string
   const timestamp = dataRecord.timestamp as number
 
   if (event.type === 'stage.snapshot') {
     updateStageStatus(event)
+    monitorInitialSyncPending = false
     notifyStoreListeners()
     return
   }
@@ -551,16 +722,35 @@ function handleMonitorEvent(event: MaisakaMonitorEvent) {
   }
 
   if (event.type === 'message.updated') {
-    const updated = updateTimelineMessageContent(event, sessionId)
+    updateTimelineMessageContent(event, sessionId)
     updateSessionInfo(event, sessionId, timestamp)
-    if (updated) {
-      notifyStoreListeners()
-    }
+    schedulePersistMonitorSnapshot(undefined, sessionId)
+    notifyStoreListeners()
     return
   }
 
+  if (event.type === 'planner.progress' || event.type === 'planner.finalized') {
+    const cycleId = dataRecord.cycle_id
+    const runId = dataRecord.run_id
+    const entryId = plannerEntryIds.get(JSON.stringify([sessionId, runId, cycleId]))
+    const existing = entryId ? entriesById.get(entryId) : undefined
+    if (existing) {
+      // 回放与实时推送可能交错；旧版本不能把正在执行/已完成的轮次回滚。
+      const previousEventId = getMonitorEventId(existing.data as unknown as Record<string, unknown>)
+      if (eventId !== null && previousEventId !== null && eventId <= previousEventId) return
+      // 保留首次出现的位置，让正在执行的工具在原卡片内更新。
+      const updated: TimelineEntry = { ...existing, type: event.type, data: event.data }
+      replaceTimelineEntry(existing, updated)
+      updateSessionInfo(event, sessionId, timestamp)
+      schedulePersistUpdatedTimelineEntry(existing.id, sessionId)
+      notifyStoreListeners()
+      return
+    }
+  }
+
   const entry: TimelineEntry = {
-    id: `evt_${++entryCounter}_${Date.now()}`,
+    id: eventId ? `evt_${eventId}` : `evt_${++entryCounter}_${Date.now()}`,
+    eventId: eventId ?? undefined,
     type: event.type,
     data: event.data,
     timestamp,
@@ -578,11 +768,25 @@ function handleMonitorEvent(event: MaisakaMonitorEvent) {
   notifyStoreListeners()
 }
 
+// connected 跟随底层连接实时变化；订阅失败（如后端尚未就绪）后，连接恢复时自动补订阅
+function handleMonitorConnectionChange(connected: boolean) {
+  if (connected && !monitorSubscriptionStarted && shouldKeepMonitorActive()) {
+    ensureMonitorSubscription()
+  }
+
+  const nextConnected = connected && monitorSubscriptionStarted
+  if (cachedConnected !== nextConnected) {
+    cachedConnected = nextConnected
+    notifyStoreListeners()
+  }
+}
+
 function ensureMonitorSubscription() {
   if (monitorSubscriptionStarted || monitorSubscriptionPromise !== null) {
     return
   }
 
+  monitorInitialSyncPending = true
   monitorSubscriptionPromise = maisakaMonitorClient
     .subscribe(handleMonitorEvent)
     .then((unsub) => {
@@ -591,27 +795,34 @@ function ensureMonitorSubscription() {
         monitorUnsubscribe = null
         void unsub()
         cachedConnected = false
-        notifyStoreListeners()
         return
       }
       monitorSubscriptionStarted = true
       cachedConnected = true
-      notifyStoreListeners()
     })
     .catch((error) => {
       console.error('MaiSaka 监控订阅失败:', error)
       cachedConnected = false
+      monitorInitialSyncPending = false
       notifyStoreListeners()
     })
     .finally(() => {
       monitorSubscriptionPromise = null
     })
+
+  // 须在 monitorSubscriptionPromise 赋值后注册：注册时会立即回调一次当前状态
+  monitorConnectionUnsubscribe ??= maisakaMonitorClient.onConnectionChange(
+    handleMonitorConnectionChange
+  )
 }
 
 function stopMonitorSubscriptionIfIdle() {
   if (shouldKeepMonitorActive()) {
     return
   }
+
+  monitorConnectionUnsubscribe?.()
+  monitorConnectionUnsubscribe = null
 
   if (monitorUnsubscribe) {
     const unsub = monitorUnsubscribe
@@ -623,88 +834,105 @@ function stopMonitorSubscriptionIfIdle() {
   }
 }
 
-export function useMaisakaMonitor() {
-  const [timeline, setTimeline] = useState<TimelineEntry[]>(cachedTimeline)
-  const [sessions, setSessions] = useState<Map<string, SessionInfo>>(new Map(cachedSessions))
-  const [stageStatuses, setStageStatuses] = useState<Map<string, StageStatusInfo>>(new Map(cachedStageStatuses))
-  const [selectedSession, setSelectedSessionState] = useState<string | null>(cachedSelectedSession)
-  const [connected, setConnected] = useState(cachedConnected)
-  const [backgroundCollection, setBackgroundCollection] = useState(loadBackgroundCollectionPreference)
+function clearTimeline() {
+  cachedTimeline = []
+  rebuildTimelineIndexes()
+  cachedSessions = new Map()
+  cachedStageStatuses = new Map()
+  cachedSelectedSession = null
+  pendingPersistEntries = []
+  pendingPersistUpdatedEntryIds = new Set()
+  pendingPersistSessionIds = new Set()
+  pendingPersistMeta = false
+  void clearPersistedMonitorSnapshot()
+  notifyStoreListeners()
+}
 
-  useEffect(() => {
-    activeConsumerCount += 1
-    ensureMonitorSubscription()
-    const syncFromStore = () => {
-      setTimeline(cachedTimeline)
-      setSessions(new Map(cachedSessions))
-      setStageStatuses(new Map(cachedStageStatuses))
-      setSelectedSessionState(cachedSelectedSession)
-      setConnected(cachedConnected)
-      setBackgroundCollection(backgroundCollectionEnabled)
-    }
+function setSelectedSession(sessionId: string | null) {
+  if (cachedSelectedSession === sessionId) return
+  cachedSelectedSession = sessionId
+  schedulePersistMonitorSnapshot()
+  notifyStoreListeners()
+}
 
-    storeListeners.add(syncFromStore)
-    syncFromStore()
-    return () => {
-      storeListeners.delete(syncFromStore)
-      activeConsumerCount = Math.max(0, activeConsumerCount - 1)
-      stopMonitorSubscriptionIfIdle()
-    }
-  }, [])
-
-  const clearTimeline = useCallback(() => {
-    cachedTimeline = []
-    cachedSessions = new Map()
-    cachedStageStatuses = new Map()
-    cachedSelectedSession = null
-    setTimeline([])
-    setSessions(new Map())
-    setStageStatuses(new Map())
-    setSelectedSessionState(null)
-    pendingPersistEntries = []
-    pendingPersistSessionIds = new Set()
-    pendingPersistMeta = false
-    void clearPersistedMonitorSnapshot()
-    notifyStoreListeners()
-  }, [])
-
-  const setSelectedSession = useCallback((sessionId: string | null) => {
-    cachedSelectedSession = sessionId
-    setSelectedSessionState(sessionId)
-    schedulePersistMonitorSnapshot()
-    notifyStoreListeners()
-  }, [])
-
-  const setBackgroundCollectionEnabled = useCallback((enabled: boolean) => {
-    backgroundCollectionEnabled = enabled
-    backgroundCollectionPreferenceLoaded = true
-    if (typeof window !== 'undefined') {
-      window.localStorage.setItem(BACKGROUND_COLLECTION_STORAGE_KEY, String(enabled))
-    }
-
-    if (enabled) {
-      ensureMonitorSubscription()
-    } else {
-      stopMonitorSubscriptionIfIdle()
-    }
-    notifyStoreListeners()
-  }, [])
-
-  /** 当前选中会话的时间线 */
-  const filteredTimeline = selectedSession
-    ? timeline.filter((e) => e.sessionId === selectedSession)
-    : timeline
-
+function getSessionSnapshot() {
   return {
-    timeline: filteredTimeline,
-    allTimeline: timeline,
-    sessions,
-    stageStatuses,
-    selectedSession,
-    setSelectedSession,
-    connected,
-    backgroundCollection,
-    setBackgroundCollectionEnabled,
+    timeline: cachedSelectedSession
+      ? (timelinesBySession.get(cachedSelectedSession) ?? emptyTimeline)
+      : cachedTimeline,
+    selectedSession: cachedSelectedSession,
+    selectedStageStatus: cachedSelectedSession
+      ? cachedStageStatuses.get(cachedSelectedSession)
+      : undefined,
     clearTimeline,
   }
+}
+
+function getOverviewSnapshot() {
+  return {
+    sessions: cachedSessions,
+    stageStatuses: cachedStageStatuses,
+    latestMessages: cachedLatestMessages,
+    selectedSession: cachedSelectedSession,
+    connected: cachedConnected,
+    setSelectedSession,
+  }
+}
+
+let sessionSnapshot = getSessionSnapshot()
+let overviewSnapshot = getOverviewSnapshot()
+let fullSnapshot = { ...overviewSnapshot, ...sessionSnapshot, allTimeline: cachedTimeline }
+
+/** 摘要可以全局更新；当前会话的时间线/阶段未变时，保持详情快照引用不变。 */
+function publishSnapshots() {
+  const nextSession = getSessionSnapshot()
+  if (
+    nextSession.timeline !== sessionSnapshot.timeline ||
+    nextSession.selectedSession !== sessionSnapshot.selectedSession ||
+    nextSession.selectedStageStatus !== sessionSnapshot.selectedStageStatus
+  ) {
+    sessionSnapshot = nextSession
+  }
+
+  const nextOverview = getOverviewSnapshot()
+  if (
+    nextOverview.sessions !== overviewSnapshot.sessions ||
+    nextOverview.stageStatuses !== overviewSnapshot.stageStatuses ||
+    nextOverview.latestMessages !== overviewSnapshot.latestMessages ||
+    nextOverview.selectedSession !== overviewSnapshot.selectedSession ||
+    nextOverview.connected !== overviewSnapshot.connected
+  ) {
+    overviewSnapshot = nextOverview
+  }
+
+  fullSnapshot = { ...overviewSnapshot, ...sessionSnapshot, allTimeline: cachedTimeline }
+}
+
+function subscribeMonitorStore(listener: () => void) {
+  activeConsumerCount += 1
+  storeListeners.add(listener)
+  ensureMonitorSubscription()
+  return () => {
+    storeListeners.delete(listener)
+    activeConsumerCount = Math.max(0, activeConsumerCount - 1)
+    stopMonitorSubscriptionIfIdle()
+  }
+}
+
+const readSessionSnapshot = () => sessionSnapshot
+const readOverviewSnapshot = () => overviewSnapshot
+const readFullSnapshot = () => fullSnapshot
+
+/** 侧边栏只订阅各会话摘要，不再遍历整个事件历史寻找最新消息。 */
+export function useMaisakaMonitorOverview() {
+  return useSyncExternalStore(subscribeMonitorStore, readOverviewSnapshot)
+}
+
+/** 其他群的事件继续入库和更新摘要，但不会触发当前详情重渲染。 */
+export function useMaisakaMonitorSession() {
+  return useSyncExternalStore(subscribeMonitorStore, readSessionSnapshot)
+}
+
+export function useMaisakaMonitor() {
+  return useSyncExternalStore(subscribeMonitorStore, readFullSnapshot)
 }

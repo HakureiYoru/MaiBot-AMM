@@ -259,7 +259,6 @@ def _is_collected_emoji_size_allowed(size_bytes: int) -> bool:
 
 
 emoji_manager_vlm = LLMServiceClient(task_name="vlm", request_type="emoji.see")
-emoji_manager_emotion_judge_llm = LLMServiceClient(task_name="utils", request_type="emoji")
 
 
 class EmojiManager:
@@ -899,7 +898,11 @@ class EmojiManager:
         emoji_replace_prompt_template.add_context("description", new_emoji.description or "无描述")
         emoji_replace_prompt = await prompt_manager.render_prompt(emoji_replace_prompt_template)
 
-        decision_result = await emoji_manager_emotion_judge_llm.generate_response(
+        # 替换决策只使用文字描述，优先使用 emoji 任务，未配置时使用 planner。
+        emoji_models = config_manager.get_model_config().model_task_config.emoji.model_list
+        replacement_task_name = "emoji" if any(model_name.strip() for model_name in emoji_models) else "planner"
+        replacement_client = LLMServiceClient(task_name=replacement_task_name, request_type="emoji")
+        decision_result = await replacement_client.generate_response(
             emoji_replace_prompt,
             session_id=session_id,
         )
@@ -1002,39 +1005,27 @@ class EmojiManager:
         image_bytes = target_emoji.image_bytes or await asyncio.to_thread(
             target_emoji.read_image_bytes, target_emoji.full_path
         )
-        image_base64 = ImageUtils.image_bytes_to_base64(image_bytes)
         try:
+            request_image_format = image_format
             if image_format == "gif":
                 try:
                     image_bytes = await asyncio.to_thread(ImageUtils.gif_2_static_image, image_bytes)
                 except Exception as e:
                     logger.error(f"[构建描述] 转换 GIF 图片时出错: {e}")
                     return False, target_emoji
-                prompt: str = (
-                    "这是一个动态图表情包，每一张图代表了动态图的一帧。"
-                    "请只返回该表情包常见的情绪/场景标签，最多 5 个，"
-                    "使用逗号分隔，标签可为中文或英文，不要附带解释。"
-                )
-                image_base64 = ImageUtils.image_bytes_to_base64(image_bytes)
-                description_result = await emoji_manager_vlm.generate_response_for_image(
-                    prompt,
-                    image_base64,
-                    "jpg",
-                    session_id=session_id,
-                )
-                description = description_result.response
-            else:
-                prompt: str = (
-                    "这是一个表情包图片，请提取该表情主要表达的情绪或语气标签，"
-                    "最多 5 个，使用逗号分隔，返回纯文本标签列表，不要解释，不要输出其他内容。"
-                )
-                description_result = await emoji_manager_vlm.generate_response_for_image(
-                    prompt,
-                    image_base64,
-                    image_format,
-                    session_id=session_id,
-                )
-                description = description_result.response
+                request_image_format = "jpg"
+
+            analysis_prompt_template = prompt_manager.get_prompt("emoji_content_analysis")
+            analysis_prompt_template.add_context("image_type", "GIF" if image_format == "gif" else "STATIC")
+            analysis_prompt = await prompt_manager.render_prompt(analysis_prompt_template)
+            image_base64 = ImageUtils.image_bytes_to_base64(image_bytes)
+            description_result = await emoji_manager_vlm.generate_response_for_image(
+                analysis_prompt,
+                image_base64,
+                request_image_format,
+                session_id=session_id,
+            )
+            description = description_result.response
         except Exception as e:
             logger.error(f"[构建描述] 调用视觉模型生成表情包描述时出错: {e}")
             return False, target_emoji
@@ -1197,7 +1188,7 @@ class EmojiManager:
                         logger.debug(f"[emoji_maintenance] Emoji not registered, keep file: {emoji_file.name}")
 
             try:
-                self.check_emoji_file_integrity()
+                await asyncio.to_thread(self.check_emoji_file_integrity)
             except Exception as e:
                 logger.error(f"[emoji_maintenance] Maintenance task failed: {e}")
 

@@ -11,7 +11,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlmodel import col, func, select
 
-from src.common.data_models.llm_service_data_models import LLMGenerationOptions
 from src.common.database.database import get_db_session
 from src.common.database.database_model import (
     BehaviorAction,
@@ -32,7 +31,7 @@ from src.learners.behavior_scene_cluster_store import (
     debug_retrieve_behavior_scores_from_scene_clusters,
     format_scene_cluster_distribution,
 )
-from src.llm_models.payload_content.message import Message, MessageBuilder, RoleType
+from src.llm_models.payload_content.context_item import ContextItem, ContextItemBuilder, RoleType
 from src.services.llm_service import LLMServiceClient
 from src.webui.dependencies import require_auth
 
@@ -44,6 +43,7 @@ class BehaviorChatInfo(BaseModel):
     session_id: str
     display_name: str
     platform: str = ""
+    account_id: Optional[str] = None
     chat_type: str = ""
     path_count: int = 0
     cluster_count: int = 0
@@ -199,11 +199,7 @@ def _cluster_tag_payloads(
 
 
 def _format_cluster_tag_payloads(tags: list[BehaviorClusterTag]) -> str:
-    parts = [
-        f"{(tag.display or tag.tag)}={tag.probability:.3f}"
-        for tag in tags[:8]
-        if (tag.display or tag.tag)
-    ]
+    parts = [f"{(tag.display or tag.tag)}={tag.probability:.3f}" for tag in tags[:8] if (tag.display or tag.tag)]
     return "；".join(parts)
 
 
@@ -233,9 +229,8 @@ async def _analyze_debug_scene_text(scene_text: str) -> BehaviorScenarioProfile:
 
     async def run_scene_prompt(system_prompt: str) -> str:
         scene_messages = _build_debug_scene_messages(normalized_scene_text, system_prompt)
-        generation_result = await behavior_scene_debug_model.generate_response_with_messages(
+        generation_result = await behavior_scene_debug_model.generate_response_with_context(
             lambda _client: scene_messages,
-            options=LLMGenerationOptions(temperature=0.2),
         )
         return generation_result.response or ""
 
@@ -252,11 +247,11 @@ async def _analyze_debug_scene_text(scene_text: str) -> BehaviorScenarioProfile:
     return profile
 
 
-def _build_debug_scene_messages(scene_text: str, system_prompt: str) -> list[Message]:
+def _build_debug_scene_messages(scene_text: str, system_prompt: str) -> list[ContextItem]:
     """把 WebUI 调试输入包装成场景概括模型熟悉的多消息格式。"""
 
     return [
-        MessageBuilder()
+        ContextItemBuilder()
         .set_role(RoleType.System)
         .add_text_content(
             f"{system_prompt}\n\n"
@@ -264,7 +259,7 @@ def _build_debug_scene_messages(scene_text: str, system_prompt: str) -> list[Mes
             "不是数据库中的真实聊天记录；请仍按主程序行为学习场景概括的 JSON 结构输出 tag 簇。"
         )
         .build(),
-        MessageBuilder()
+        ContextItemBuilder()
         .set_role(RoleType.User)
         .add_text_content(
             "\n".join(
@@ -278,7 +273,7 @@ def _build_debug_scene_messages(scene_text: str, system_prompt: str) -> list[Mes
             )
         )
         .build(),
-        MessageBuilder()
+        ContextItemBuilder()
         .set_role(RoleType.User)
         .add_text_content("请根据以上聊天场景描述输出场景片段 JSON。")
         .build(),
@@ -503,7 +498,9 @@ def _build_behavior_graph_data(session: Any, session_id: Optional[str]) -> dict[
             tag_scene_count[tag].add(scene_id)
         for left_tag, right_tag in combinations(sorted(tag_probs), 2):
             edge_key = tuple(sorted((left_tag, right_tag)))
-            edge = tag_edges.setdefault(edge_key, {"source": edge_key[0], "target": edge_key[1], "weight": 0.0, "count": 0})
+            edge = tag_edges.setdefault(
+                edge_key, {"source": edge_key[0], "target": edge_key[1], "weight": 0.0, "count": 0}
+            )
             edge["weight"] += min(tag_probs[left_tag], tag_probs[right_tag])
             edge["count"] += 1
 
@@ -564,7 +561,7 @@ def _session_scope(session_id: Optional[str]) -> set[str]:
 
 
 @router.get("/chats")
-async def list_behavior_chats() -> dict[str, Any]:
+def list_behavior_chats() -> dict[str, Any]:
     """列出存在行为经验路径的聊天流。"""
 
     with get_db_session(auto_commit=False) as session:
@@ -596,6 +593,7 @@ async def list_behavior_chats() -> dict[str, Any]:
             session_id=row[0] or "",
             display_name=_chat_display_name(chat_sessions.get(row[0]), row[0]),
             platform=str(chat_sessions[row[0]].platform) if row[0] in chat_sessions else "",
+            account_id=chat_sessions[row[0]].account_id if row[0] in chat_sessions else None,
             chat_type=_chat_type_of(chat_sessions.get(row[0])),
             path_count=int(row[1] or 0),
             cluster_count=cluster_count_by_session.get(row[0], 0),
@@ -608,7 +606,7 @@ async def list_behavior_chats() -> dict[str, Any]:
 
 
 @router.get("/paths", response_model=BehaviorPathListResponse)
-async def list_behavior_paths(
+def list_behavior_paths(
     session_id: Annotated[Optional[str], Query()] = None,
     search: Annotated[str, Query()] = "",
     enabled: Annotated[str, Query()] = "all",
@@ -659,7 +657,7 @@ async def list_behavior_paths(
 
 
 @router.get("/clusters", response_model=BehaviorClusterListResponse)
-async def list_behavior_clusters(
+def list_behavior_clusters(
     session_id: Annotated[Optional[str], Query()] = None,
     search: Annotated[str, Query()] = "",
     sort_by: Annotated[str, Query()] = "update_time",
@@ -686,8 +684,7 @@ async def list_behavior_clusters(
                 for item in cluster_items
                 if normalized_search
                 in (
-                    f"{item.name}\n{item.chat_name}\n"
-                    + "\n".join(f"{tag.tag}\n{tag.display}" for tag in item.tags)
+                    f"{item.name}\n{item.chat_name}\n" + "\n".join(f"{tag.tag}\n{tag.display}" for tag in item.tags)
                 ).lower()
             ]
         cluster_items = _sort_behavior_cluster_items(cluster_items, sort_by=sort_by, sort_order=sort_order)
@@ -698,7 +695,7 @@ async def list_behavior_clusters(
 
 
 @router.get("/graph-data", response_model=BehaviorGraphDataResponse)
-async def get_behavior_graph_data(
+def get_behavior_graph_data(
     session_id: Annotated[Optional[str], Query()] = None,
 ) -> BehaviorGraphDataResponse:
     """返回 WebUI 行为学习图谱所需的场景簇网络和 tag 簇分布网络。"""
@@ -708,7 +705,7 @@ async def get_behavior_graph_data(
 
 
 @router.get("/paths/{path_id}", response_model=BehaviorPathDetailResponse)
-async def get_behavior_path_detail(path_id: int) -> BehaviorPathDetailResponse:
+def get_behavior_path_detail(path_id: int) -> BehaviorPathDetailResponse:
     """读取一条行为经验路径及其局部图谱。"""
 
     with get_db_session(auto_commit=False) as session:
@@ -774,7 +771,9 @@ async def debug_behavior_retrieval(request: BehaviorScenarioDebugRequest) -> dic
     with get_db_session(auto_commit=False) as session:
         paths = []
         if behavior_ids:
-            paths = session.exec(select(BehaviorExperiencePath).where(col(BehaviorExperiencePath.id).in_(behavior_ids))).all()
+            paths = session.exec(
+                select(BehaviorExperiencePath).where(col(BehaviorExperiencePath.id).in_(behavior_ids))
+            ).all()
         path_items = {item.id: item for item in _build_path_items(session, list(paths))}
         matched_clusters = _enrich_debug_clusters(session, debug_payload.get("matched_clusters", []))
     return {
@@ -978,6 +977,8 @@ def _load_scene_clusters(session: Any, scene_cluster_ids: set[int]) -> dict[int,
         return {}
     return {
         cluster.id: cluster
-        for cluster in session.exec(select(BehaviorSceneCluster).where(col(BehaviorSceneCluster.id).in_(scene_cluster_ids))).all()
+        for cluster in session.exec(
+            select(BehaviorSceneCluster).where(col(BehaviorSceneCluster.id).in_(scene_cluster_ids))
+        ).all()
         if cluster.id is not None
     }

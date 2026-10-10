@@ -64,6 +64,38 @@ def test_sparse_tokenized_shadow_index_search_and_delete(tmp_path: Path) -> None
         store.close()
 
 
+def test_scoped_sparse_search_filters_in_sql_before_limit(tmp_path: Path) -> None:
+    store = MetadataStore(data_dir=tmp_path)
+    store.connect()
+    index = None
+    try:
+        store.add_paragraph("scopeprobe 排除段落", source="test")
+        allowed_paragraph = store.add_paragraph("scopeprobe 允许段落", source="test")
+        store.add_relation("scopeprobe", "关联", "排除关系")
+        allowed_relation = store.add_relation("scopeprobe", "关联", "允许关系")
+        index = SparseBM25Index(
+            metadata_store=store,
+            config=SparseBM25Config(enable_ngram_fallback_index=False),
+        )
+        assert index.ensure_loaded()
+        statements: list[str] = []
+        assert index._conn is not None
+        index._conn.set_trace_callback(statements.append)
+
+        paragraph_rows = index.search("scopeprobe", k=1, allowed_ids={allowed_paragraph})
+        relation_rows = index.search_relations("scopeprobe", k=1, allowed_ids={allowed_relation})
+
+        assert [row["hash"] for row in paragraph_rows] == [allowed_paragraph]
+        assert [row["hash"] for row in relation_rows] == [allowed_relation]
+        match_queries = [statement for statement in statements if " MATCH " in statement]
+        assert len(match_queries) == 2
+        assert all("json_each" in statement for statement in match_queries)
+    finally:
+        if index is not None:
+            index.unload()
+        store.close()
+
+
 def test_sparse_tokenized_shadow_index_incremental_lifecycle(tmp_path: Path) -> None:
     store = MetadataStore(data_dir=tmp_path)
     store.connect()
@@ -81,7 +113,7 @@ def test_sparse_tokenized_shadow_index_incremental_lifecycle(tmp_path: Path) -> 
         paragraph_hash = store.add_paragraph("探针段落 含有 蓝莓曲奇 和 事务一致性", source="test")
         assert index.search("蓝莓曲奇 事务一致性", k=5)[0]["hash"] == paragraph_hash
 
-        assert store.mark_as_deleted([paragraph_hash], "paragraph") == 1
+        assert store.mark_as_deleted([paragraph_hash], "paragraph", reason="test_soft_delete") == 1
         assert index.search("蓝莓曲奇 事务一致性", k=5) == []
 
         assert store.revive_if_deleted(paragraph_hashes=[paragraph_hash]) == 1
@@ -112,7 +144,7 @@ def test_tokenized_shadow_index_meta_tracks_incremental_lifecycle(tmp_path: Path
         cursor.execute("SELECT value FROM paragraph_tokenized_fts_meta WHERE key='paragraph_count'")
         assert cursor.fetchone()[0] == "2"
 
-        assert store.mark_as_deleted([first_hash], "paragraph") == 1
+        assert store.mark_as_deleted([first_hash], "paragraph", reason="test_soft_delete") == 1
         cursor.execute("SELECT value FROM paragraph_tokenized_fts_meta WHERE key='paragraph_count'")
         assert cursor.fetchone()[0] == "1"
 
@@ -141,7 +173,7 @@ def test_relation_support_batch_excludes_soft_deleted_paragraphs(tmp_path: Path)
         )
         store._conn.commit()
 
-        assert store.mark_as_deleted([deleted_hash], "paragraph") == 1
+        assert store.mark_as_deleted([deleted_hash], "paragraph", reason="test_soft_delete") == 1
 
         grouped = store.get_paragraphs_by_relation_hashes([relation_hash])
 
@@ -170,6 +202,25 @@ def test_tokenized_shadow_index_does_not_commit_outer_transaction(tmp_path: Path
         cursor.execute("ROLLBACK")
         assert conn.in_transaction is False
         rows = store.fts_search_tokenized_paragraphs_bm25("蓝莓 曲奇", limit=5)
+        assert {row["hash"] for row in rows} == {paragraph_hash}
+    finally:
+        store.close()
+
+
+def test_primary_fts_delete_does_not_commit_outer_transaction(tmp_path: Path) -> None:
+    store = MetadataStore(data_dir=tmp_path)
+    store.connect()
+    try:
+        paragraph_hash = store.add_paragraph("primary fts rollback probe 蓝莓曲奇", source="test")
+        assert store.fts_upsert_paragraph(paragraph_hash) is True
+
+        conn = store.get_connection()
+        conn.execute("BEGIN IMMEDIATE")
+        assert store.fts_delete_paragraph(paragraph_hash, conn=conn) is True
+        assert conn.in_transaction is True
+
+        conn.rollback()
+        rows = store.fts_search_bm25("蓝莓曲奇", limit=5)
         assert {row["hash"] for row in rows} == {paragraph_hash}
     finally:
         store.close()

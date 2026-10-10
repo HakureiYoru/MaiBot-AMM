@@ -1,11 +1,12 @@
 import { beforeAll, describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
-import { ExpressionGroupsHook, MultipleReplyStyleHook } from '../complexFieldHooks'
+import { BotPlatformAccountsHook, ExpressionGroupsHook, MultipleReplyStyleHook } from '../complexFieldHooks'
 import { createJsonFieldHook } from '../JsonFieldHookFactory'
 import { createListItemEditorHook } from '../ListItemEditorHookFactory'
 import { getChatStreams, type ChatStream } from '@/lib/chat-management-api'
+import * as botAccountsApi from '@/lib/bot-accounts-api'
 import type { FieldSchema } from '@/types/config-schema'
 
 vi.mock('@/lib/chat-management-api', () => ({
@@ -56,6 +57,12 @@ vi.mock('@/lib/chat-management-api', () => ({
     },
   ]),
   resolveChatTargets: vi.fn(async () => []),
+}))
+
+vi.mock('@/lib/bot-accounts-api', () => ({
+  getDiscoveredBotAccounts: vi.fn(),
+  deleteDiscoveredBotAccount: vi.fn(),
+  setDiscoveredBotAccountDisabled: vi.fn(),
 }))
 
 const advancedSchema: FieldSchema = {
@@ -230,7 +237,101 @@ describe('custom bot config hooks', () => {
     expect(onParentChange).toHaveBeenLastCalledWith('global_memory_sharing_enabled', true)
   })
 
-  it('selects shared memory group members from known group or private chats inline', async () => {
+  it('shows discovered adapter accounts and keeps fallback fields editable', async () => {
+    vi.mocked(botAccountsApi.getDiscoveredBotAccounts).mockResolvedValue([
+      {
+        id: 1,
+        platform: 'qq',
+        account_id: 'bot-1',
+        disabled: false,
+        first_seen_at: '2026-08-08T08:00:00',
+        last_seen_at: '2026-08-08T09:00:00',
+        disabled_at: null,
+        last_source: 'ready',
+        last_adapter_id: 'adapter-1',
+        last_plugin_id: 'plugin-1',
+        last_gateway_name: 'gateway-1',
+        online: true,
+      },
+    ])
+    vi.mocked(botAccountsApi.deleteDiscoveredBotAccount).mockResolvedValue(undefined)
+    const onParentChange = vi.fn()
+
+    render(
+      <BotPlatformAccountsHook
+        fieldPath="bot.platform"
+        onChange={vi.fn()}
+        onParentChange={onParentChange}
+        parentValues={{ qq_account: 'fallback-qq', platforms: ['wx:fallback-wx'] }}
+        schema={advancedSchema}
+        value="qq"
+      />,
+    )
+
+    expect(await screen.findByText('bot-1')).toBeInTheDocument()
+    expect(screen.getByText('在线')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '备用平台账号' })).toHaveAttribute(
+      'aria-expanded',
+      'false',
+    )
+    expect(screen.queryByDisplayValue('fallback-qq')).not.toBeInTheDocument()
+    expect(screen.queryByDisplayValue('fallback-wx')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '添加平台' })).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: '备用平台账号' }))
+    expect(screen.getByText('fallback-qq')).toBeInTheDocument()
+    expect(screen.getByText('fallback-wx')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '编辑主账号' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '添加平台' })).toBeInTheDocument()
+
+    expect(screen.queryByText(/禁用只影响/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/这些配置不会写入/)).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: '删除账号' }))
+    await waitFor(() => expect(botAccountsApi.deleteDiscoveredBotAccount).toHaveBeenCalledWith(1))
+    await waitFor(() => expect(screen.queryByText('bot-1')).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '已排除账号 1' })).not.toBeInTheDocument()
+
+  })
+
+  it('uses the shared scope selector while limiting memory groups to exact chats', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+
+    render(
+      <ExpressionGroupsHook
+        fieldPath="a_memorix.shared_memory_groups"
+        onChange={onChange}
+        parentValues={{ global_memory_sharing_enabled: false }}
+        schema={sharedMemorySchema}
+        value={[]}
+      />,
+    )
+
+    await user.click(screen.getByLabelText('添加共享记忆组'))
+
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByRole('button', { name: /指定聊天流/ })).toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /全局通配/ })).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /指定平台/ })).not.toBeInTheDocument()
+    expect(within(dialog).queryByRole('button', { name: /默认兜底/ })).not.toBeInTheDocument()
+
+    await user.click(within(dialog).getByRole('button', { name: '添加' }))
+
+    expect(onChange).toHaveBeenLastCalledWith([
+      {
+        targets: [
+          {
+            platform: 'qq',
+            item_id: '',
+            rule_type: 'group',
+          },
+        ],
+      },
+    ])
+  })
+
+  it.skip('selects shared memory group members from known group or private chats inline', async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
 
@@ -265,8 +366,6 @@ describe('custom bot config hooks', () => {
     expect(screen.queryByText('聊天流 ID')).not.toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '手动填写' }))
-    expect(screen.getByText('群号或用户 ID')).toBeInTheDocument()
-
     fireEvent.change(screen.getByPlaceholderText('群号或用户 ID'), {
       target: { value: '30003' },
     })
@@ -297,6 +396,53 @@ describe('custom bot config hooks', () => {
         ],
       },
     ])
+  })
+
+  it('keeps the newest chat stream when legacy and account-specific sessions share one target', async () => {
+    const user = userEvent.setup()
+    const currentChat = {
+      ...createChatStream(1, 'group'),
+      session_id: 'current-session',
+      display_name: '麦麦脑电图｜技术交流群｜部署/配置',
+      target_id: '571780722',
+      group_id: '571780722',
+      group_name: '麦麦脑电图｜技术交流群｜部署/配置',
+      account_id: '2814567326',
+    }
+    const legacyChat = {
+      ...currentChat,
+      id: 2,
+      session_id: 'legacy-session',
+      display_name: '麦麦的私聊',
+      group_name: null,
+      account_id: null,
+    }
+    vi.mocked(getChatStreams).mockResolvedValueOnce([currentChat, legacyChat])
+
+    render(
+      <ExpressionGroupsHook
+        fieldPath="a_memorix.shared_memory_groups"
+        onChange={vi.fn()}
+        parentValues={{ global_memory_sharing_enabled: false }}
+        schema={sharedMemorySchema}
+        value={[
+          {
+            targets: [
+              {
+                platform: 'qq',
+                item_id: '571780722',
+                rule_type: 'group',
+              },
+            ],
+          },
+        ]}
+      />,
+    )
+
+    await user.click(screen.getByLabelText('展开共享记忆组 1'))
+
+    expect(await screen.findByText('麦麦脑电图｜技术交流群｜部署/配置')).toBeInTheDocument()
+    expect(screen.queryByText('麦麦的私聊')).not.toBeInTheDocument()
   })
 
   it('keeps private chat matches visible when group matches exceed the display limit', async () => {

@@ -90,12 +90,17 @@ class PersonProfileResult:
 
 
 class MemoryService:
-    async def _invoke(self, component_name: str, args: Optional[Dict[str, Any]] = None, *, timeout_ms: int = 30000) -> Any:
-        response = await a_memorix_host_service.invoke(
-            component_name,
-            args or {},
-            timeout_ms=max(1000, int(timeout_ms or 30000)),
-        )
+    async def _invoke(
+        self,
+        component_name: str,
+        args: Optional[Dict[str, Any]] = None,
+        *,
+        timeout_ms: Optional[int] = None,
+    ) -> Any:
+        if timeout_ms is None:
+            response = await a_memorix_host_service.invoke(component_name, args or {})
+        else:
+            response = await a_memorix_host_service.invoke(component_name, args or {}, timeout_ms=timeout_ms)
         if isinstance(response, dict):
             return response
         payload = getattr(response, "payload", None)
@@ -119,10 +124,13 @@ class MemoryService:
         component_name: str,
         *,
         action: str,
-        timeout_ms: int = 30000,
+        timeout_ms: Optional[int] = None,
         **kwargs,
     ) -> Dict[str, Any]:
-        payload = await self._invoke(component_name, {"action": action, **kwargs}, timeout_ms=timeout_ms)
+        if timeout_ms is None:
+            payload = await self._invoke(component_name, {"action": action, **kwargs})
+        else:
+            payload = await self._invoke(component_name, {"action": action, **kwargs}, timeout_ms=timeout_ms)
         return payload if isinstance(payload, dict) else {"success": False, "error": "invalid_payload"}
 
     @staticmethod
@@ -255,7 +263,9 @@ class MemoryService:
         except Exception as exc:
             logger.warning(f"反馈纠错任务入队失败: {exc}")
             return {"success": False, "queued": False, "reason": str(exc)}
-        return payload if isinstance(payload, dict) else {"success": False, "queued": False, "reason": "invalid_payload"}
+        return (
+            payload if isinstance(payload, dict) else {"success": False, "queued": False, "reason": "invalid_payload"}
+        )
 
     async def ingest_summary(
         self,
@@ -384,6 +394,20 @@ class MemoryService:
             logger.warning(f"获取记忆统计失败: {exc}")
             return {}
 
+    async def image_memory(self, *, action: str, timeout_ms: int = 120000, **kwargs: Any) -> Dict[str, Any]:
+        """调用图片记忆的写入、相似检索和管理接口。"""
+
+        try:
+            payload = await self._invoke(
+                "image_memory",
+                {"action": str(action or "").strip(), **kwargs},
+                timeout_ms=timeout_ms,
+            )
+            return payload if isinstance(payload, dict) else {"success": False, "error": "invalid_payload"}
+        except Exception as exc:
+            logger.warning(f"图片记忆调用失败: {exc}")
+            return {"success": False, "error": str(exc)}
+
     async def graph_admin(self, *, action: str, **kwargs) -> Dict[str, Any]:
         try:
             return await self._invoke_admin("memory_graph_admin", action=action, **kwargs)
@@ -419,6 +443,13 @@ class MemoryService:
             logger.warning(f"反馈纠错管理调用失败: {exc}")
             return {"success": False, "error": str(exc)}
 
+    async def fact_admin(self, *, action: str, **kwargs) -> Dict[str, Any]:
+        try:
+            return await self._invoke_admin("memory_fact_admin", action=action, **kwargs)
+        except Exception as exc:
+            logger.warning(f"事实账本管理调用失败: {exc}")
+            return {"success": False, "error": str(exc)}
+
     async def runtime_admin(self, *, action: str, **kwargs) -> Dict[str, Any]:
         try:
             return await self._invoke_admin("memory_runtime_admin", action=action, **kwargs)
@@ -433,6 +464,13 @@ class MemoryService:
             logger.warning(f"导入管理调用失败: {exc}")
             return {"success": False, "error": str(exc)}
 
+    async def bundle_admin(self, *, action: str, timeout_ms: int = 120000, **kwargs) -> Dict[str, Any]:
+        try:
+            return await self._invoke_admin("memory_bundle_admin", action=action, timeout_ms=timeout_ms, **kwargs)
+        except Exception as exc:
+            logger.warning(f"记忆包管理调用失败: {exc}")
+            return {"success": False, "error": str(exc)}
+
     async def tuning_admin(self, *, action: str, timeout_ms: int = 120000, **kwargs) -> Dict[str, Any]:
         try:
             return await self._invoke_admin("memory_tuning_admin", action=action, timeout_ms=timeout_ms, **kwargs)
@@ -440,7 +478,7 @@ class MemoryService:
             logger.warning(f"调优管理调用失败: {exc}")
             return {"success": False, "error": str(exc)}
 
-    async def v5_admin(self, *, action: str, timeout_ms: int = 30000, **kwargs) -> Dict[str, Any]:
+    async def v5_admin(self, *, action: str, timeout_ms: Optional[int] = None, **kwargs) -> Dict[str, Any]:
         try:
             return await self._invoke_admin("memory_v5_admin", action=action, timeout_ms=timeout_ms, **kwargs)
         except Exception as exc:
@@ -466,7 +504,9 @@ class MemoryService:
 
     async def get_recycle_bin(self, *, limit: int = 50) -> Dict[str, Any]:
         try:
-            payload = await self._invoke("maintain_memory", {"action": "recycle_bin", "limit": max(1, int(limit or 50))})
+            payload = await self._invoke(
+                "maintain_memory", {"action": "recycle_bin", "limit": max(1, int(limit or 50))}
+            )
             return payload if isinstance(payload, dict) else {"success": False, "error": "invalid_payload"}
         except Exception as exc:
             logger.warning(f"获取回收站失败: {exc}")

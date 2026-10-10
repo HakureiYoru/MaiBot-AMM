@@ -1,8 +1,9 @@
 # 使用基于时间戳的文件处理器，简单的轮转份数限制
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional, TextIO
 
 import asyncio
 import json
@@ -73,6 +74,19 @@ def get_console_handler():
     return _console_handler
 
 
+@contextmanager
+def redirect_console_logs(stream: TextIO) -> Iterator[None]:
+    """临时把主控制台日志接到可安全重绘的输出流。"""
+
+    handler = get_console_handler()
+    original_stream = handler.stream
+    handler.setStream(stream)
+    try:
+        yield
+    finally:
+        handler.setStream(original_stream)
+
+
 def get_ws_handler():
     """获取 WebSocket handler 单例"""
     global _ws_handler
@@ -124,12 +138,13 @@ class TimestampedFileHandler(logging.Handler):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.current_file = self.log_dir / f"app_{timestamp}.log.jsonl"
         self.current_stream = open(self.current_file, "a", encoding=self.encoding)
+        # 追加模式下流位置就是文件已有字节数；后续由 emit 累加写入量，
+        # 避免每条日志都去文件系统确认一次大小。
+        self._written_bytes = self.current_stream.tell()
 
     def _should_rollover(self):
         """检查是否需要轮转"""
-        if self.current_file and self.current_file.exists():
-            return self.current_file.stat().st_size >= self.max_bytes
-        return False
+        return self._written_bytes >= self.max_bytes
 
     def _do_rollover(self):
         """执行轮转：关闭当前文件，创建新文件"""
@@ -175,6 +190,8 @@ class TimestampedFileHandler(logging.Handler):
                     msg = self.format(record)
                     self.current_stream.write(msg + "\n")
                     self.current_stream.flush()
+                    # flush 之后流位置即文件当前字节数，用它更新写入量。
+                    self._written_bytes = self.current_stream.tell()
 
         except Exception:
             self.handleError(record)
@@ -253,7 +270,12 @@ class WebSocketLogHandler(logging.Handler):
             try:
                 log_dict = json.loads(formatted_msg)
                 message = log_dict.get("event", formatted_msg)
-                module_name = log_dict.get("logger_name") or log_dict.get("module") or record.name
+                module_name = (
+                    log_dict.get("logger_name")
+                    or log_dict.get("logger")
+                    or log_dict.get("module")
+                    or record.name
+                )
                 level_name = str(log_dict.get("level") or record.levelname).upper()
             except (json.JSONDecodeError, ValueError):
                 # 不是 JSON,直接使用消息
@@ -269,6 +291,7 @@ class WebSocketLogHandler(logging.Handler):
                 "timestamp": datetime.fromtimestamp(record.created).strftime("%Y-%m-%d %H:%M:%S"),
                 "level": level_name,
                 "module": module_name,
+                "moduleDisplayName": MODULE_ALIASES.get(module_name, module_name),
                 "message": message,
             }
 

@@ -30,6 +30,7 @@ class UsageFixture(SQLModel, table=True):
     prompt_cache_miss_tokens: int = 0
     cost: float = 0.01
     time_cost: float = 1.0
+    task_name: Optional[str] = None
 
 
 class MessageFixture(SQLModel, table=True):
@@ -130,7 +131,7 @@ class StatisticsMemoryTests(unittest.TestCase):
         namespace = {"defaultdict": defaultdict, "cast": cast, "StatPeriodData": Dict,
                      "fetch_model_duration_aggregates_since": self.ns["fetch_model_duration_aggregates_since"]}
         data = {}
-        for category in ("TYPE", "USER", "MODEL", "MODULE"):
+        for category in ("TYPE", "USER", "MODEL", "MODULE", "TASK"):
             for prefix in ("AVG", "STD"):
                 key = f"{prefix}_TIME_COST_BY_{category}"
                 namespace[key] = key

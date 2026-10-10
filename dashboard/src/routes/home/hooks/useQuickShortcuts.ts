@@ -11,20 +11,14 @@
  *   handleRestart / isRestarting / uncheckedCount / onOpenReviewer，hook 负责编排其余全部逻辑。
  * - 插件快捷入口的纯函数 helper（id 编解码、schema 解析等）随 hook 一并下沉。
  */
-import {
-  BarChart3,
-  ClipboardCheck,
-  FileText,
-  HardDrive,
-  MessageSquare,
-  Puzzle,
-  RotateCcw,
-  Settings,
-} from 'lucide-react'
+import { BookOpen, ClipboardCheck, FileText, HardDrive, MessageSquare, Puzzle, RotateCcw, Settings } from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { TFunction } from 'i18next'
 
+import { getBotConfigSchema } from '@/lib/config-api'
+import { buildTabGroupsFromSchema } from '@/lib/config-tab-groups'
 import {
   getInstalledPlugins,
   getPluginConfigSchema,
@@ -36,13 +30,21 @@ import type { QuickShortcutDefinition } from '../types'
 
 const QUICK_SHORTCUT_STORAGE_KEY = 'maibot-home-quick-shortcuts'
 const DEFAULT_QUICK_SHORTCUT_IDS = [
-  'action:restart',
-  'action:expression-review',
   'route:logs',
-  'route:plugin-market',
-  'route:settings',
-  'external:statistics',
+  'route:settings-appearance',
+  'route:model-list',
+  'route:chat',
+  'route:logs:replyer',
+  'route:logs:reasoning',
 ]
+const SIDEBAR_REDUNDANT_SHORTCUT_IDS = new Set([
+  'route:plugin-market',
+  'route:plugin-config',
+  'route:model-providers',
+  'route:bot-config',
+  'route:emoji',
+  'route:expression',
+])
 
 function loadQuickShortcutIds(): string[] {
   const fallback = [...DEFAULT_QUICK_SHORTCUT_IDS]
@@ -58,8 +60,19 @@ function loadQuickShortcutIds(): string[] {
   try {
     const parsed = JSON.parse(stored)
     if (Array.isArray(parsed)) {
-      const ids = parsed.filter((item): item is string => typeof item === 'string' && item.length > 0)
-      return ids.length > 0 ? Array.from(new Set(ids)) : fallback
+      const ids = parsed.filter(
+        (item): item is string => typeof item === 'string' && item.length > 0
+      )
+      const uniqueIds = Array.from(new Set(ids))
+      const filteredIds = uniqueIds.filter((id) => !SIDEBAR_REDUNDANT_SHORTCUT_IDS.has(id))
+      const normalizedIds = filteredIds.length > 0 ? filteredIds : fallback
+      if (
+        normalizedIds.length !== uniqueIds.length ||
+        normalizedIds.some((id, index) => id !== uniqueIds[index])
+      ) {
+        saveQuickShortcutIds(normalizedIds)
+      }
+      return normalizedIds
     }
   } catch {
     return fallback
@@ -210,6 +223,25 @@ export function useQuickShortcuts({
   const [quickShortcutSearch, setQuickShortcutSearch] = useState('')
   const [pluginShortcuts, setPluginShortcuts] = useState<QuickShortcutDefinition[]>([])
   const [isPluginShortcutsLoading, setIsPluginShortcutsLoading] = useState(false)
+  const configSchemaQuery = useQuery({
+    queryKey: ['bot-config', 'schema'],
+    queryFn: getBotConfigSchema,
+    staleTime: Infinity,
+  })
+  const configShortcuts = useMemo<QuickShortcutDefinition[]>(
+    () =>
+      configSchemaQuery.data
+        ? buildTabGroupsFromSchema(configSchemaQuery.data).map((tab) => ({
+            id: `route:bot-config:${tab.id}`,
+            category: 'config' as const,
+            label: tab.label,
+            description: t('home.quickActions.descriptions.configSection', { section: tab.label }),
+            icon: Settings,
+            href: `/config/bot?${new URLSearchParams({ tab: tab.id }).toString()}`,
+          }))
+        : [],
+    [configSchemaQuery.data, t]
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -302,7 +334,8 @@ export function useQuickShortcuts({
         description: t('home.quickActions.descriptions.expressionReview'),
         icon: ClipboardCheck,
         action: onOpenReviewer,
-        badge: uncheckedCount > 0 ? (uncheckedCount > 99 ? '99+' : String(uncheckedCount)) : undefined,
+        badge:
+          uncheckedCount > 0 ? (uncheckedCount > 99 ? '99+' : String(uncheckedCount)) : undefined,
       },
       {
         id: 'route:logs',
@@ -313,29 +346,31 @@ export function useQuickShortcuts({
         href: '/logs',
       },
       {
-        id: 'route:plugin-market',
-        category: 'plugin',
-        label: t('home.quickActions.pluginManage'),
-        description: t('home.quickActions.descriptions.pluginManage'),
-        icon: Puzzle,
-        href: '/plugins',
-      },
-      {
-        id: 'route:plugin-config',
-        category: 'plugin',
-        label: t('home.quickActions.pluginConfig'),
-        description: t('home.quickActions.descriptions.pluginConfig'),
-        icon: Settings,
-        href: '/plugin-config',
-      },
-      {
-        id: 'route:settings',
+        id: 'route:chat',
         category: 'system',
-        label: t('home.quickActions.systemSettings'),
-        description: t('home.quickActions.descriptions.systemSettings'),
-        icon: Settings,
-        href: '/settings',
+        label: t('home.quickActions.chat'),
+        description: t('home.quickActions.descriptions.chat'),
+        icon: MessageSquare,
+        href: '/chat',
       },
+      {
+        id: 'external:docs',
+        category: 'external',
+        label: t('home.quickActions.docs'),
+        description: t('home.quickActions.descriptions.docs'),
+        icon: BookOpen,
+        href: 'https://docs.mai-mai.org',
+        external: true,
+      },
+      ...(['replyer', 'planner', 'reasoning'] as const).map((stage) => ({
+        id: `route:logs:${stage}`,
+        category: 'monitor' as const,
+        label: t(`home.quickActions.${stage}Logs`),
+        description: t(`home.quickActions.descriptions.${stage}Logs`),
+        icon: FileText,
+        href: stage === 'reasoning' ? '/reasoning-process' : `/reasoning-process?stage=${stage}`,
+      })),
+      ...configShortcuts,
       {
         id: 'route:settings-appearance',
         category: 'system',
@@ -353,14 +388,6 @@ export function useQuickShortcuts({
         href: '/settings?tab=local-cache',
       },
       {
-        id: 'route:model-providers',
-        category: 'config',
-        label: t('home.quickActions.modelProviders'),
-        description: t('home.quickActions.descriptions.modelProviders'),
-        icon: Settings,
-        href: '/config/model?tab=providers',
-      },
-      {
         id: 'route:model-list',
         category: 'config',
         label: t('home.quickActions.modelList'),
@@ -376,42 +403,9 @@ export function useQuickShortcuts({
         icon: Settings,
         href: '/config/model?tab=tasks',
       },
-      {
-        id: 'route:bot-config',
-        category: 'config',
-        label: t('home.quickActions.botConfig'),
-        description: t('home.quickActions.descriptions.botConfig'),
-        icon: Settings,
-        href: '/config/bot',
-      },
-      {
-        id: 'route:emoji',
-        category: 'resource',
-        label: t('home.quickActions.emojiManagement'),
-        description: t('home.quickActions.descriptions.emojiManagement'),
-        icon: MessageSquare,
-        href: '/resource/emoji',
-      },
-      {
-        id: 'route:expression',
-        category: 'resource',
-        label: t('home.quickActions.expressionManagement'),
-        description: t('home.quickActions.descriptions.expressionManagement'),
-        icon: MessageSquare,
-        href: '/resource/expression',
-      },
-      {
-        id: 'external:statistics',
-        category: 'external',
-        label: t('home.quickActions.statistics'),
-        description: t('home.quickActions.descriptions.statistics'),
-        icon: BarChart3,
-        href: '/maibot_statistics.html',
-        external: true,
-      },
       ...pluginShortcuts,
     ],
-    [handleRestart, isRestarting, onOpenReviewer, pluginShortcuts, t, uncheckedCount]
+    [configShortcuts, handleRestart, isRestarting, onOpenReviewer, pluginShortcuts, t, uncheckedCount]
   )
 
   const quickShortcutMap = useMemo(
@@ -447,7 +441,9 @@ export function useQuickShortcuts({
   const toggleQuickShortcut = useCallback(
     (id: string, checked: boolean) => {
       updateQuickShortcutIds(
-        checked ? [...quickShortcutIds, id] : quickShortcutIds.filter((shortcutId) => shortcutId !== id)
+        checked
+          ? [...quickShortcutIds, id]
+          : quickShortcutIds.filter((shortcutId) => shortcutId !== id)
       )
     },
     [quickShortcutIds, updateQuickShortcutIds]

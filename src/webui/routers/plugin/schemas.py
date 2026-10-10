@@ -81,9 +81,10 @@ class GitStatusResponse(BaseModel):
 
 class InstallPluginRequest(BaseModel):
     plugin_id: str = Field(..., description="插件 ID")
-    repository_url: str = Field(..., description="插件仓库 URL")
+    repository_url: str = Field("", description="分支安装的仓库 URL；发布版本由索引解析")
     branch: Optional[str] = Field("main", description="分支名称")
     mirror_id: Optional[str] = Field(None, description="指定镜像源 ID")
+    version: Optional[str] = Field(None, description="发布版本；latest 表示最新兼容稳定版本")
 
 
 class VersionResponse(BaseModel):
@@ -99,9 +100,10 @@ class UninstallPluginRequest(BaseModel):
 
 class UpdatePluginRequest(BaseModel):
     plugin_id: str = Field(..., description="插件 ID")
-    repository_url: str = Field(..., description="插件仓库 URL")
+    repository_url: str = Field("", description="分支安装的仓库 URL；发布版本由索引解析")
     branch: Optional[str] = Field("main", description="分支名称")
     mirror_id: Optional[str] = Field(None, description="指定镜像源 ID")
+    version: Optional[str] = Field(None, description="发布版本；latest 表示最新兼容稳定版本")
 
 
 class UpdatePluginConfigRequest(BaseModel):

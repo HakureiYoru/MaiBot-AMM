@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { ChevronDown, Play, RefreshCw, RotateCcw, Search } from 'lucide-react'
+import { ChevronDown, Play, RefreshCw, RotateCcw, Search, Trash2 } from 'lucide-react'
 
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -14,13 +24,17 @@ import { Textarea } from '@/components/ui/textarea'
 import { ThinkingIllustration } from '@/components/ui/thinking-illustration'
 import { useToast } from '@/hooks/use-toast'
 import {
+  discardMemoryEpisodeMigrationBackfill,
   getMemoryEpisode,
   getMemoryEpisodes,
+  getMemoryEpisodeMigrationBackfill,
   getMemoryEpisodeStatus,
   processMemoryEpisodePending,
   rebuildMemoryEpisodes,
+  type MemoryEpisodeActionPayload,
   type MemoryEpisodeDetailPayload,
   type MemoryEpisodeItemPayload,
+  type MemoryEpisodeMigrationBackfillPayload,
   type MemoryEpisodeParagraphPayload,
   type MemoryEpisodeStatusPayload,
 } from '@/lib/memory-api'
@@ -54,12 +68,43 @@ function parseOptionalNumber(value: string): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined
 }
 
-function parsePositiveInt(value: string, fallback: number): number {
+function parsePositiveInt(value: string, maximum?: number): number | undefined {
   const parsed = Number(value)
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    return fallback
+  if (!Number.isInteger(parsed) || parsed <= 0 || (maximum !== undefined && parsed > maximum)) {
+    return undefined
   }
   return parsed
+}
+
+function formatEpisodeIssueReason(reason: string): string {
+  const labels: Record<string, string> = {
+    superseded: '来源版本已更新',
+    lease_lost_or_claim_mismatch: '任务租约已失效或被其他进程接管',
+    not_claimed: '本轮未领取到该来源任务',
+  }
+  return labels[reason] ?? reason
+}
+
+function getEpisodeActionDescription(payload: MemoryEpisodeActionPayload): string {
+  if (payload.detail) {
+    return payload.detail
+  }
+  if (payload.error) {
+    return payload.error
+  }
+  const firstIssue = payload.failures?.[0] ?? payload.unfinished_items?.[0]
+  const issueReason = firstIssue?.error ?? firstIssue?.reason
+  if (issueReason) {
+    const source = firstIssue?.source ? `${firstIssue.source}: ` : ''
+    return `${source}${formatEpisodeIssueReason(issueReason)}`
+  }
+  if (!payload.success) {
+    return `失败 ${payload.failed ?? 0} 项，未完成 ${payload.unfinished ?? 0} 项`
+  }
+  if (payload.rebuilt !== undefined) {
+    return `已重建 ${payload.rebuilt} 个来源`
+  }
+  return `已处理 ${payload.processed ?? 0} 项`
 }
 
 function getEpisodeId(item: MemoryEpisodeItemPayload | null | undefined): string {
@@ -116,6 +161,8 @@ export function MemoryEpisodeManager({
   const [limit, setLimit] = useState('20')
   const [items, setItems] = useState<MemoryEpisodeItemPayload[]>([])
   const [status, setStatus] = useState<MemoryEpisodeStatusPayload | null>(null)
+  const [migrationBackfill, setMigrationBackfill] = useState<MemoryEpisodeMigrationBackfillPayload | null>(null)
+  const [discardDialogOpen, setDiscardDialogOpen] = useState(false)
   const [selectedId, setSelectedId] = useState('')
   const [detail, setDetail] = useState<MemoryEpisodeDetailPayload | null>(null)
   const [loading, setLoading] = useState(false)
@@ -129,15 +176,45 @@ export function MemoryEpisodeManager({
   const initialLoadedRef = useRef(false)
   const initialTargetKeyRef = useRef('')
   const pendingInitialTargetRef = useRef<{ source: string; timeStart: string; timeEnd: string } | null>(null)
+  const detailRequestIdRef = useRef(0)
 
   const selectedEpisode = useMemo(() => detail?.episode ?? items.find((item) => getEpisodeId(item) === selectedId), [detail?.episode, items, selectedId])
   const selectedEpisodeParagraphs = useMemo(() => getEpisodeParagraphs(selectedEpisode), [selectedEpisode])
   const failedItems = Array.isArray(status?.failed) ? status.failed : []
 
   const loadStatus = useCallback(async () => {
-    const payload = await getMemoryEpisodeStatus(parsePositiveInt(limit, 20))
-    setStatus(payload)
-  }, [limit])
+    const [statusResult, migrationResult] = await Promise.allSettled([
+      getMemoryEpisodeStatus(parsePositiveInt(limit) ?? 20),
+      getMemoryEpisodeMigrationBackfill(),
+    ])
+    if (statusResult.status === 'fulfilled' && statusResult.value.success) {
+      setStatus(statusResult.value)
+    } else {
+      setStatus(null)
+      toast({
+        title: '加载 Episode 状态失败',
+        description: statusResult.status === 'rejected'
+          ? statusResult.reason instanceof Error ? statusResult.reason.message : String(statusResult.reason)
+          : statusResult.value.error || 'Episode 状态接口返回失败',
+        variant: 'destructive',
+      })
+    }
+    const migrationPayload = migrationResult.status === 'fulfilled' ? migrationResult.value : null
+    if (migrationPayload?.success && migrationPayload.by_status && Array.isArray(migrationPayload.sample_sources)) {
+      setMigrationBackfill(migrationPayload)
+    } else {
+      setMigrationBackfill(null)
+      let description = migrationPayload?.error || 'Episode 迁移历史任务接口返回的数据不完整'
+      if (migrationResult.status === 'rejected') {
+        description = migrationResult.reason instanceof Error ? migrationResult.reason.message : String(migrationResult.reason)
+      }
+      toast({
+        title: '加载迁移任务失败',
+        description,
+        variant: 'destructive',
+      })
+    }
+  }, [limit, toast])
 
   const loadEpisodes = useCallback(async () => {
     setLoading(true)
@@ -150,7 +227,7 @@ export function MemoryEpisodeManager({
           platform: platform.trim(),
           userId: userId.trim(),
           personId: directPersonId,
-          limit: parsePositiveInt(limit, 20),
+          limit: parsePositiveInt(limit) ?? 20,
           timeStart: parseOptionalNumber(timeStart),
           timeEnd: parseOptionalNumber(timeEnd),
         }),
@@ -158,8 +235,8 @@ export function MemoryEpisodeManager({
       ])
       const nextItems = listPayload.items ?? []
       setItems(nextItems)
-      if (!selectedId && nextItems.length > 0) {
-        setSelectedId(getEpisodeId(nextItems[0]))
+      if (nextItems.length > 0) {
+        setSelectedId((current) => current || getEpisodeId(nextItems[0]))
       }
     } catch (error) {
       toast({
@@ -170,25 +247,34 @@ export function MemoryEpisodeManager({
     } finally {
       setLoading(false)
     }
-  }, [limit, loadStatus, personId, platform, query, selectedId, showAdvancedPersonId, source, timeEnd, timeStart, toast, userId])
+  }, [limit, loadStatus, personId, platform, query, showAdvancedPersonId, source, timeEnd, timeStart, toast, userId])
 
   const loadDetail = useCallback(async (episodeId: string) => {
+    const requestId = detailRequestIdRef.current + 1
+    detailRequestIdRef.current = requestId
     if (!episodeId) {
       setDetail(null)
       return
     }
+    setDetail(null)
     setDetailLoading(true)
     try {
       const payload = await getMemoryEpisode(episodeId)
-      setDetail(payload)
+      if (detailRequestIdRef.current === requestId) {
+        setDetail(payload)
+      }
     } catch (error) {
-      toast({
-        title: '加载 Episode 详情失败',
-        description: error instanceof Error ? error.message : String(error),
-        variant: 'destructive',
-      })
+      if (detailRequestIdRef.current === requestId) {
+        toast({
+          title: '加载 Episode 详情失败',
+          description: error instanceof Error ? error.message : String(error),
+          variant: 'destructive',
+        })
+      }
     } finally {
-      setDetailLoading(false)
+      if (detailRequestIdRef.current === requestId) {
+        setDetailLoading(false)
+      }
     }
   }, [toast])
 
@@ -269,7 +355,7 @@ export function MemoryEpisodeManager({
       })
       toast({
         title: payload.success ? 'Episode 重建已提交' : 'Episode 重建失败',
-        description: String(payload.detail ?? payload.error ?? `影响来源 ${payload.rebuilt ?? 0} 个`),
+        description: getEpisodeActionDescription(payload),
         variant: payload.success ? 'default' : 'destructive',
       })
       await loadEpisodes()
@@ -285,21 +371,32 @@ export function MemoryEpisodeManager({
   }, [loadEpisodes, rebuildAll, rebuildSource, rebuildSources, toast])
 
   const submitProcessPending = useCallback(async () => {
+    const limit = parsePositiveInt(pendingLimit, 200)
+    const maxAttempts = parsePositiveInt(pendingMaxRetry, 20)
+    if (limit === undefined || maxAttempts === undefined) {
+      toast({
+        title: '处理参数无效',
+        description: '本次处理上限必须是1至200的整数，最大尝试次数必须是1至20的整数。',
+        variant: 'destructive',
+      })
+      return
+    }
+
     setActionLoading(true)
     try {
       const payload = await processMemoryEpisodePending({
-        limit: parsePositiveInt(pendingLimit, 20),
-        max_retry: parsePositiveInt(pendingMaxRetry, 3),
+        limit,
+        max_retry: maxAttempts,
       })
       toast({
-        title: payload.success ? '已处理待生成 Episode' : '处理待生成 Episode 失败',
-        description: String(payload.detail ?? payload.error ?? `已处理 ${payload.processed ?? 0} 项`),
+        title: payload.success ? '已处理来源重建任务' : '处理来源重建任务失败',
+        description: getEpisodeActionDescription(payload),
         variant: payload.success ? 'default' : 'destructive',
       })
       await loadEpisodes()
     } catch (error) {
       toast({
-        title: '处理待生成 Episode 失败',
+        title: '处理来源重建任务失败',
         description: error instanceof Error ? error.message : String(error),
         variant: 'destructive',
       })
@@ -308,14 +405,41 @@ export function MemoryEpisodeManager({
     }
   }, [loadEpisodes, pendingLimit, pendingMaxRetry, toast])
 
+  const submitDiscardMigrationBackfill = useCallback(async () => {
+    const count = migrationBackfill?.candidates ?? 0
+    if (count === 0) {
+      return
+    }
+    setActionLoading(true)
+    try {
+      const result = await discardMemoryEpisodeMigrationBackfill()
+      if (!result.success) {
+        throw new Error(result.error || '丢弃 Episode 迁移历史任务失败')
+      }
+      toast({
+        title: '已丢弃历史 Episode 任务',
+        description: `已丢弃 ${result.discarded} 条迁移任务；${result.active_skipped} 条运行中的任务仍需等待完成后再次处理。`,
+      })
+      await loadEpisodes()
+    } catch (error) {
+      toast({
+        title: '丢弃历史 Episode 任务失败',
+        description: error instanceof Error ? error.message : String(error),
+        variant: 'destructive',
+      })
+    } finally {
+      setActionLoading(false)
+    }
+  }, [loadEpisodes, migrationBackfill?.candidates, toast])
+
   return (
     <div className="space-y-4">
       <div className="grid gap-4 xl:grid-cols-4">
         {[
-          { label: '待处理队列', value: Number(status?.pending_queue ?? 0) },
           { label: '待重建', value: getStatusCount(status, 'pending') },
           { label: '运行中', value: getStatusCount(status, 'running') },
-          { label: '失败来源', value: failedItems.length || getStatusCount(status, 'failed') },
+          { label: '已完成', value: getStatusCount(status, 'done') },
+          { label: '失败来源', value: getStatusCount(status, 'failed') || failedItems.length },
         ].map((item) => (
           <Card key={item.label}>
             <CardHeader className="pb-3">
@@ -553,23 +677,39 @@ export function MemoryEpisodeManager({
 
               <div className="space-y-3 rounded-lg border bg-muted/10 p-3">
                 <div>
-                  <div className="text-sm font-medium">处理待生成任务</div>
+                  <div className="text-sm font-medium">处理来源重建任务</div>
                   <div className="mt-1 text-xs text-muted-foreground">
-                    适用于后台已有待生成段落时，手动推进这些段落生成 Episode。
+                    适用于后台已有待重建来源时，手动推进这些来源生成 Episode。
                   </div>
                 </div>
                 <div className="grid gap-3 md:grid-cols-[1fr_1fr_auto] md:items-end">
                   <div className="space-y-2">
                     <Label htmlFor="episode-pending-limit">本次处理上限</Label>
-                    <Input id="episode-pending-limit" type="number" value={pendingLimit} onChange={(event) => setPendingLimit(event.target.value)} />
+                    <Input
+                      id="episode-pending-limit"
+                      type="number"
+                      min={1}
+                      max={200}
+                      step={1}
+                      value={pendingLimit}
+                      onChange={(event) => setPendingLimit(event.target.value)}
+                    />
                   </div>
                   <div className="space-y-2">
-                    <Label htmlFor="episode-pending-retry">失败重试上限</Label>
-                    <Input id="episode-pending-retry" type="number" value={pendingMaxRetry} onChange={(event) => setPendingMaxRetry(event.target.value)} />
+                    <Label htmlFor="episode-pending-retry">最大尝试次数（含首次）</Label>
+                    <Input
+                      id="episode-pending-retry"
+                      type="number"
+                      min={1}
+                      max={20}
+                      step={1}
+                      value={pendingMaxRetry}
+                      onChange={(event) => setPendingMaxRetry(event.target.value)}
+                    />
                   </div>
                   <Button variant="outline" onClick={() => void submitProcessPending()} disabled={actionLoading}>
                     <Play className="mr-2 h-4 w-4" />
-                    处理待生成任务
+                    处理来源重建任务
                   </Button>
                 </div>
               </div>
@@ -577,6 +717,62 @@ export function MemoryEpisodeManager({
           </Card>
         </div>
       </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Trash2 className="h-4 w-4" />
+            丢弃升级迁移的历史任务
+          </CardTitle>
+          <CardDescription>
+            仅清理升级迁移留下的 Episode 来源任务，保留已经生成的 Episode。之后有新记忆写入时，仍会正常自动生成。
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="text-sm">
+            可丢弃 {migrationBackfill?.candidates ?? 0} 条迁移来源记录
+            {migrationBackfill?.active_skipped ? `，运行中暂不处理 ${migrationBackfill.active_skipped} 条` : ''}
+          </div>
+          {migrationBackfill ? (
+            <div className="text-xs text-muted-foreground">
+              待重建 {migrationBackfill.by_status.pending ?? 0}、已完成 {migrationBackfill.by_status.done ?? 0}、失败 {migrationBackfill.by_status.failed ?? 0}
+            </div>
+          ) : null}
+          {migrationBackfill?.sample_sources.length ? (
+            <div className="break-all text-xs text-muted-foreground">
+              来源示例：{migrationBackfill.sample_sources.slice(0, 3).join('、')}
+            </div>
+          ) : null}
+          <Button
+            variant="outline"
+            onClick={() => setDiscardDialogOpen(true)}
+            disabled={actionLoading || !migrationBackfill?.candidates}
+          >
+            <Trash2 className="mr-2 h-4 w-4" />
+            丢弃历史任务
+          </Button>
+        </CardContent>
+      </Card>
+
+      <AlertDialog open={discardDialogOpen} onOpenChange={setDiscardDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认丢弃历史 Episode 任务</AlertDialogTitle>
+            <AlertDialogDescription>
+              将丢弃 {migrationBackfill?.candidates ?? 0} 条升级迁移留下的来源任务。已有 Episode 和之后新写入的自动生成不受影响。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={actionLoading}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={actionLoading || !migrationBackfill?.candidates}
+              onClick={() => void submitDiscardMigrationBackfill()}
+            >
+              确认丢弃
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict
 
 import asyncio
 import hashlib
 import json
-import pickle
 import numpy as np
 import pytest
 
 from src.A_memorix.core.runtime import sdk_memory_kernel as kernel_module
 from src.A_memorix.core.runtime.sdk_memory_kernel import SDKMemoryKernel
+from src.A_memorix.core.runtime.services.embedding_state_service import MemoryEmbeddingStateService
+from src.A_memorix.core.storage import MetadataStore, VectorStore
 
 
 class _FakeEmbeddingManager:
@@ -56,7 +58,40 @@ class _FakeEmbeddingManager:
             "provider": "fake-provider",
             "dimension": effective_dimension,
             "dimension_request_mode": "explicit",
-            "source": "configured",
+            "source": "observed",
+        }
+
+
+class _FallbackEmbeddingManager(_FakeEmbeddingManager):
+    def __init__(
+        self,
+        *,
+        candidates: tuple[str, ...],
+        successful_model: str,
+        initial_observed_model: str = "",
+        dimension: int = 8,
+    ) -> None:
+        super().__init__(dimension=dimension, model_name=candidates[0])
+        self.candidates = tuple(candidates)
+        self.successful_model = successful_model
+        self.observed_model = initial_observed_model
+
+    async def encode(self, text: Any, **kwargs: Any) -> np.ndarray:
+        self.observed_model = self.successful_model
+        return await super().encode(text, **kwargs)
+
+    def get_embedding_fingerprint(self, *, dimension: int | None = None) -> Dict[str, Any]:
+        effective_dimension = int(dimension or self.default_dimension)
+        model_name = self.observed_model or self.candidates[0]
+        raw = f"{model_name}|fake-provider|{effective_dimension}|explicit"
+        return {
+            "version": 1,
+            "hash": f"sha256:{hashlib.sha256(raw.encode('utf-8')).hexdigest()}",
+            "model": model_name,
+            "provider": "fake-provider",
+            "dimension": effective_dimension,
+            "dimension_request_mode": "explicit",
+            "source": "observed" if self.observed_model else "configured",
         }
 
 
@@ -91,6 +126,123 @@ def _dual_kernel_config(data_dir: Path, dimension: int) -> dict[str, Any]:
     return config
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pool_mode", "stored_state"),
+    [
+        ("single", "compatible"),
+        ("dual", "compatible"),
+        ("single", "fingerprint_mismatch"),
+        ("dual", "fingerprint_mismatch"),
+        ("single", "missing"),
+        ("dual", "missing"),
+        ("dual", "dual_fingerprint_mismatch"),
+    ],
+)
+async def test_pending_single_pool_recovers_after_real_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pool_mode: str,
+    stored_state: str,
+) -> None:
+    """真实磁盘单池在请求确认指纹后恢复；不兼容或丢失时保留准确的阻塞状态。"""
+    data_dir = tmp_path / "memory"
+    embedding = _FallbackEmbeddingManager(
+        candidates=("fake-embedding",),
+        successful_model="fake-embedding",
+        initial_observed_model="fake-embedding",
+    )
+    metadata = MetadataStore(data_dir=data_dir / "metadata")
+    metadata.connect()
+    try:
+        paragraph_hash = metadata.add_paragraph(content="重启后仍应检索到的旧单池记忆", source="test")
+    finally:
+        metadata.close()
+    vector = await embedding.encode("重启后仍应检索到的旧单池记忆")
+    store = VectorStore(dimension=embedding.default_dimension, data_dir=data_dir / "vectors")
+    store.add(np.asarray([vector]), [paragraph_hash])
+    fingerprint = embedding.get_embedding_fingerprint()
+    if stored_state == "fingerprint_mismatch":
+        fingerprint["hash"] = "different-model-fingerprint"
+    store.save(embedding_fingerprint=fingerprint)
+    if stored_state == "dual_fingerprint_mismatch":
+        # 已发布双池明确不兼容时，即使旧单池完整且兼容，也不能绕过双池校验。
+        (data_dir / "vectors" / "dual_ready.json").write_text(
+            json.dumps(
+                {
+                    "status": "ready",
+                    "dimension": embedding.default_dimension,
+                    "paragraph_vectors": 1,
+                    "graph_vectors": 1,
+                    "embedding_fingerprint": {"hash": "different-dual-model"},
+                }
+            ),
+            encoding="utf-8",
+        )
+    embedding.observed_model = ""
+    embedding.encode_calls.clear()
+
+    config = _kernel_config(data_dir, embedding.default_dimension)
+    config["retrieval"]["vector_pools"]["mode"] = pool_mode
+    kernel = SDKMemoryKernel(plugin_root=tmp_path, config=config)
+    monkeypatch.setattr(kernel_module, "create_embedding_api_adapter", lambda **kwargs: embedding)
+
+    async def no_background_tasks() -> None:
+        # 手动驱动同一个恢复入口，避免后台探测与断言并发；不调用外部模型。
+        pass
+
+    monkeypatch.setattr(kernel, "_start_background_tasks", no_background_tasks)
+    try:
+        await kernel.initialize()
+        assert kernel._vector_health["error_code"] == "embedding_fingerprint_unavailable"
+        assert kernel.vector_store is None
+        assert embedding.encode_calls == []
+        if stored_state == "missing":
+            (data_dir / "vectors" / "vectors_metadata.json").unlink()
+        files_before = {
+            path.name: path.read_bytes() for path in (data_dir / "vectors").iterdir() if path.is_file()
+        }
+
+        result = await kernel.memory_runtime_admin(action="recover_embedding")
+
+        assert result["success"] is True
+        assert result["recovered"] is True
+        assert embedding.observed_model == "fake-embedding"
+        assert len(embedding.encode_calls) == 1
+        assert kernel._dual_vector_pools_enabled() is False
+        if stored_state == "compatible":
+            assert result["vector_restored"] is True
+            assert result["vector_available"] is True
+            assert result["vector_health"]["state"] == "healthy"
+            assert paragraph_hash in kernel.vector_store
+            assert kernel._runtime_capabilities["vector_read"] is True
+            assert kernel._runtime_capabilities["vector_write"] is True
+            assert kernel.retriever is not None
+            assert kernel.retriever.config.vector_pools.mode == "single"
+            assert kernel.retriever._is_sparse_only_runtime() is False
+            hashes, _ = kernel.vector_store.search(vector, k=1)
+            assert hashes == [paragraph_hash]
+        else:
+            assert result["vector_restored"] is False
+            assert result["vector_available"] is False
+            expected_code = (
+                "vector_generation_missing" if stored_state == "missing" else "v2_fingerprint_mismatch"
+            )
+            assert result["vector_health"]["error_code"] == expected_code
+            assert result["vector_health"]["recovery_stage"] == "rebuild_required"
+            assert kernel.vector_store is None
+            # 再次手动探测必须仍返回真实的向量故障，不能把 Embedding 成功当作通道恢复。
+            repeated = await kernel.memory_runtime_admin(action="recover_embedding")
+            assert repeated["vector_available"] is False
+            assert repeated["vector_health"]["error_code"] == expected_code
+        for name, content in files_before.items():
+            assert (data_dir / "vectors" / name).read_bytes() == content
+        assert not (data_dir / "vector_quarantine").exists()
+        assert (data_dir / "vectors" / "dual_ready.json").exists() == (stored_state == "dual_fingerprint_mismatch")
+    finally:
+        await kernel.shutdown()
+
+
 async def _fake_runtime_self_check(**kwargs: Any) -> dict[str, Any]:
     vector_store = kwargs["vector_store"]
     embedding_manager = kwargs["embedding_manager"]
@@ -114,6 +266,34 @@ async def _wait_background_task(kernel: SDKMemoryKernel, name: str) -> None:
     if task is None:
         return
     await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_hash"),
+    [
+        ("observed", "sha256:observed"),
+        ("OBSERVED", "sha256:observed"),
+        ("configured", None),
+        ("unknown", None),
+        (None, None),
+    ],
+)
+def test_embedding_fingerprint_validation_only_trusts_observed_source(
+    source: str | None,
+    expected_hash: str | None,
+) -> None:
+    fingerprint: Dict[str, Any] = {"hash": "sha256:observed"}
+    if source is not None:
+        fingerprint["source"] = source
+    manager = SimpleNamespace(
+        default_dimension=8,
+        get_embedding_fingerprint=lambda *, dimension: fingerprint,
+    )
+    service = MemoryEmbeddingStateService(SimpleNamespace(embedding_manager=manager))
+
+    result = service._current_embedding_fingerprint_for_validation()
+
+    assert (result or {}).get("hash") == expected_hash
 
 
 def test_dual_auto_migration_progress_tracks_stable_fields(
@@ -296,6 +476,10 @@ async def test_runtime_admin_rebuild_all_vectors_replaces_existing_store(
         ["stale-vector"],
     )
     kernel.vector_store.save()
+    kernel._set_runtime_capability("vector_read", False)
+    kernel._apply_runtime_sparse_mode()
+    assert kernel.retriever is not None
+    assert kernel.retriever._runtime_sparse_only is True
 
     preview = await kernel.memory_runtime_admin(action="rebuild_all_vectors", dry_run=True)
     assert preview["success"] is True
@@ -316,6 +500,7 @@ async def test_runtime_admin_rebuild_all_vectors_replaces_existing_store(
     assert kernel.summary_importer.vector_store is not old_summary_importer_store
     assert kernel.person_profile_service.vector_store is not old_profile_store
     assert kernel.episode_retriever.retriever is not old_episode_retriever
+    assert kernel.retriever._runtime_sparse_only is False
 
     config = await kernel.memory_runtime_admin(action="get_config")
     assert config["vector_rebuild_required"] is False
@@ -416,7 +601,9 @@ async def test_dual_rebuild_reencodes_when_single_pool_fingerprint_mismatches(
     await first_kernel.initialize()
     assert first_kernel.metadata_store is not None
     paragraph_hash = first_kernel.metadata_store.add_paragraph("需要重编码的段落", source="test")
-    result = await first_kernel.memory_runtime_admin(action="rebuild_all_vectors", batch_size=2, include_relations=False)
+    result = await first_kernel.memory_runtime_admin(
+        action="rebuild_all_vectors", batch_size=2, include_relations=False
+    )
     assert result["success"] is True
     assert paragraph_hash in first_kernel.vector_store
     await first_kernel.shutdown()
@@ -430,7 +617,9 @@ async def test_dual_rebuild_reencodes_when_single_pool_fingerprint_mismatches(
     )
     await second_kernel.initialize()
     try:
-        result = await second_kernel.memory_runtime_admin(action="rebuild_all_vectors", batch_size=2, include_relations=False)
+        result = await second_kernel.memory_runtime_admin(
+            action="rebuild_all_vectors", batch_size=2, include_relations=False
+        )
         assert result["success"] is True
         assert result["migration"]["paragraphs"]["copied"] == 0
         assert result["migration"]["paragraphs"]["encoded"] == 1
@@ -581,7 +770,7 @@ async def test_dual_initialize_without_ready_manifest_falls_back_to_single_pool(
         np.ones((1, fake_embedding_manager.default_dimension), dtype=np.float32),
         ["legacy-paragraph"],
     )
-    kernel.vector_store.save()
+    kernel._save_vector_store(kernel.vector_store)
     await kernel.shutdown()
 
     paragraph_dir = data_dir / "vectors" / "paragraph"
@@ -604,49 +793,83 @@ async def test_dual_initialize_without_ready_manifest_falls_back_to_single_pool(
     await dual_kernel.shutdown()
 
 
+def test_dual_cleanup_keeps_activated_directories_when_ready_manifest_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "a_memorix_data"
+    kernel = SDKMemoryKernel(
+        plugin_root=tmp_path / "plugin_root",
+        config=_dual_kernel_config(data_dir, 8),
+    )
+    vectors_root = data_dir / "vectors"
+    paragraph_dir = vectors_root / "paragraph"
+    graph_dir = vectors_root / "graph"
+    paragraph_dir.mkdir(parents=True)
+    graph_dir.mkdir(parents=True)
+    (paragraph_dir / "current.txt").write_text("new paragraph", encoding="utf-8")
+    (graph_dir / "current.txt").write_text("new graph", encoding="utf-8")
+
+    backup_root = vectors_root / "dual_backup_1"
+    backup_paragraph = backup_root / "paragraph"
+    backup_graph = backup_root / "graph"
+    backup_paragraph.mkdir(parents=True)
+    backup_graph.mkdir(parents=True)
+    (backup_paragraph / "old.txt").write_text("old paragraph", encoding="utf-8")
+    (backup_graph / "old.txt").write_text("old graph", encoding="utf-8")
+    (backup_root / "activation.json").write_text(
+        json.dumps({"status": "activated", "had_paragraph": True, "had_graph": True}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kernel, "_dual_vector_ready", lambda **kwargs: False)
+
+    kernel._dual_vector_state_service._cleanup_stale_dual_vector_build_dirs()
+
+    assert (paragraph_dir / "current.txt").read_text(encoding="utf-8") == "new paragraph"
+    assert (graph_dir / "current.txt").read_text(encoding="utf-8") == "new graph"
+    assert not backup_root.exists()
+
+
 @pytest.mark.asyncio
-async def test_default_dual_mode_starts_auto_migration_without_blocking_initialize(
+async def test_default_dual_mode_does_not_start_historical_reembedding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     fake_embedding_manager = _FakeEmbeddingManager(dimension=8)
     data_dir = tmp_path / "a_memorix_data"
-    release = asyncio.Event()
-    rebuild_started = asyncio.Event()
+    rebuild_calls = 0
     monkeypatch.setattr(kernel_module, "create_embedding_api_adapter", lambda **kw: fake_embedding_manager)
     monkeypatch.setattr(kernel_module, "run_embedding_runtime_self_check", _fake_runtime_self_check)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_LOCK_RETRY_DELAYS_SECONDS", ())
 
     kernel = SDKMemoryKernel(
         plugin_root=tmp_path / "plugin_root",
         config=_default_dual_kernel_config(data_dir, fake_embedding_manager.default_dimension),
     )
-    original_rebuild = kernel._rebuild_all_vectors
+    async def _unexpected_rebuild(**kwargs: Any) -> dict[str, Any]:
+        nonlocal rebuild_calls
+        del kwargs
+        rebuild_calls += 1
+        return {"success": True}
 
-    async def _blocked_rebuild(**kwargs: Any) -> dict[str, Any]:
-        rebuild_started.set()
-        await release.wait()
-        return await original_rebuild(**kwargs)
-
-    monkeypatch.setattr(kernel, "_rebuild_all_vectors", _blocked_rebuild)
+    monkeypatch.setattr(kernel, "_rebuild_all_vectors", _unexpected_rebuild)
     await kernel.initialize()
     try:
         assert kernel.retriever.config.vector_pools.mode == "single"
         assert kernel._dual_vector_pools_enabled() is False
-        await asyncio.wait_for(rebuild_started.wait(), timeout=1.0)
+        await asyncio.sleep(0)
         config = await kernel.memory_runtime_admin(action="get_config")
         assert config["vector_pools"]["configured_mode"] == "dual"
         assert config["vector_pools_effective_mode"] == "single"
-        assert config["vector_pools"]["auto_migration"]["running"] is True
+        assert config["vector_pools"]["auto_migration"]["running"] is False
+        assert config["vector_pools"]["auto_migration"]["attempted"] is False
+        assert "dual_vector_auto_migration" not in kernel._background_tasks
+        assert rebuild_calls == 0
     finally:
-        release.set()
-        await _wait_background_task(kernel, "dual_vector_auto_migration")
         await kernel.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_dual_auto_migration_switches_to_dual_when_rebuild_succeeds(
+async def test_existing_single_pool_is_not_automatically_reembedded_into_dual_pools(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -654,8 +877,6 @@ async def test_dual_auto_migration_switches_to_dual_when_rebuild_succeeds(
     data_dir = tmp_path / "a_memorix_data"
     monkeypatch.setattr(kernel_module, "create_embedding_api_adapter", lambda **kw: fake_embedding_manager)
     monkeypatch.setattr(kernel_module, "run_embedding_runtime_self_check", _fake_runtime_self_check)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_LOCK_RETRY_DELAYS_SECONDS", ())
 
     single_kernel = SDKMemoryKernel(
         plugin_root=tmp_path / "plugin_root_single",
@@ -665,8 +886,11 @@ async def test_dual_auto_migration_switches_to_dual_when_rebuild_succeeds(
     assert single_kernel.metadata_store is not None
     paragraph_hash = single_kernel.metadata_store.add_paragraph("自动迁移段落", source="test")
     entity_hash = single_kernel.metadata_store.add_entity("自动迁移实体")
-    rebuild = await single_kernel.memory_runtime_admin(action="rebuild_all_vectors", batch_size=2, include_relations=False)
+    rebuild = await single_kernel.memory_runtime_admin(
+        action="rebuild_all_vectors", batch_size=2, include_relations=False
+    )
     assert rebuild["success"] is True
+    encode_calls_before_reload = len(fake_embedding_manager.encode_calls)
     await single_kernel.shutdown()
 
     kernel = SDKMemoryKernel(
@@ -674,22 +898,22 @@ async def test_dual_auto_migration_switches_to_dual_when_rebuild_succeeds(
         config=_dual_kernel_config(data_dir, fake_embedding_manager.default_dimension),
     )
     await kernel.initialize()
-    await _wait_background_task(kernel, "dual_vector_auto_migration")
-
-    assert kernel._dual_vector_pools_enabled() is True
-    assert kernel.retriever.config.vector_pools.mode == "dual"
-    assert (data_dir / "vectors" / "dual_ready.json").exists()
-    assert paragraph_hash in kernel.paragraph_vector_store
-    assert f"entity:{entity_hash}" in kernel.graph_vector_store
-    config = await kernel.memory_runtime_admin(action="get_config")
-    assert config["vector_pools"]["auto_migration"]["success"] is True
-    assert config["vector_pools_effective_mode"] == "dual"
-
-    await kernel.shutdown()
+    try:
+        assert kernel._dual_vector_pools_enabled() is False
+        assert kernel.retriever.config.vector_pools.mode == "single"
+        assert not (data_dir / "vectors" / "dual_ready.json").exists()
+        assert paragraph_hash in kernel.vector_store
+        assert entity_hash in kernel.vector_store
+        assert len(fake_embedding_manager.encode_calls) == encode_calls_before_reload
+        config = await kernel.memory_runtime_admin(action="get_config")
+        assert config["vector_pools"]["auto_migration"]["attempted"] is False
+        assert config["vector_pools_effective_mode"] == "single"
+    finally:
+        await kernel.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_dual_auto_migration_failure_keeps_single_pool(
+async def test_dual_auto_migration_callback_is_never_invoked(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -697,8 +921,7 @@ async def test_dual_auto_migration_failure_keeps_single_pool(
     data_dir = tmp_path / "a_memorix_data"
     monkeypatch.setattr(kernel_module, "create_embedding_api_adapter", lambda **kw: fake_embedding_manager)
     monkeypatch.setattr(kernel_module, "run_embedding_runtime_self_check", _fake_runtime_self_check)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_LOCK_RETRY_DELAYS_SECONDS", ())
+    rebuild_calls = 0
 
     kernel = SDKMemoryKernel(
         plugin_root=tmp_path / "plugin_root",
@@ -706,48 +929,41 @@ async def test_dual_auto_migration_failure_keeps_single_pool(
     )
 
     async def _failed_rebuild(**kwargs: Any) -> dict[str, Any]:
+        nonlocal rebuild_calls
         del kwargs
+        rebuild_calls += 1
         return {"success": False, "error": "embedding_down", "detail": "embedding_down"}
 
     monkeypatch.setattr(kernel, "_rebuild_all_vectors", _failed_rebuild)
     await kernel.initialize()
-    await _wait_background_task(kernel, "dual_vector_auto_migration")
-
-    assert kernel._dual_vector_pools_enabled() is False
-    assert kernel.retriever.config.vector_pools.mode == "single"
-    assert not (data_dir / "vectors" / "dual_ready.json").exists()
-    config = await kernel.memory_runtime_admin(action="get_config")
-    assert config["vector_pools"]["auto_migration"]["success"] is False
-    assert config["vector_pools"]["auto_migration"]["last_error"] == "embedding_down"
-
-    await kernel.shutdown()
+    try:
+        await asyncio.sleep(0)
+        assert rebuild_calls == 0
+        assert kernel._dual_vector_pools_enabled() is False
+        assert kernel.retriever.config.vector_pools.mode == "single"
+        assert not (data_dir / "vectors" / "dual_ready.json").exists()
+        config = await kernel.memory_runtime_admin(action="get_config")
+        assert config["vector_pools"]["auto_migration"]["attempted"] is False
+        assert config["vector_pools"]["auto_migration"]["last_error"] == ""
+    finally:
+        await kernel.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_dual_auto_migration_waits_for_manual_rebuild_lock_once(
+async def test_dual_auto_migration_does_not_wait_for_manual_rebuild_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     fake_embedding_manager = _FakeEmbeddingManager(dimension=8)
     data_dir = tmp_path / "a_memorix_data"
-    sleep_calls: list[float] = []
     rebuild_calls = 0
-    release_lock = asyncio.Event()
     monkeypatch.setattr(kernel_module, "create_embedding_api_adapter", lambda **kw: fake_embedding_manager)
     monkeypatch.setattr(kernel_module, "run_embedding_runtime_self_check", _fake_runtime_self_check)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(kernel_module, "DUAL_VECTOR_AUTO_MIGRATION_LOCK_RETRY_DELAYS_SECONDS", (0.01,))
 
     kernel = SDKMemoryKernel(
         plugin_root=tmp_path / "plugin_root",
         config=_dual_kernel_config(data_dir, fake_embedding_manager.default_dimension),
     )
-
-    async def _fast_sleep(seconds: float) -> None:
-        sleep_calls.append(seconds)
-        if seconds > 0:
-            release_lock.set()
-            await asyncio.sleep(0)
 
     async def _fake_rebuild(**kwargs: Any) -> dict[str, Any]:
         nonlocal rebuild_calls
@@ -756,17 +972,15 @@ async def test_dual_auto_migration_waits_for_manual_rebuild_lock_once(
         kernel._dual_vector_pools_ready = True
         return {"success": True}
 
-    monkeypatch.setattr(kernel, "_sleep_background", _fast_sleep)
     monkeypatch.setattr(kernel, "_rebuild_all_vectors", _fake_rebuild)
 
     async with kernel._vector_rebuild_lock:
         await kernel.initialize()
-        await asyncio.wait_for(release_lock.wait(), timeout=1.0)
-    await _wait_background_task(kernel, "dual_vector_auto_migration")
+        await asyncio.sleep(0)
 
-    assert rebuild_calls == 1
-    assert 0.01 in sleep_calls
-    assert kernel._dual_vector_pools_enabled() is True
+    assert rebuild_calls == 0
+    assert kernel._dual_vector_pools_enabled() is False
+    assert "dual_vector_auto_migration" not in kernel._background_tasks
 
     await kernel.shutdown()
 
@@ -860,7 +1074,7 @@ async def test_runtime_admin_rebuild_all_vectors_rejects_concurrent_request(
 
 
 @pytest.mark.asyncio
-async def test_initialize_dimension_mismatch_keeps_vector_store_empty_until_rebuild(
+async def test_initialize_dimension_mismatch_preserves_old_generation_until_rebuild(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -885,6 +1099,8 @@ async def test_initialize_dimension_mismatch_keeps_vector_store_empty_until_rebu
     )
     first_kernel.vector_store.save()
     await first_kernel.shutdown()
+    vector_bytes = (data_dir / "vectors" / "vectors.bin").read_bytes()
+    id_bytes = (data_dir / "vectors" / "vectors_ids.bin").read_bytes()
 
     second_embedding_manager = _FakeEmbeddingManager(dimension=12)
     monkeypatch.setattr(
@@ -898,59 +1114,34 @@ async def test_initialize_dimension_mismatch_keeps_vector_store_empty_until_rebu
         config=_kernel_config(data_dir, second_embedding_manager.default_dimension),
     )
     await second_kernel.initialize()
-    assert second_kernel.vector_store is not None
-    assert second_kernel.vector_store.dimension == first_embedding_manager.default_dimension
-    assert second_kernel.vector_store.num_vectors == 1
-    assert "old-dimension-vector" in second_kernel.vector_store
+    try:
+        assert second_kernel.vector_store is None
+        assert second_kernel._vector_health["state"] == "incompatible"
+        assert second_kernel._vector_health["error_code"] == "v2_dimension_mismatch"
+        assert (data_dir / "vectors" / "vectors.bin").read_bytes() == vector_bytes
+        assert (data_dir / "vectors" / "vectors_ids.bin").read_bytes() == id_bytes
+        assert not (data_dir / "vector_quarantine").exists()
 
-    config = await second_kernel.memory_runtime_admin(action="get_config")
-    assert config["vector_rebuild_required"] is True
-    assert config["embedding_fingerprint_status"] == "mismatched"
+        config = await second_kernel.memory_runtime_admin(action="get_config")
+        assert config["runtime_ready"] is True
+        assert config["degraded"] is True
+        assert config["stored_vector_dimension"] == first_embedding_manager.default_dimension
+        assert config["vector_rebuild_required"] is True
+        assert config["vector_health"]["error_code"] == "v2_dimension_mismatch"
 
-    recover = await second_kernel.memory_runtime_admin(action="recover_embedding")
-    assert recover["success"] is False
-    assert recover["detail"] == "dimension_mismatch"
-
-    config = await second_kernel.memory_runtime_admin(action="get_config")
-    assert config["embedding_dimension"] == second_embedding_manager.default_dimension
-    assert config["vector_rebuild_required"] is True
-    assert config["stored_vector_dimension"] == first_embedding_manager.default_dimension
-    assert config["embedding_degraded"] is True
-
-    await second_kernel.shutdown()
-
-    third_kernel = SDKMemoryKernel(
-        plugin_root=tmp_path / "plugin_root_third",
-        config=_kernel_config(data_dir, second_embedding_manager.default_dimension),
-    )
-    await third_kernel.initialize()
-    assert third_kernel.vector_store is not None
-    assert third_kernel.vector_store.dimension == first_embedding_manager.default_dimension
-
-    config = await third_kernel.memory_runtime_admin(action="get_config")
-    assert config["vector_rebuild_required"] is True
-    assert config["embedding_fingerprint_status"] == "mismatched"
-
-    recover = await third_kernel.memory_runtime_admin(action="recover_embedding")
-    assert recover["detail"] == "dimension_mismatch"
-
-    result = await third_kernel.memory_runtime_admin(action="rebuild_all_vectors", batch_size=2)
-    assert result["success"] is True
-
-    await third_kernel.shutdown()
-
-    fourth_kernel = SDKMemoryKernel(
-        plugin_root=tmp_path / "plugin_root_fourth",
-        config=_kernel_config(data_dir, second_embedding_manager.default_dimension),
-    )
-    await fourth_kernel.initialize()
-
-    config = await fourth_kernel.memory_runtime_admin(action="get_config")
-    assert config["vector_rebuild_required"] is False
-    assert config["embedding_fingerprint_status"] == "matched"
-    assert config["stored_vector_dimension"] == second_embedding_manager.default_dimension
-
-    await fourth_kernel.shutdown()
+        rebuilt = await second_kernel.memory_runtime_admin(action="rebuild_all_vectors")
+        assert rebuilt["success"] is True
+        assert second_kernel.vector_store is not None
+        assert second_kernel.vector_store.dimension == second_embedding_manager.default_dimension
+        assert "old-dimension-vector" not in second_kernel.vector_store
+        second_kernel.vector_store.add(
+            np.ones((1, second_embedding_manager.default_dimension), dtype=np.float32),
+            ["new-generation-vector"],
+        )
+        second_kernel._save_vector_store(second_kernel.vector_store)
+        assert "new-generation-vector" in second_kernel.vector_store
+    finally:
+        await second_kernel.shutdown()
 
 
 @pytest.mark.asyncio
@@ -995,8 +1186,10 @@ async def test_rebuild_all_vectors_detects_new_embedding_dimension_without_recov
     )
     await second_kernel.initialize()
     try:
-        assert second_kernel.vector_store is not None
-        assert second_kernel.vector_store.dimension == first_embedding_manager.default_dimension
+        assert second_kernel.vector_store is None
+        assert second_kernel._vector_health["state"] == "incompatible"
+        assert second_kernel._vector_health["error_code"] == "v2_dimension_mismatch"
+        assert not (data_dir / "vector_quarantine").exists()
 
         result = await second_kernel.memory_runtime_admin(action="rebuild_all_vectors", batch_size=2)
 
@@ -1052,6 +1245,9 @@ async def test_dual_rebuild_detects_new_embedding_dimension_without_recover(
         assert config["stored_vector_dimension"] == first_embedding_manager.default_dimension
         assert config["embedding_dimension"] == second_embedding_manager.default_dimension
         assert config["vector_rebuild_required"] is True
+        assert config["degraded"] is True
+        assert config["vector_health"]["error_code"] == "v2_dimension_mismatch"
+        assert not (data_dir / "vector_quarantine").exists()
 
         preview = await second_kernel.memory_runtime_admin(action="rebuild_all_vectors", dry_run=True)
         assert preview["embedding_dimension"] == second_embedding_manager.default_dimension
@@ -1110,15 +1306,13 @@ async def test_plain_vector_store_save_preserves_existing_embedding_fingerprint(
         )
         kernel._save_vector_store(kernel.vector_store)
 
-        meta_path = data_dir / "vectors" / "vectors_metadata.pkl"
-        with open(meta_path, "rb") as handle:
-            first_meta = pickle.load(handle)
+        meta_path = data_dir / "vectors" / "vectors_metadata.json"
+        first_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         first_fingerprint = dict(first_meta["embedding_fingerprint"])
 
         kernel.vector_store.save()
 
-        with open(meta_path, "rb") as handle:
-            second_meta = pickle.load(handle)
+        second_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         assert second_meta["embedding_fingerprint"] == first_fingerprint
 
         config = await kernel.memory_runtime_admin(action="get_config")
@@ -1129,7 +1323,7 @@ async def test_plain_vector_store_save_preserves_existing_embedding_fingerprint(
 
 
 @pytest.mark.asyncio
-async def test_runtime_auto_stamps_missing_embedding_fingerprint_when_dimension_matches(
+async def test_runtime_does_not_auto_stamp_missing_embedding_fingerprint_when_dimension_matches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1154,19 +1348,19 @@ async def test_runtime_auto_stamps_missing_embedding_fingerprint_when_dimension_
             ["missing-fingerprint"],
         )
         kernel.vector_store.save()
-        meta_path = data_dir / "vectors" / "vectors_metadata.pkl"
-        with open(meta_path, "rb") as handle:
-            meta = pickle.load(handle)
+        meta_path = data_dir / "vectors" / "vectors_metadata.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta.pop("embedding_fingerprint", None)
-        with open(meta_path, "wb") as handle:
-            pickle.dump(meta, handle)
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
-        assert kernel._stored_vectors_compatible_with_current_embedding(kernel.vector_store) is True
+        assert kernel._stored_vectors_compatible_with_current_embedding(kernel.vector_store) is False
 
         config = await kernel.memory_runtime_admin(action="get_config")
-        assert config["embedding_fingerprint_status"] == "matched"
-        assert config["stored_embedding_fingerprint"]["hash"] == config["embedding_fingerprint"]["hash"]
-        assert config["vector_rebuild_required"] is False
+        assert config["embedding_fingerprint_status"] == "missing"
+        assert config["stored_embedding_fingerprint"] == {}
+        assert config["vector_rebuild_required"] is True
+        persisted = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert "embedding_fingerprint" not in persisted
     finally:
         await kernel.shutdown()
 
@@ -1197,13 +1391,11 @@ async def test_runtime_does_not_auto_stamp_missing_embedding_fingerprint_when_di
             ["dimension-mismatch"],
         )
         kernel.vector_store.save()
-        meta_path = data_dir / "vectors" / "vectors_metadata.pkl"
-        with open(meta_path, "rb") as handle:
-            meta = pickle.load(handle)
+        meta_path = data_dir / "vectors" / "vectors_metadata.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta.pop("embedding_fingerprint", None)
         meta["dimension"] = fake_embedding_manager.default_dimension + 1
-        with open(meta_path, "wb") as handle:
-            pickle.dump(meta, handle)
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True), encoding="utf-8")
 
         assert kernel._stored_vectors_compatible_with_current_embedding(kernel.vector_store) is False
 
@@ -1233,7 +1425,7 @@ async def test_dual_ready_manifest_rejects_mismatched_embedding_fingerprint(
     await first_kernel.initialize()
     try:
         assert first_kernel.metadata_store is not None
-        first_kernel.metadata_store.add_paragraph("双池旧指纹段落", source="test")
+        paragraph_hash = first_kernel.metadata_store.add_paragraph("双池旧指纹段落", source="test")
         first_kernel.metadata_store.add_entity("双池旧指纹实体")
         result = await first_kernel.memory_runtime_admin(
             action="rebuild_all_vectors",
@@ -1254,12 +1446,28 @@ async def test_dual_ready_manifest_rejects_mismatched_embedding_fingerprint(
     await second_kernel.initialize()
     try:
         assert second_kernel._dual_vector_pools_enabled() is False
-        assert second_kernel.retriever.config.vector_pools.mode == "single"
+        assert second_kernel.vector_store is None
+        assert second_kernel._vector_health["state"] == "incompatible"
+        assert not (data_dir / "vector_quarantine").exists()
         config = await second_kernel.memory_runtime_admin(action="get_config")
         assert config["vector_pools"]["configured_mode"] == "dual"
         assert config["vector_pools_effective_mode"] == "single"
         assert config["embedding_fingerprint_status"] == "mismatched"
         assert config["vector_rebuild_required"] is True
+        assert config["degraded"] is True
+        assert config["vector_health"]["error_code"] == "v2_fingerprint_mismatch"
+
+        rebuilt = await second_kernel.memory_runtime_admin(
+            action="rebuild_all_vectors",
+            batch_size=2,
+            include_relations=False,
+        )
+
+        assert rebuilt["success"] is True
+        assert second_kernel._dual_vector_pools_enabled() is True
+        assert second_kernel.paragraph_vector_store is not None
+        assert paragraph_hash in second_kernel.paragraph_vector_store
+        assert second_kernel._vector_health["state"] == "healthy"
     finally:
         await second_kernel.shutdown()
 
@@ -1358,7 +1566,7 @@ async def test_deferred_self_check_marks_dimension_mismatch(
 
 
 @pytest.mark.asyncio
-async def test_runtime_config_requires_rebuild_when_embedding_model_fingerprint_changes(
+async def test_runtime_isolates_fingerprint_mismatch_without_historical_reembedding(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1383,6 +1591,8 @@ async def test_runtime_config_requires_rebuild_when_embedding_model_fingerprint_
     first_config = await first_kernel.memory_runtime_admin(action="get_config")
     assert first_config["embedding_fingerprint_status"] == "matched"
     await first_kernel.shutdown()
+    vector_bytes = (data_dir / "vectors" / "vectors.bin").read_bytes()
+    id_bytes = (data_dir / "vectors" / "vectors_ids.bin").read_bytes()
 
     second_embedding_manager = _FakeEmbeddingManager(dimension=8, model_name="fake-embedding-b")
     monkeypatch.setattr(
@@ -1398,13 +1608,162 @@ async def test_runtime_config_requires_rebuild_when_embedding_model_fingerprint_
     await second_kernel.initialize()
     try:
         config = await second_kernel.memory_runtime_admin(action="get_config")
-        assert config["stored_vector_dimension"] == second_embedding_manager.default_dimension
+        assert second_kernel.vector_store is None
+        assert second_kernel._vector_health["state"] == "incompatible"
+        assert config["stored_vector_dimension"] == first_embedding_manager.default_dimension
         assert config["embedding_dimension"] == second_embedding_manager.default_dimension
         assert config["embedding_fingerprint_status"] == "mismatched"
         assert config["vector_rebuild_required"] is True
-        assert "模型指纹" in config["vector_rebuild_message"]
+        assert config["degraded"] is True
+        assert config["vector_health"]["error_code"] == "v2_fingerprint_mismatch"
+        assert second_embedding_manager.encode_calls == []
+        assert (data_dir / "vectors" / "vectors.bin").read_bytes() == vector_bytes
+        assert (data_dir / "vectors" / "vectors_ids.bin").read_bytes() == id_bytes
+        assert not (data_dir / "vector_quarantine").exists()
     finally:
         await second_kernel.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "restart_candidates",
+    [
+        ("fake-embedding-a", "fake-embedding-b"),
+        ("fake-embedding-b", "fake-embedding-a"),
+    ],
+)
+async def test_restart_waits_for_observed_fallback_model_before_loading_vectors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    restart_candidates: tuple[str, str],
+) -> None:
+    data_dir = tmp_path / "a_memorix_data"
+    first_embedding_manager = _FallbackEmbeddingManager(
+        candidates=("fake-embedding-a", "fake-embedding-b"),
+        successful_model="fake-embedding-b",
+        initial_observed_model="fake-embedding-b",
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "create_embedding_api_adapter",
+        lambda **kwargs: first_embedding_manager,
+    )
+    first_kernel = SDKMemoryKernel(
+        plugin_root=tmp_path / "plugin_root_first",
+        config=_kernel_config(data_dir, first_embedding_manager.default_dimension),
+    )
+    await first_kernel.initialize()
+    try:
+        assert first_kernel.metadata_store is not None
+        paragraph_hash = first_kernel.metadata_store.add_paragraph(
+            "候选模型回退后仍需复用的向量",
+            source="test",
+        )
+        rebuilt = await first_kernel.memory_runtime_admin(
+            action="rebuild_all_vectors",
+            batch_size=2,
+        )
+        assert rebuilt["success"] is True
+        assert paragraph_hash in first_kernel.vector_store
+    finally:
+        await first_kernel.shutdown()
+
+    restarted_embedding_manager = _FallbackEmbeddingManager(
+        candidates=restart_candidates,
+        successful_model="fake-embedding-b",
+    )
+    monkeypatch.setattr(
+        kernel_module,
+        "create_embedding_api_adapter",
+        lambda **kwargs: restarted_embedding_manager,
+    )
+    restarted_kernel = SDKMemoryKernel(
+        plugin_root=tmp_path / "plugin_root_second",
+        config=_kernel_config(data_dir, restarted_embedding_manager.default_dimension),
+    )
+    await restarted_kernel.initialize()
+    try:
+        assert restarted_kernel.vector_store is None
+        assert restarted_kernel._vector_health["state"] == "verification_pending"
+        assert restarted_kernel._vector_health["error_code"] == "embedding_fingerprint_unavailable"
+        assert not (data_dir / "vector_quarantine").exists()
+
+        recovered = await restarted_kernel._embedding_state_service._recover_embedding_once()
+
+        assert recovered["success"] is True
+        assert restarted_embedding_manager.observed_model == "fake-embedding-b"
+        assert restarted_kernel._vector_health["state"] == "healthy"
+        assert restarted_kernel.vector_store is not None
+        assert paragraph_hash in restarted_kernel.vector_store
+        assert not (data_dir / "vector_quarantine").exists()
+    finally:
+        await restarted_kernel.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_missing_vector_fingerprint_is_preserved_until_explicit_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "a_memorix_data"
+    embedding_manager = _FakeEmbeddingManager(dimension=8)
+    monkeypatch.setattr(
+        kernel_module,
+        "create_embedding_api_adapter",
+        lambda **kwargs: embedding_manager,
+    )
+    monkeypatch.setattr(kernel_module, "run_embedding_runtime_self_check", _fake_runtime_self_check)
+
+    first_kernel = SDKMemoryKernel(
+        plugin_root=tmp_path / "plugin_root_first",
+        config=_kernel_config(data_dir, embedding_manager.default_dimension),
+    )
+    await first_kernel.initialize()
+    try:
+        assert first_kernel.metadata_store is not None
+        paragraph_hash = first_kernel.metadata_store.add_paragraph(
+            "缺少指纹时保留的向量",
+            source="test",
+        )
+        rebuilt = await first_kernel.memory_runtime_admin(
+            action="rebuild_all_vectors",
+            batch_size=2,
+        )
+        assert rebuilt["success"] is True
+    finally:
+        await first_kernel.shutdown()
+
+    metadata_path = data_dir / "vectors" / "vectors_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.pop("embedding_fingerprint", None)
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+    vector_bytes = (data_dir / "vectors" / "vectors.bin").read_bytes()
+    id_bytes = (data_dir / "vectors" / "vectors_ids.bin").read_bytes()
+
+    restarted_kernel = SDKMemoryKernel(
+        plugin_root=tmp_path / "plugin_root_second",
+        config=_kernel_config(data_dir, embedding_manager.default_dimension),
+    )
+    await restarted_kernel.initialize()
+    try:
+        assert restarted_kernel.vector_store is None
+        assert restarted_kernel._vector_health["state"] == "incompatible"
+        assert restarted_kernel._vector_health["error_code"] == "v2_fingerprint_missing"
+        assert (data_dir / "vectors" / "vectors.bin").read_bytes() == vector_bytes
+        assert (data_dir / "vectors" / "vectors_ids.bin").read_bytes() == id_bytes
+        assert not (data_dir / "vector_quarantine").exists()
+
+        rebuilt = await restarted_kernel.memory_runtime_admin(
+            action="rebuild_all_vectors",
+            batch_size=2,
+        )
+
+        assert rebuilt["success"] is True
+        assert restarted_kernel._vector_health["state"] == "healthy"
+        assert restarted_kernel.vector_store is not None
+        assert paragraph_hash in restarted_kernel.vector_store
+    finally:
+        await restarted_kernel.shutdown()
 
 
 # ── 风险验证测试 ──
@@ -1432,9 +1791,7 @@ async def test_dual_migration_cleans_legacy_single_pool_files(
     eh = kernel.metadata_store.add_entity("旧池实体")
     rh = kernel.metadata_store.add_relation("用户", "喜欢", "旧池关系")
 
-    kernel.vector_store.add(
-        np.eye(3, fake_embedding_manager.default_dimension, dtype=np.float32), [ph, eh, rh]
-    )
+    kernel.vector_store.add(np.eye(3, fake_embedding_manager.default_dimension, dtype=np.float32), [ph, eh, rh])
     kernel.vector_store.save()
 
     result = await kernel.memory_runtime_admin(action="rebuild_all_vectors", batch_size=2)
@@ -1445,6 +1802,7 @@ async def test_dual_migration_cleans_legacy_single_pool_files(
     assert kernel.graph_vector_store.has_data()
     assert not (data_dir / "vectors" / "vectors.bin").exists()
     assert not (data_dir / "vectors" / "vectors_ids.bin").exists()
+    assert not (data_dir / "vectors" / "vectors_metadata.json").exists()
     assert not (data_dir / "vectors" / "vectors_metadata.pkl").exists()
     assert (data_dir / "vectors" / "dual_ready.json").exists()
 
@@ -1486,6 +1844,60 @@ async def test_dual_ready_manifest_recovers_when_deleted(
     assert manifest_path.exists()
 
     await reloaded.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_valid_dual_pools_ignore_damaged_legacy_single_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    fake_embedding_manager = _FakeEmbeddingManager(dimension=8)
+    data_dir = tmp_path / "a_memorix_data"
+    monkeypatch.setattr(kernel_module, "create_embedding_api_adapter", lambda **kw: fake_embedding_manager)
+    monkeypatch.setattr(kernel_module, "run_embedding_runtime_self_check", _fake_runtime_self_check)
+
+    kernel = SDKMemoryKernel(
+        plugin_root=tmp_path / "plugin_root",
+        config=_dual_kernel_config(data_dir, fake_embedding_manager.default_dimension),
+    )
+    await kernel.initialize()
+    assert kernel.metadata_store is not None
+    kernel.metadata_store.add_paragraph("双池中的有效段落", source="test")
+    result = await kernel.memory_runtime_admin(action="rebuild_all_vectors", batch_size=2)
+    assert result["success"] is True
+    await kernel.shutdown()
+
+    legacy_store = kernel_module.VectorStore(
+        dimension=fake_embedding_manager.default_dimension,
+        data_dir=data_dir / "vectors",
+        buffer_size=1,
+    )
+    legacy_store.add(np.eye(1, fake_embedding_manager.default_dimension, dtype=np.float32), ["legacy"])
+    legacy_store.save(embedding_fingerprint=fake_embedding_manager.get_embedding_fingerprint())
+    metadata_path = data_dir / "vectors" / "vectors_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["schema_version"] = 1
+    metadata.pop("binary_commit", None)
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False), encoding="utf-8")
+    with (data_dir / "vectors" / "vectors.bin").open("ab") as vector_file:
+        vector_file.write(np.eye(1, fake_embedding_manager.default_dimension, dtype=np.float16).tobytes())
+    with (data_dir / "vectors" / "vectors_ids.bin").open("ab") as id_file:
+        id_file.write(
+            np.asarray([kernel_module.VectorStore._generate_id("orphan")], dtype=">i8").tobytes()
+        )
+
+    reloaded = SDKMemoryKernel(
+        plugin_root=tmp_path / "plugin_root_reloaded",
+        config=_dual_kernel_config(data_dir, fake_embedding_manager.default_dimension),
+    )
+    await reloaded.initialize()
+    try:
+        assert reloaded._dual_vector_pools_enabled() is True
+        assert reloaded._vector_health["state"] == "healthy"
+        assert not (data_dir / "vector_quarantine").exists()
+        assert metadata_path.exists()
+    finally:
+        await reloaded.shutdown()
 
 
 @pytest.mark.asyncio
@@ -1535,8 +1947,12 @@ async def test_filter_current_effective_hits_expired_paragraph(tmp_path: Path) -
 
     hits = [
         {"hash": "p-active", "type": "paragraph", "content": "", "metadata": {}},
-        {"hash": "p-expired", "type": "paragraph", "content": "",
-         "metadata": {"memory_change": {"valid_to": 1.0, "change_type": "superseded"}}},
+        {
+            "hash": "p-expired",
+            "type": "paragraph",
+            "content": "",
+            "metadata": {"memory_change": {"valid_to": 1.0, "change_type": "superseded"}},
+        },
     ]
     filtered = kernel._filter_current_effective_hits(hits)
     assert len(filtered) == 1

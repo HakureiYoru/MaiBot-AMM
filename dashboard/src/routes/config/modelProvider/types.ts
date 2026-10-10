@@ -1,3 +1,5 @@
+import type { ModelInfo } from '@/routes/config/model/types'
+
 /**
  * API 提供商接口定义
  */
@@ -6,9 +8,10 @@ export interface APIProvider {
   base_url: string
   api_key: string
   client_type: string
-  max_retry: number | null
-  timeout: number | null
-  retry_interval: number | null
+  default_headers?: Record<string, string>
+  max_retry?: number | null
+  timeout?: number | null
+  retry_interval?: number | null
 }
 
 /**
@@ -17,7 +20,7 @@ export interface APIProvider {
 export interface DeleteConfirmState {
   isOpen: boolean
   providersToDelete: string[]
-  affectedModels: any[]
+  affectedModels: ModelInfo[]
   pendingProviders: APIProvider[]
   context: 'auto' | 'manual' | 'restart'
   oldProviders: APIProvider[]

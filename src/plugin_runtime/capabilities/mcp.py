@@ -2,12 +2,10 @@
 
 from typing import Any, Dict
 
-import asyncio
-
 from src.common.logger import get_logger
 from src.config.config import config_manager
 from src.core.tooling import ToolContentItem, ToolInvocation
-from src.mcp_module import MCPManager
+from src.mcp_module.service import MCPService, get_mcp_service
 
 logger = get_logger("plugin_runtime.integration")
 
@@ -15,29 +13,12 @@ logger = get_logger("plugin_runtime.integration")
 class RuntimeMCPCapabilityMixin:
     """向显式声明权限的插件提供主程序 MCP 客户端。"""
 
-    _plugin_mcp_manager: MCPManager | None
-    _plugin_mcp_lock: asyncio.Lock
+    async def _get_plugin_mcp_service(self) -> MCPService:
+        """复用主程序 MCP 服务，连接与热重载由主程序统一管理。"""
 
-    async def _get_plugin_mcp_manager(self) -> MCPManager | None:
-        """延迟创建插件共享的 MCP 管理器。"""
-
-        if self._plugin_mcp_manager is not None:
-            return self._plugin_mcp_manager
-
-        async with self._plugin_mcp_lock:
-            if self._plugin_mcp_manager is None:
-                mcp_config = config_manager.get_global_config().mcp
-                self._plugin_mcp_manager = await MCPManager.from_app_config(mcp_config)
-        return self._plugin_mcp_manager
-
-    async def _close_plugin_mcp_manager(self) -> None:
-        """关闭插件共享的 MCP 连接。"""
-
-        async with self._plugin_mcp_lock:
-            manager = self._plugin_mcp_manager
-            self._plugin_mcp_manager = None
-        if manager is not None:
-            await manager.close()
+        service = get_mcp_service()
+        await service.ensure_initialized(config_manager.get_global_config().mcp)
+        return service
 
     @staticmethod
     def _serialize_mcp_content_item(item: ToolContentItem) -> Dict[str, Any]:
@@ -66,10 +47,8 @@ class RuntimeMCPCapabilityMixin:
             return {"success": False, "error": "参数 arguments 必须为字典"}
 
         try:
-            manager = await self._get_plugin_mcp_manager()
-            if manager is None:
-                return {"success": False, "error": "MCP 未启用、未配置可用服务器或连接失败"}
-            result = await manager.call_tool_invocation(
+            service = await self._get_plugin_mcp_service()
+            result = await service.call_tool_invocation(
                 ToolInvocation(tool_name=tool_name, arguments=arguments)
             )
         except Exception as exc:
@@ -95,9 +74,7 @@ class RuntimeMCPCapabilityMixin:
 
         del plugin_id, capability, args
         try:
-            manager = await self._get_plugin_mcp_manager()
-            if manager is None:
-                return {"success": False, "error": "MCP 未启用、未配置可用服务器或连接失败", "tools": []}
+            service = await self._get_plugin_mcp_service()
             return {
                 "success": True,
                 "tools": [
@@ -107,7 +84,7 @@ class RuntimeMCPCapabilityMixin:
                         "parameters": tool.parameters_schema or {"type": "object", "properties": {}},
                         "provider_name": tool.provider_name,
                     }
-                    for tool in manager.get_tool_specs()
+                    for tool in await service.list_tools()
                 ],
             }
         except Exception as exc:

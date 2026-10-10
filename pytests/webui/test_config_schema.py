@@ -3,10 +3,11 @@ from typing import get_args, get_origin
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pytest import raises
 
 from src.config.config import Config
 from src.config.config_base import AttributeData, ConfigBase, Field
-from src.config.official_configs import AMemorixConfig, ChatConfig, MessageReceiveConfig
+from src.config.official_configs import AMemorixConfig, ChatConfig, DebugConfig, MessageReceiveConfig, PersonalityConfig
 from src.webui.dependencies import require_auth
 from src.webui.config_schema import (
     AMEMORIX_ADVANCED_FIELD_PATHS,
@@ -44,7 +45,7 @@ def test_json_schema_extra_merged():
 
     # Verify UI metadata fields from json_schema_extra exist
     assert talk_value.get("x-widget") == "slider"
-    assert talk_value.get("x-icon") == "message-circle"
+    assert "x-icon" not in talk_value
     assert talk_value.get("step") == 0.001
 
 
@@ -78,6 +79,25 @@ def test_nested_model_schema():
     assert "description" in talk_value
     assert talk_value.get("x-widget") == "slider"
     assert talk_value.get("minValue") == 0
+
+
+def test_personality_schema_exposes_behavior_style():
+    """核心设置需要从官方配置架构读取独立的行为风格字段。"""
+    schema = ConfigSchemaGenerator.generate_schema(PersonalityConfig)
+    behavior_style = next(field for field in schema["fields"] if field["name"] == "behavior_style")
+
+    assert behavior_style["label"]["zh_CN"] == "行为风格"
+    assert behavior_style.get("x-widget") == "textarea"
+
+
+def test_debug_schema_exposes_clear_context_command_switch():
+    """调试设置需要展示可选的 /clear 上下文清理指令开关。"""
+    schema = ConfigSchemaGenerator.generate_schema(DebugConfig)
+    clear_command = next(field for field in schema["fields"] if field["name"] == "enable_clear_context_command")
+
+    assert clear_command["default"] is False
+    assert clear_command["label"]["zh_CN"] == "启用 /clear 指令"
+    assert clear_command.get("x-widget") == "switch"
 
 
 def test_config_subtab_metadata_is_exposed():
@@ -115,10 +135,9 @@ def test_field_without_extra_metadata():
     assert "label" in plain_field
     assert "required" in plain_field
 
-    # Verify no x-widget or x-icon from json_schema_extra (since field has none)
+    # Verify no x-widget from json_schema_extra (since field has none)
     # These fields should only be present if explicitly defined in json_schema_extra
     assert not plain_field.get("x-widget")
-    assert not plain_field.get("x-icon")
 
 
 def test_all_top_level_sections_have_ui_metadata():
@@ -162,11 +181,9 @@ def test_memory_query_config_fields_are_exposed():
 
     assert enable_field["type"] == "boolean"
     assert enable_field.get("x-widget") == "switch"
-    assert enable_field.get("x-icon") == "database"
 
     assert limit_field["type"] == "integer"
     assert limit_field.get("x-widget") == "input"
-    assert limit_field.get("x-icon") == "hash"
     assert limit_field.get("minValue") == 1
     assert limit_field.get("maxValue") == 20
 
@@ -266,6 +283,14 @@ def test_a_memorix_visibility_policy_marks_and_filters_fields():
     assert _schema_field(web_import_schema, "max_files_per_task")["advanced"] is True
     assert "max_queue_size" not in _field_names(web_import_schema)
 
+    episode_schema = schema["nested"]["episode"]
+    assert _schema_field(episode_schema, "source_max_retry")["minValue"] == 1
+
+
+def test_a_memorix_source_attempt_budget_rejects_zero():
+    with raises(ValueError, match="source_max_retry"):
+        AMemorixConfig(episode={"source_max_retry": 0})
+
 
 def test_a_memorix_visibility_policy_classifies_all_official_fields():
     """新增 A_Memorix 官方字段时，必须明确进入 basic、advanced 或 excluded。"""
@@ -290,7 +315,11 @@ def test_a_memorix_excluded_fields_are_still_loaded_by_official_model():
         attribute_data,
         {
             "storage": {"data_dir": "data/custom-a-memorix"},
-            "embedding": {"dimension": 1536, "quantization_type": "int8"},
+            "embedding": {
+                "dimension": 1536,
+                "quantization_type": "int8",
+                "runtime_train_threshold": 512,
+            },
             "retrieval": {
                 "alpha": 0.4,
                 "fusion": {"method": "alpha_legacy", "rrf_k": 42},
@@ -303,6 +332,7 @@ def test_a_memorix_excluded_fields_are_still_loaded_by_official_model():
     assert attribute_data.redundant_attributes == []
     assert config.storage.data_dir == "data/custom-a-memorix"
     assert config.embedding.dimension == 1536
+    assert config.embedding.runtime_train_threshold == 512
     assert config.retrieval.alpha == 0.4
     assert config.retrieval.fusion.method == "alpha_legacy"
     assert config.retrieval.vector_pools.mode == "single"

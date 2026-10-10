@@ -1,13 +1,14 @@
+from dataclasses import dataclass, field
+from typing import Any, Callable, Coroutine, Dict, List, Set, Tuple, cast
+from urllib.parse import urlparse
+from uuid import uuid4
+
 import asyncio
 import base64
 import binascii
 import io
 import json
 import re
-from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Dict, List, Set, Tuple, cast
-from urllib.parse import urlparse
-from uuid import uuid4
 
 from json_repair import repair_json
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, AsyncStream
@@ -42,8 +43,24 @@ from src.llm_models.exceptions import (
 from src.llm_models.openai_compat import (
     build_openai_compatible_client_config,
     split_openai_request_overrides,
+    validate_image_embedding_transport,
 )
-from src.llm_models.payload_content.message import ImageMessagePart, Message, RoleType, TextMessagePart
+from src.llm_models.payload_content.context_item import (
+    AssistantMessageItem,
+    ContextImagePart,
+    ContextItem,
+    ContextRefusalPart,
+    ContextTextPart,
+    ContextToolCall,
+    FunctionCallItem,
+    FunctionCallOutputItem,
+    ProviderActivityItem,
+    ProviderOpaqueItem,
+    ReasoningItem,
+    SystemMessageItem,
+    UserMessageItem,
+    build_portable_output_items,
+)
 from src.llm_models.payload_content.resp_format import RespFormat, RespFormatType
 from src.llm_models.payload_content.tool_option import (
     TOOL_CALL_SOURCE_EXTRA_KEY,
@@ -63,9 +80,20 @@ from .base_client import (
     APIResponse,
     AudioTranscriptionRequest,
     EmbeddingRequest,
+    ImageEmbeddingRequest,
+    RequestTraceContext,
     ResponseRequest,
     UsageTuple,
     client_registry,
+)
+from .image_embedding_protocols import (
+    build_compatible_image_embedding_fingerprint,
+    build_native_image_embedding_diagnostic_payload,
+    build_native_image_embedding_fingerprint,
+    build_native_image_embedding_request,
+    parse_native_image_embedding_response,
+    resolve_compatible_image_embedding_input,
+    resolve_native_image_embedding_protocol,
 )
 from ..request_snapshot import (
     attach_request_snapshot,
@@ -73,6 +101,7 @@ from ..request_snapshot import (
     save_failed_request_snapshot,
     serialize_audio_request_snapshot,
     serialize_embedding_request_snapshot,
+    serialize_image_embedding_request_snapshot,
     serialize_response_request_snapshot,
 )
 
@@ -80,6 +109,21 @@ logger = get_logger("llm_models")
 
 SUPPORTED_OPENAI_IMAGE_FORMATS = {"jpeg", "png", "webp"}
 """OpenAI 兼容图片输入稳定支持的格式集合。"""
+
+
+def _render_image_embedding_template(value: Any, replacements: Dict[str, str]) -> Any:
+    """递归替换图片嵌入输入模板中的受控占位符。"""
+
+    if isinstance(value, str):
+        rendered = value
+        for name, replacement in replacements.items():
+            rendered = rendered.replace("{" + name + "}", replacement)
+        return rendered
+    if isinstance(value, list):
+        return [_render_image_embedding_template(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _render_image_embedding_template(item, replacements) for key, item in value.items()}
+    return value
 
 THINK_CONTENT_PATTERN = re.compile(
     r"<think>(?P<think>.*?)</think>(?P<content>.*)|<think>(?P<think_unclosed>.*)|(?P<content_only>.+)",
@@ -116,6 +160,28 @@ CHAT_COMPLETIONS_RESERVED_EXTRA_BODY_KEYS = {
     "tools",
 }
 """由当前客户端显式承载、不应再落入 `extra_body` 的字段集合。"""
+
+_SDK_AUTH_PLACEHOLDER_API_KEY = "maibot-sdk-auth-disabled"
+"""鉴权不交给 SDK 时传给 `AsyncOpenAI` 的占位密钥。
+
+OpenAI SDK 2.34+ 构造时拒绝空 `api_key`，且每次请求要么带 `Authorization` 头、要么显式省略它；
+占位密钥只用于通过构造校验，它生成的 `Authorization` 头会被自定义鉴权头覆盖或在请求时被省略。"""
+
+_AUTHORIZATION_HEADER = "Authorization"
+
+
+def _canonicalize_authorization_header(headers: Dict[str, str]) -> Dict[str, str]:
+    """把任意大小写的 Authorization 请求头统一为标准写法。
+
+    SDK 按精确键名合并请求头：大小写不同的同名头会与占位密钥生成的 `Authorization` 头同时发出，
+    或被请求级的省略标记误删，所以先统一键名。
+    """
+
+    return {
+        (_AUTHORIZATION_HEADER if key.lower() == _AUTHORIZATION_HEADER.lower() else key): value
+        for key, value in headers.items()
+    }
+
 
 _MODELS_REQUIRING_MAX_COMPLETION_TOKENS: Set[Tuple[str, str]] = set()
 """记录本进程内已确认「仅支持 max_completion_tokens」的模型，键为 (base_url, model_identifier)。
@@ -173,11 +239,16 @@ def _extract_reasoning_content(message_part: Any, reasoning_key: str) -> str | N
     """从 OpenAI 兼容响应对象中读取原生推理内容。
 
     不同兼容服务商对推理字段命名并不完全一致。这里集中处理字段访问，
-    避免解析路径里散落 provider 特判；具体字段名由 provider 决定。
+    避免解析路径里散落 provider 特判；优先读取 provider 指定字段，
+    读取不到时再尝试兼容 ``reasoning`` 字段。
     """
     native_reasoning = getattr(message_part, reasoning_key, None)
     if isinstance(native_reasoning, str) and native_reasoning:
         return native_reasoning
+
+    fallback_reasoning = getattr(message_part, "reasoning", None)
+    if isinstance(fallback_reasoning, str) and fallback_reasoning:
+        return fallback_reasoning
     return None
 
 
@@ -232,7 +303,7 @@ def _build_text_content_part(text: str) -> ChatCompletionContentPartTextParam:
     }
 
 
-def _build_image_content_part(part: ImageMessagePart) -> ChatCompletionContentPartImageParam:
+def _build_image_content_part(part: ContextImagePart) -> ChatCompletionContentPartImageParam:
     """构建图片内容片段。
 
     Args:
@@ -254,7 +325,7 @@ def _build_image_content_part(part: ImageMessagePart) -> ChatCompletionContentPa
     }
 
 
-def _normalize_image_part_for_openai(part: ImageMessagePart) -> Tuple[str, str] | None:
+def _normalize_image_part_for_openai(part: ContextImagePart) -> Tuple[str, str] | None:
     """将图片片段规范化为 OpenAI 兼容格式。
 
     Args:
@@ -279,32 +350,15 @@ def _normalize_image_part_for_openai(part: ImageMessagePart) -> Tuple[str, str] 
                 return image_format, part.image_base64
 
             if image_format == "gif":
-                frame_count = getattr(image, "n_frames", 1)
-                frames: List[PILImage.Image] = []
-                durations: List[int] = []
-
-                for frame_index in range(frame_count):
-                    image.seek(frame_index)
-                    frame = image.copy()
-                    if frame.mode not in {"RGB", "RGBA"}:
-                        frame = frame.convert("RGBA")
-                    frames.append(frame)
-                    durations.append(int(image.info.get("duration", 100) or 100))
-
+                # 部分 OpenAI 兼容视觉接口会拒绝动画 GIF 或动画 WebP，因此只传递首帧。
+                image.seek(0)
+                first_frame = image.copy()
+                if first_frame.mode not in {"RGB", "RGBA"}:
+                    first_frame = first_frame.convert("RGBA")
                 output_buffer = io.BytesIO()
-                save_kwargs: Dict[str, Any] = {
-                    "format": "WEBP",
-                    "save_all": True,
-                    "append_images": frames[1:],
-                    "duration": durations,
-                    "loop": int(image.info.get("loop", 0) or 0),
-                }
-                if frame_count > 1:
-                    save_kwargs["lossless"] = True
-
-                frames[0].save(output_buffer, **save_kwargs)
+                first_frame.save(output_buffer, format="PNG")
                 converted_base64 = base64.b64encode(output_buffer.getvalue()).decode("utf-8")
-                return "webp", converted_base64
+                return "png", converted_base64
 
             image.seek(0)
             normalized_image = image.copy()
@@ -341,8 +395,18 @@ def _convert_response_format(response_format: RespFormat | None) -> Any:
     return omit
 
 
+def _get_portable_text_part(part: Any) -> str | None:
+    """返回文本或拒答片段的跨端点可见文本。"""
+
+    if isinstance(part, ContextTextPart):
+        return part.text
+    if isinstance(part, ContextRefusalPart):
+        return part.refusal
+    return None
+
+
 def _convert_text_only_message_content(
-    message: Message,
+    message: SystemMessageItem | AssistantMessageItem,
 ) -> str | List[ChatCompletionContentPartTextParam]:
     """将仅允许文本的消息转换为 OpenAI 兼容内容。
 
@@ -357,22 +421,23 @@ def _convert_text_only_message_content(
     """
     if not message.parts:
         return ""
-    if len(message.parts) == 1 and isinstance(message.parts[0], TextMessagePart):
-        return message.parts[0].text
+    if len(message.parts) == 1 and (single_part_text := _get_portable_text_part(message.parts[0])) is not None:
+        return single_part_text
 
     content: List[ChatCompletionContentPartTextParam] = []
     for part in message.parts:
-        if not isinstance(part, TextMessagePart):
+        part_text = _get_portable_text_part(part)
+        if part_text is None:
             raise ValueError(f"{message.role.value} 消息仅支持文本片段")
-        if not part.text.strip():
+        if not part_text.strip():
             continue
-        content.append(_build_text_content_part(part.text))
+        content.append(_build_text_content_part(part_text))
     if not content:
         return ""
     return content
 
 
-def _convert_user_message_content(message: Message) -> str | List[ChatCompletionContentPartParam]:
+def _convert_user_message_content(message: UserMessageItem) -> str | List[ChatCompletionContentPartParam]:
     """将用户消息转换为 OpenAI 兼容内容。
 
     Args:
@@ -381,12 +446,12 @@ def _convert_user_message_content(message: Message) -> str | List[ChatCompletion
     Returns:
         str | List[ChatCompletionContentPartParam]: 用户消息内容结构。
     """
-    if len(message.parts) == 1 and isinstance(message.parts[0], TextMessagePart):
+    if len(message.parts) == 1 and isinstance(message.parts[0], ContextTextPart):
         return message.parts[0].text
 
     content: List[ChatCompletionContentPartParam] = []
     for part in message.parts:
-        if isinstance(part, TextMessagePart):
+        if isinstance(part, ContextTextPart):
             if part.text.strip():
                 content.append(_build_text_content_part(part.text))
             continue
@@ -410,7 +475,9 @@ def _convert_user_message_content(message: Message) -> str | List[ChatCompletion
     return content
 
 
-def _convert_assistant_tool_calls(tool_calls: List[ToolCall]) -> List[ChatCompletionMessageFunctionToolCallParam]:
+def _convert_assistant_tool_calls(
+    tool_calls: List[ContextToolCall],
+) -> List[ChatCompletionMessageFunctionToolCallParam]:
     """将内部工具调用转换为 OpenAI assistant tool_calls 结构。
 
     Args:
@@ -427,88 +494,108 @@ def _convert_assistant_tool_calls(tool_calls: List[ToolCall]) -> List[ChatComple
                 "type": "function",
                 "function": {
                     "name": tool_call.func_name,
-                    "arguments": json.dumps(tool_call.args or {}, ensure_ascii=False),
+                    "arguments": json.dumps(tool_call.materialize_args(), ensure_ascii=False),
                 },
             }
         )
     return converted_tool_calls
 
 
-def _sanitize_messages_for_toolless_request(messages: List[Message]) -> List[Message]:
+def _sanitize_messages_for_toolless_request(items: List[ContextItem]) -> List[ContextItem]:
     """在无工具请求时清洗历史工具调用链，避免兼容接口拒收消息。"""
-    sanitized_messages: List[Message] = []
-
-    for message in messages:
-        if message.role == RoleType.Tool:
-            continue
-
-        if message.role == RoleType.Assistant and message.tool_calls:
-            if not message.parts:
-                continue
-            assistant_message = Message(
-                role=message.role,
-                parts=list(message.parts),
-                tool_call_id=message.tool_call_id,
-                tool_name=message.tool_name,
-                tool_calls=None,
-            )
-            sanitized_messages.append(assistant_message)
-            continue
-
-        sanitized_messages.append(message)
-
-    return sanitized_messages
+    return [item for item in items if not isinstance(item, (FunctionCallItem, FunctionCallOutputItem))]
 
 
-def _convert_messages(messages: List[Message]) -> List[ChatCompletionMessageParam]:
+def _convert_assistant_item_group(items: List[ContextItem]) -> ChatCompletionAssistantMessageParam | None:
+    """把相邻的模型输出 Items 折叠为 Chat assistant message。"""
+
+    text_parts: List[str] = []
+    tool_calls: List[ContextToolCall] = []
+    for item in items:
+        if isinstance(item, AssistantMessageItem):
+            for part in item.parts:
+                part_text = _get_portable_text_part(part)
+                if part_text is None:
+                    raise ValueError("Chat assistant message 仅支持文本片段")
+                text_parts.append(part_text)
+        elif isinstance(item, FunctionCallItem):
+            tool_calls.append(item.tool_call)
+
+    content = "".join(text_parts)
+    if not content and not tool_calls:
+        return None
+    payload: ChatCompletionAssistantMessageParam = {
+        "role": "assistant",
+        "content": content or None,
+    }
+    if tool_calls:
+        payload["tool_calls"] = _convert_assistant_tool_calls(tool_calls)
+    return payload
+
+
+def _convert_messages(items: List[ContextItem]) -> List[ChatCompletionMessageParam]:
     """将内部消息列表转换为 OpenAI 兼容消息列表。
 
     Args:
-        messages: 内部统一消息列表。
+        items: 内部 Context Items。
 
     Returns:
         List[ChatCompletionMessageParam]: OpenAI SDK 所需的消息结构列表。
     """
     converted_messages: List[ChatCompletionMessageParam] = []
-    for message in messages:
-        if message.role == RoleType.System:
+    index = 0
+    while index < len(items):
+        item = items[index]
+        if isinstance(item, SystemMessageItem):
             system_payload: ChatCompletionSystemMessageParam = {
                 "role": "system",
-                "content": _convert_text_only_message_content(message),
+                "content": _convert_text_only_message_content(item),
             }
             converted_messages.append(system_payload)
+            index += 1
             continue
 
-        if message.role == RoleType.User:
+        if isinstance(item, UserMessageItem):
             user_payload: ChatCompletionUserMessageParam = {
                 "role": "user",
-                "content": _convert_user_message_content(message),
+                "content": _convert_user_message_content(item),
             }
             converted_messages.append(user_payload)
+            index += 1
             continue
 
-        if message.role == RoleType.Assistant:
-            assistant_payload: ChatCompletionAssistantMessageParam = {
-                "role": "assistant",
-                "content": None if not message.parts and message.tool_calls else _convert_text_only_message_content(message),
-            }
-            if message.tool_calls:
-                assistant_payload["tool_calls"] = _convert_assistant_tool_calls(message.tool_calls)
-            converted_messages.append(assistant_payload)
-            continue
-
-        if message.role == RoleType.Tool:
-            if message.tool_call_id is None:
-                raise ValueError("Tool 消息缺少 tool_call_id")
+        if isinstance(item, FunctionCallOutputItem):
             tool_payload: ChatCompletionToolMessageParam = {
                 "role": "tool",
-                "content": _convert_text_only_message_content(message),
-                "tool_call_id": message.tool_call_id,
+                "content": item.output,
+                "tool_call_id": item.call_id,
             }
             converted_messages.append(tool_payload)
+            index += 1
             continue
 
-        raise ValueError(f"不支持的消息角色：{message.role}")
+        if isinstance(
+            item,
+            (ReasoningItem, AssistantMessageItem, FunctionCallItem, ProviderActivityItem, ProviderOpaqueItem),
+        ):
+            group_items: List[ContextItem] = [item]
+            index += 1
+            while index < len(items):
+                next_item = items[index]
+                if not isinstance(
+                    next_item,
+                    (ReasoningItem, AssistantMessageItem, FunctionCallItem, ProviderActivityItem, ProviderOpaqueItem),
+                ):
+                    break
+                group_items.append(next_item)
+                index += 1
+            assistant_payload = _convert_assistant_item_group(group_items)
+            if assistant_payload is not None:
+                converted_messages.append(assistant_payload)
+            continue
+
+        # ProviderActivityItem 和 ProviderOpaqueItem 没有可移植 Chat 投影。
+        index += 1
 
     return converted_messages
 
@@ -543,22 +630,30 @@ def _convert_tool_options(tool_options: List[ToolOption]) -> List[ChatCompletion
 
 
 def _extract_usage_record(usage: Any) -> UsageTuple | None:
-    """从响应对象中提取 usage 三元组。
+    """从响应对象中提取 usage 元组，并判断供应商是否上报了 Prompt 缓存用量。
 
     Args:
         usage: OpenAI SDK 返回的 usage 对象。
 
     Returns:
-        UsageTuple | None: `(prompt_tokens, completion_tokens, total_tokens)`。
+        UsageTuple | None: `(prompt_tokens, completion_tokens, total_tokens,
+        prompt_cache_hit_tokens, prompt_cache_miss_tokens, prompt_cache_reported)`。
     """
     if usage is None:
         return None
     prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    prompt_cache_hit_tokens = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
-    prompt_cache_miss_tokens = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+    # 用 None 哨兵区分「字段缺失」与「字段为 0」：StepFun 等供应商只在命中时返回缓存字段
+    reported_hit_tokens = getattr(usage, "prompt_cache_hit_tokens", None)
+    reported_miss_tokens = getattr(usage, "prompt_cache_miss_tokens", None)
     prompt_tokens_details = getattr(usage, "prompt_tokens_details", None)
-    if prompt_cache_hit_tokens == 0 and prompt_tokens_details is not None:
-        prompt_cache_hit_tokens = getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+    reported_cached_tokens = (
+        getattr(prompt_tokens_details, "cached_tokens", None) if prompt_tokens_details is not None else None
+    )
+    prompt_cache_reported = (
+        reported_hit_tokens is not None or reported_miss_tokens is not None or reported_cached_tokens is not None
+    )
+    prompt_cache_hit_tokens = reported_hit_tokens or reported_cached_tokens or 0
+    prompt_cache_miss_tokens = reported_miss_tokens or 0
     if prompt_cache_miss_tokens == 0 and prompt_cache_hit_tokens > 0:
         prompt_cache_miss_tokens = max(prompt_tokens - prompt_cache_hit_tokens, 0)
     return (
@@ -567,6 +662,7 @@ def _extract_usage_record(usage: Any) -> UsageTuple | None:
         getattr(usage, "total_tokens", 0) or 0,
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
+        prompt_cache_reported,
     )
 
 
@@ -723,7 +819,9 @@ def _extract_content_block_text(content_block: Any) -> str:
     return ""
 
 
-def _normalize_content_block_arguments(raw_arguments: Any, parse_mode: ToolArgumentParseMode, response: Any) -> Dict[str, Any]:
+def _normalize_content_block_arguments(
+    raw_arguments: Any, parse_mode: ToolArgumentParseMode, response: Any
+) -> Dict[str, Any]:
     """将 content block 内的工具参数规范化为字典。"""
 
     if raw_arguments is None:
@@ -756,7 +854,9 @@ def _extract_content_block_tool_call(
         call_name = _get_content_block_value(function_info, "name")
         raw_arguments = _get_content_block_value(function_info, "arguments")
     else:
-        call_name = _get_content_block_value(content_block, "name") or _get_content_block_value(content_block, "func_name")
+        call_name = _get_content_block_value(content_block, "name") or _get_content_block_value(
+            content_block, "func_name"
+        )
         raw_arguments = (
             _get_content_block_value(content_block, "input")
             or _get_content_block_value(content_block, "arguments")
@@ -816,64 +916,99 @@ def _extract_content_blocks(
             if block_text:
                 content_parts.append(block_text)
 
-    tool_call_source = TOOL_CALL_SOURCE_REASONING if reasoning_parts and not content_parts else TOOL_CALL_SOURCE_RESPONSE
+    tool_call_source = (
+        TOOL_CALL_SOURCE_REASONING if reasoning_parts and not content_parts else TOOL_CALL_SOURCE_RESPONSE
+    )
     tool_calls = [_set_tool_call_source(tool_call, tool_call_source) for tool_call in tool_calls]
     reasoning_content = "\n".join(reasoning_parts).strip() or None
     content = "\n".join(content_parts).strip() or None
     return reasoning_content, content, tool_calls or None
 
 
-def _log_length_truncation(finish_reason: str | None, model_name: str | None) -> None:
-    """记录因长度截断导致的告警日志。
-
-    Args:
-        finish_reason: OpenAI 兼容接口返回的完成原因。
-        model_name: 上游返回的模型标识。
-    """
+def _log_length_truncation(
+    finish_reason: str | None,
+    model_name: str | None,
+    max_tokens: int | None,
+    trace_context: RequestTraceContext | None,
+) -> None:
+    """记录因长度截断导致的告警日志。"""
     if finish_reason == "length":
-        logger.info(f"模型{model_name or ''}因为超过最大 max_token 限制，可能仅输出部分内容，可视情况调整")
+        task_name = trace_context.task_name if trace_context else "未知"
+        request_type = trace_context.request_type if trace_context else "未知"
+        limit = str(max_tokens) if max_tokens is not None else "未指定（由服务商决定）"
+        logger.info(
+            f"模型{model_name or ''}因为达到最大输出 token 限制（max_tokens={limit}，"
+            f"任务={task_name}，请求类型={request_type}），可能仅输出部分内容，可视情况调整"
+        )
 
 
 def _apply_xml_tool_call_fallback(
-    response: APIResponse,
+    content: str | None,
+    reasoning_content: str | None,
+    tool_calls: List[ToolCall] | None,
     parse_mode: ToolArgumentParseMode,
     raw_response: Any,
-) -> None:
+) -> Tuple[str | None, str | None, List[ToolCall] | None]:
     """当上游未返回标准 tool_calls 时，尝试从 XML 文本兜底解析。
 
     这是一个暂时性处理方法，用来兼容思维链中混入工具调用的返回格式，
     后续可能随着模型或上游接口的规范化而变更。
     """
-    if response.tool_calls:
-        return
+    if tool_calls:
+        return content, reasoning_content, tool_calls
 
-    reasoning_content, tool_calls = _extract_xml_tool_calls(
-        response.reasoning_content,
+    cleaned_reasoning, extracted_tool_calls = _extract_xml_tool_calls(
+        reasoning_content,
         parse_mode,
         raw_response,
         source=TOOL_CALL_SOURCE_REASONING,
     )
-    if reasoning_content != response.reasoning_content:
-        response.reasoning_content = reasoning_content
-    if tool_calls:
-        response.tool_calls = tool_calls
-        if not response.content and reasoning_content:
-            response.content = reasoning_content
-            response.reasoning_content = None
+    if extracted_tool_calls:
+        if not content and cleaned_reasoning:
+            content = cleaned_reasoning
+            cleaned_reasoning = None
         logger.warning("OpenAI 兼容响应未返回标准 tool_calls，已从 XML 文本兜底解析工具调用")
-        return
+        return content, cleaned_reasoning, extracted_tool_calls
 
-    cleaned_content, tool_calls = _extract_xml_tool_calls(
-        response.content,
+    cleaned_content, extracted_tool_calls = _extract_xml_tool_calls(
+        content,
         parse_mode,
         raw_response,
         source=TOOL_CALL_SOURCE_RESPONSE,
     )
-    if cleaned_content != response.content:
-        response.content = cleaned_content
-    if tool_calls:
-        response.tool_calls = tool_calls
+    if extracted_tool_calls:
         logger.warning("OpenAI 兼容响应未返回标准 tool_calls，已从 XML 文本兜底解析工具调用")
+    return cleaned_content, cleaned_reasoning, extracted_tool_calls
+
+
+def _build_portable_api_response(
+    *,
+    content: str | None,
+    reasoning_content: str | None,
+    tool_calls: List[ToolCall] | None,
+    logical_turn_id: str,
+    raw_data: Any,
+) -> APIResponse:
+    """将 Chat Completions 的复合输出冻结为通用 Context Items。"""
+
+    context_tool_calls = [
+        ContextToolCall.create(
+            call_id=tool_call.call_id,
+            func_name=tool_call.func_name,
+            args=tool_call.args,
+            extra_content=tool_call.extra_content,
+        )
+        for tool_call in (tool_calls or [])
+    ]
+    return APIResponse(
+        output_items=build_portable_output_items(
+            content=content,
+            reasoning=reasoning_content,
+            tool_calls=context_tool_calls,
+            logical_turn_id=logical_turn_id,
+        ),
+        raw_data=raw_data,
+    )
 
 
 def _coerce_openai_argument(value: Any) -> Any | Omit:
@@ -966,6 +1101,7 @@ class _OpenAIStreamAccumulator:
         reasoning_parse_mode: ReasoningParseMode,
         tool_argument_parse_mode: ToolArgumentParseMode,
         reasoning_key: str,
+        logical_turn_id: str,
     ) -> None:
         """初始化累积器。
 
@@ -977,6 +1113,7 @@ class _OpenAIStreamAccumulator:
         self.reasoning_parse_mode = reasoning_parse_mode
         self.tool_argument_parse_mode = tool_argument_parse_mode
         self.reasoning_key = reasoning_key
+        self.logical_turn_id = logical_turn_id
         self.reasoning_buffer = io.StringIO()
         self.content_buffer = io.StringIO()
         self.tool_call_states: Dict[int, _StreamedToolCallState] = {}
@@ -1041,7 +1178,9 @@ class _OpenAIStreamAccumulator:
         """
         tool_call_deltas = getattr(delta, "tool_calls", None) or []
         for tool_call_delta in tool_call_deltas:
-            state = self.tool_call_states.setdefault(tool_call_delta.index, _StreamedToolCallState(index=tool_call_delta.index))
+            state = self.tool_call_states.setdefault(
+                tool_call_delta.index, _StreamedToolCallState(index=tool_call_delta.index)
+            )
             if tool_call_delta.id:
                 state.call_id = tool_call_delta.id
             function = tool_call_delta.function
@@ -1057,11 +1196,9 @@ class _OpenAIStreamAccumulator:
             APIResponse: 累积完成的响应对象。
 
         Raises:
-            EmptyResponseException: 当响应中既无可见内容也无工具调用时抛出。
+            EmptyResponseException: 当响应中既无正文、推理内容也无工具调用时抛出。
             RespParseException: 当工具调用结构不完整时抛出。
         """
-        response = APIResponse()
-
         content = self.content_buffer.getvalue().strip()
         reasoning_content = self.reasoning_buffer.getvalue().strip()
         if not self._using_native_reasoning and self.reasoning_parse_mode != ReasoningParseMode.NONE and content:
@@ -1072,26 +1209,19 @@ class _OpenAIStreamAccumulator:
             if parsed_reasoning_content:
                 reasoning_content = parsed_reasoning_content
             content = parsed_content or ""
-        if reasoning_content:
-            response.reasoning_content = reasoning_content
-        if content:
-            response.content = content
-
+        tool_calls: List[ToolCall] = []
         if self.tool_call_states:
-            response.tool_calls = []
             for index in sorted(self.tool_call_states):
                 state = self.tool_call_states[index]
                 if not state.function_name:
                     raise RespParseException(None, f"响应解析失败，工具调用 {index} 缺少函数名。")
                 raw_arguments = state.arguments_buffer.getvalue().strip()
                 arguments = (
-                    _parse_tool_arguments(raw_arguments, self.tool_argument_parse_mode, None)
-                    if raw_arguments
-                    else None
+                    _parse_tool_arguments(raw_arguments, self.tool_argument_parse_mode, None) if raw_arguments else None
                 )
                 call_id = state.call_id or _build_fallback_tool_call_id(f"tool_call_{index}")
                 source = TOOL_CALL_SOURCE_REASONING if reasoning_content else TOOL_CALL_SOURCE_RESPONSE
-                response.tool_calls.append(
+                tool_calls.append(
                     ToolCall(
                         call_id=call_id,
                         func_name=state.function_name,
@@ -1100,13 +1230,23 @@ class _OpenAIStreamAccumulator:
                     )
                 )
 
-        response.raw_data = {"model": self.model_name} if self.model_name else None
-        _apply_xml_tool_call_fallback(response, self.tool_argument_parse_mode, response.raw_data)
-
-        if not response.content and not response.tool_calls:
-            raise EmptyResponseException(response.raw_data)
-
-        return response
+        raw_data = {"model": self.model_name} if self.model_name else None
+        content, reasoning_content, resolved_tool_calls = _apply_xml_tool_call_fallback(
+            content or None,
+            reasoning_content or None,
+            tool_calls or None,
+            self.tool_argument_parse_mode,
+            raw_data,
+        )
+        if not content and not reasoning_content and not resolved_tool_calls:
+            raise EmptyResponseException(raw_data)
+        return _build_portable_api_response(
+            content=content,
+            reasoning_content=reasoning_content,
+            tool_calls=resolved_tool_calls,
+            logical_turn_id=self.logical_turn_id,
+            raw_data=raw_data,
+        )
 
     def close(self) -> None:
         """关闭内部缓冲区。"""
@@ -1125,6 +1265,9 @@ async def _default_stream_response_handler(
     reasoning_parse_mode: ReasoningParseMode,
     tool_argument_parse_mode: ToolArgumentParseMode,
     reasoning_key: str,
+    logical_turn_id: str,
+    max_tokens: int | None,
+    trace_context: RequestTraceContext | None,
 ) -> Tuple[APIResponse, UsageTuple | None]:
     """处理 OpenAI 兼容流式响应。
 
@@ -1142,6 +1285,7 @@ async def _default_stream_response_handler(
         reasoning_parse_mode=reasoning_parse_mode,
         tool_argument_parse_mode=tool_argument_parse_mode,
         reasoning_key=reasoning_key,
+        logical_turn_id=logical_turn_id,
     )
     usage_record: UsageTuple | None = None
 
@@ -1164,7 +1308,7 @@ async def _default_stream_response_handler(
         model_name = None
         if isinstance(response.raw_data, dict):
             model_name = response.raw_data.get("model")
-        _log_length_truncation(accumulator.finish_reason, model_name)
+        _log_length_truncation(accumulator.finish_reason, model_name, max_tokens, trace_context)
         return response, usage_record
     finally:
         accumulator.close()
@@ -1176,6 +1320,9 @@ def _default_normal_response_parser(
     reasoning_parse_mode: ReasoningParseMode,
     tool_argument_parse_mode: ToolArgumentParseMode,
     reasoning_key: str,
+    logical_turn_id: str,
+    max_tokens: int | None,
+    trace_context: RequestTraceContext | None,
 ) -> Tuple[APIResponse, UsageTuple | None]:
     """解析 OpenAI 兼容的非流式响应。
 
@@ -1189,13 +1336,12 @@ def _default_normal_response_parser(
         Tuple[APIResponse, UsageTuple | None]: 解析后的响应与 usage 统计。
 
     Raises:
-        EmptyResponseException: 当 choices 为空或响应内容为空时抛出。
+        EmptyResponseException: 当 choices 为空，或响应中既无正文、推理内容也无工具调用时抛出。
     """
     choices = getattr(resp, "choices", None)
     if not choices:
         raise EmptyResponseException(resp, "响应解析失败，choices 为空或缺失")
 
-    api_response = APIResponse()
     message_part = choices[0].message
     native_reasoning = _extract_reasoning_content(message_part, reasoning_key)
     raw_message_content = message_part.content
@@ -1207,54 +1353,61 @@ def _default_normal_response_parser(
     )
 
     if native_reasoning is not None and reasoning_parse_mode != ReasoningParseMode.NONE:
-        api_response.reasoning_content = native_reasoning
-        api_response.content = message_content or content_block_content
+        reasoning_content = native_reasoning
+        content = message_content or content_block_content
     elif isinstance(message_content, str) and message_content:
-        reasoning_content, final_content = _extract_reasoning_and_content(
+        reasoning_content, content = _extract_reasoning_and_content(
             content=message_content,
             parse_mode=reasoning_parse_mode,
         )
-        api_response.reasoning_content = reasoning_content
-        api_response.content = final_content
     else:
-        api_response.reasoning_content = content_block_reasoning
-        api_response.content = content_block_content
-        api_response.tool_calls = content_block_tool_calls
+        reasoning_content = content_block_reasoning
+        content = content_block_content
 
+    parsed_tool_calls: List[ToolCall] = []
     tool_calls = getattr(message_part, "tool_calls", None) or []
     if tool_calls:
-        api_response.tool_calls = []
         for tool_call in tool_calls:
             if tool_call.type != "function":
                 raise RespParseException(resp, f"响应解析失败，暂不支持工具调用类型 {tool_call.type}。")
             raw_arguments = tool_call.function.arguments or ""
             arguments = _parse_tool_arguments(raw_arguments, tool_argument_parse_mode, resp)
-            api_response.tool_calls.append(
+            parsed_tool_calls.append(
                 ToolCall(
                     call_id=tool_call.id,
                     func_name=tool_call.function.name,
                     args=arguments,
                     extra_content=_build_tool_call_extra_content(
-                        TOOL_CALL_SOURCE_REASONING
-                        if api_response.reasoning_content
-                        else TOOL_CALL_SOURCE_RESPONSE
+                        TOOL_CALL_SOURCE_REASONING if reasoning_content else TOOL_CALL_SOURCE_RESPONSE
                     ),
                 )
             )
     elif content_block_tool_calls:
-        api_response.tool_calls = content_block_tool_calls
+        parsed_tool_calls = content_block_tool_calls
 
     usage_record = _extract_usage_record(getattr(resp, "usage", None))
-    api_response.raw_data = resp
 
     finish_reason = getattr(resp.choices[0], "finish_reason", None)
-    _log_length_truncation(finish_reason, getattr(resp, "model", None))
-    _apply_xml_tool_call_fallback(api_response, tool_argument_parse_mode, resp)
-
-    if not api_response.content and not api_response.tool_calls:
+    _log_length_truncation(finish_reason, getattr(resp, "model", None), max_tokens, trace_context)
+    content, reasoning_content, resolved_tool_calls = _apply_xml_tool_call_fallback(
+        content,
+        reasoning_content,
+        parsed_tool_calls or None,
+        tool_argument_parse_mode,
+        resp,
+    )
+    if not content and not reasoning_content and not resolved_tool_calls:
         raise EmptyResponseException(resp)
-
-    return api_response, usage_record
+    return (
+        _build_portable_api_response(
+            content=content,
+            reasoning_content=reasoning_content,
+            tool_calls=resolved_tool_calls,
+            logical_turn_id=logical_turn_id,
+            raw_data=resp,
+        ),
+        usage_record,
+    )
 
 
 @client_registry.register_client_class("openai")
@@ -1277,16 +1430,37 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
         self.reasoning_parse_mode = _normalize_reasoning_parse_mode(api_provider.reasoning_parse_mode)
         self.reasoning_key = _build_reasoning_key(api_provider)
         self.tool_argument_parse_mode = _normalize_tool_argument_parse_mode(api_provider.tool_argument_parse_mode)
+        default_headers = _canonicalize_authorization_header(client_config.default_headers)
+        # api_key 为空表示鉴权不交给 SDK（none/header/query 或自定义 Bearer 前缀）；
+        # 此时若没有自定义 Authorization 头覆盖占位密钥，每次请求都要显式省略它
+        self._omit_sdk_authorization = not client_config.api_key and _AUTHORIZATION_HEADER not in default_headers
         self.client = AsyncOpenAI(
-            api_key=client_config.api_key,
+            api_key=client_config.api_key or _SDK_AUTH_PLACEHOLDER_API_KEY,
             organization=api_provider.organization,
             project=api_provider.project,
             base_url=client_config.base_url,
             timeout=api_provider.timeout,
-            max_retries=api_provider.max_retry,
-            default_headers=client_config.default_headers or None,
+            # 重试统一由 LLMOrchestrator 外层循环按 api_provider.max_retry 负责（计数、日志、retry_interval）；
+            # SDK 内部再重试会与外层嵌套，使超时请求被重复发送并重复计费输出 token（#1769）
+            max_retries=0,
+            default_headers=default_headers or None,
             default_query=client_config.default_query or None,
         )
+
+    def _build_request_headers(self, extra_headers: Dict[str, str]) -> Dict[str, str | Omit] | None:
+        """构造单次请求的附加请求头。
+
+        Args:
+            extra_headers: 模型 `extra_params` 中声明的附加请求头。
+
+        Returns:
+            Dict[str, str | Omit] | None: 传给 SDK 的 `extra_headers`；鉴权不交给 SDK 时
+            会显式省略占位密钥生成的 `Authorization` 头。
+        """
+        request_headers: Dict[str, str | Omit] = dict(_canonicalize_authorization_header(extra_headers))
+        if self._omit_sdk_authorization:
+            request_headers.setdefault(_AUTHORIZATION_HEADER, omit)
+        return request_headers or None
 
     def _build_default_stream_response_handler(
         self,
@@ -1300,8 +1474,6 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
         Returns:
             ProviderStreamResponseHandler[AsyncStream[ChatCompletionChunk]]: 默认流式处理器。
         """
-        del request
-
         async def default_stream_handler(
             resp_stream: AsyncStream[ChatCompletionChunk],
             flag: asyncio.Event | None,
@@ -1313,6 +1485,9 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 reasoning_parse_mode=self.reasoning_parse_mode,
                 tool_argument_parse_mode=self.tool_argument_parse_mode,
                 reasoning_key=self.reasoning_key,
+                logical_turn_id=request.logical_turn_id,
+                max_tokens=request.max_tokens,
+                trace_context=request.trace_context,
             )
 
         return default_stream_handler
@@ -1329,8 +1504,6 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
         Returns:
             ProviderResponseParser[ChatCompletion]: 默认非流式解析器。
         """
-        del request
-
         def default_response_parser(
             response: ChatCompletion,
         ) -> Tuple[APIResponse, UsageTuple | None]:
@@ -1340,6 +1513,9 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 reasoning_parse_mode=self.reasoning_parse_mode,
                 tool_argument_parse_mode=self.tool_argument_parse_mode,
                 reasoning_key=self.reasoning_key,
+                logical_turn_id=request.logical_turn_id,
+                max_tokens=request.max_tokens,
+                trace_context=request.trace_context,
             )
 
         return default_response_parser
@@ -1373,9 +1549,9 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
 
         try:
             request_messages = (
-                list(request.message_list)
+                list(request.context_items)
                 if request.tool_options
-                else _sanitize_messages_for_toolless_request(request.message_list)
+                else _sanitize_messages_for_toolless_request(request.context_items)
             )
             messages_payload: List[ChatCompletionMessageParam] = _convert_messages(request_messages)
             tools_payload: List[ChatCompletionToolParam] | None = (
@@ -1414,6 +1590,10 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                         if "max_tokens" in extra_body or "max_completion_tokens" in extra_body
                         else _coerce_openai_argument(request.max_tokens)
                     )
+                effective_max_tokens = extra_body.get(
+                    "max_completion_tokens",
+                    extra_body.get("max_tokens", None if max_tokens_argument is omit else max_tokens_argument),
+                )
                 snapshot_provider_request["request_kwargs"] = {
                     "extra_body": extra_body or None,
                     "extra_headers": request_overrides.extra_headers or None,
@@ -1428,6 +1608,11 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 }
 
                 if model_info.force_stream_mode:
+                    active_stream_handler = (
+                        stream_response_handler
+                        if request.stream_response_handler is not None
+                        else self._build_default_stream_response_handler(request.copy_with(max_tokens=effective_max_tokens))
+                    )
                     stream_task: asyncio.Task[AsyncStream[ChatCompletionChunk]] = asyncio.create_task(
                         self.client.chat.completions.create(
                             model=model_info.model_identifier,
@@ -1437,7 +1622,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                             max_tokens=max_tokens_argument,
                             stream=True,
                             response_format=openai_response_format,
-                            extra_headers=request_overrides.extra_headers or None,
+                            extra_headers=self._build_request_headers(request_overrides.extra_headers),
                             extra_query=request_overrides.extra_query or None,
                             extra_body=extra_body or None,
                         )
@@ -1446,8 +1631,13 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                         AsyncStream[ChatCompletionChunk],
                         await await_task_with_interrupt(stream_task, request.interrupt_flag),
                     )
-                    return await stream_response_handler(raw_response, request.interrupt_flag)
+                    return await active_stream_handler(raw_response, request.interrupt_flag)
 
+                active_response_parser = (
+                    response_parser
+                    if request.async_response_parser is not None
+                    else self._build_default_response_parser(request.copy_with(max_tokens=effective_max_tokens))
+                )
                 completion_task: asyncio.Task[ChatCompletion] = asyncio.create_task(
                     self.client.chat.completions.create(
                         model=model_info.model_identifier,
@@ -1457,7 +1647,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                         max_tokens=max_tokens_argument,
                         stream=False,
                         response_format=openai_response_format,
-                        extra_headers=request_overrides.extra_headers or None,
+                        extra_headers=self._build_request_headers(request_overrides.extra_headers),
                         extra_query=request_overrides.extra_query or None,
                         extra_body=extra_body or None,
                     )
@@ -1466,7 +1656,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                     ChatCompletion,
                     await await_task_with_interrupt(completion_task, request.interrupt_flag),
                 )
-                return response_parser(raw_response)
+                return active_response_parser(raw_response)
 
             # 已知仅支持 max_completion_tokens 的模型直接走对应分支；否则先按常规发送，
             # 命中「max_tokens 不被支持」的 400 错误时自动改用 max_completion_tokens 重试并记忆。
@@ -1480,16 +1670,26 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 or (request.max_tokens is not None and "max_completion_tokens" not in request_overrides.extra_body)
             )
             try:
-                return await _dispatch(use_mct)
+                response_result = await _dispatch(use_mct)
             except APIStatusError as exc:
                 if sent_legacy_max_tokens and _is_max_tokens_unsupported_error(exc):
                     _MODELS_REQUIRING_MAX_COMPLETION_TOKENS.add(cache_key)
                     logger.info(
-                        f"模型 '{model_info.name}' 不支持 max_tokens，自动改用 "
-                        f"max_completion_tokens 重试并记忆该模型。"
+                        f"模型 '{model_info.name}' 不支持 max_tokens，自动改用 max_completion_tokens 重试并记忆该模型。"
                     )
-                    return await _dispatch(True)
-                raise
+                    response_result = await _dispatch(True)
+                else:
+                    raise
+            response, usage_record = response_result
+            request_kwargs = snapshot_provider_request["request_kwargs"]
+            response.wire_protocol = "chat_completions"
+            response.request_wire_payload = {
+                "extra_body": request_kwargs.get("extra_body"),
+                "messages": request_kwargs.get("messages"),
+                "response_format": request_kwargs.get("response_format"),
+                "tools": request_kwargs.get("tools"),
+            }
+            return response, usage_record
         except (EmptyResponseException, RespParseException) as exc:
             snapshot_path = save_failed_request_snapshot(
                 api_provider=self.api_provider,
@@ -1499,6 +1699,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="chat.completions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             attach_request_snapshot(exc, snapshot_path)
             raise
@@ -1511,6 +1712,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="chat.completions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             wrapped_error = NetworkConnectionError(str(exc))
             attach_request_snapshot(wrapped_error, snapshot_path)
@@ -1524,6 +1726,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="chat.completions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             wrapped_error = RespNotOkException(exc.status_code, _build_api_status_message(exc))
             attach_request_snapshot(wrapped_error, snapshot_path)
@@ -1541,9 +1744,197 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="chat.completions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             attach_request_snapshot(exc, snapshot_path)
             raise
+
+    async def get_image_embedding(self, request: ImageEmbeddingRequest) -> APIResponse:
+        """调用图片嵌入协议。
+
+        显式配置 `image_embedding_input` / `image_embedding_body` 时走 OpenAI 兼容模板协议；
+        否则官方百炼/豆包地址切换原生协议，硅基流动地址自动使用其兼容图片输入模板。
+        """
+
+        extra_params = dict(request.extra_params)
+        if "image_embedding_input" in extra_params or "image_embedding_body" in extra_params:
+            return await self._get_openai_compatible_image_embedding(request, extra_params)
+        native_protocol = resolve_native_image_embedding_protocol(self.api_provider.base_url)
+        if native_protocol is not None:
+            return await self._get_native_image_embedding(request, native_protocol)
+        compatible_input = resolve_compatible_image_embedding_input(self.api_provider.base_url)
+        if compatible_input is not None:
+            extra_params["image_embedding_input"] = compatible_input
+            response = await self._get_openai_compatible_image_embedding(request, extra_params)
+            response.request_protocol_hash = build_compatible_image_embedding_fingerprint(
+                compatible_input, request.extra_params
+            )
+            return response
+        raise ValueError("图片嵌入必须配置 Provider 对应的 image_embedding_input 或 image_embedding_body")
+
+    async def _get_openai_compatible_image_embedding(
+        self,
+        request: ImageEmbeddingRequest,
+        extra_params: Dict[str, Any],
+    ) -> APIResponse:
+        """调用 OpenAI 兼容的图片嵌入扩展协议（模板由 extra_params 提供）。"""
+
+        model_info = request.model_info
+        validate_image_embedding_transport(self.api_provider.base_url)
+        input_template = extra_params.pop("image_embedding_input", None)
+        body_template = extra_params.pop("image_embedding_body", None)
+        encoded = base64.b64encode(request.image_bytes).decode("ascii")
+        replacements = {
+            "base64": encoded,
+            "data_uri": f"data:{request.mime_type};base64,{encoded}",
+            "mime_type": request.mime_type,
+        }
+        image_input = _render_image_embedding_template(input_template, replacements)
+        if body_template is not None:
+            if not isinstance(body_template, dict):
+                raise ValueError("image_embedding_body 必须是对象")
+            rendered_body = _render_image_embedding_template(body_template, replacements)
+            if "input" in rendered_body:
+                image_input = rendered_body.pop("input")
+            extra_params.update(rendered_body)
+        if image_input is None:
+            raise ValueError("图片嵌入请求模板缺少 input")
+        request_overrides = split_openai_request_overrides(extra_params)
+        provider_request = {
+            "base_url": self.api_provider.base_url,
+            "endpoint": "/embeddings",
+            "method": "POST",
+            "operation": "embeddings.create.image",
+            "request_kwargs": {
+                "extra_body": request_overrides.extra_body or None,
+                "extra_headers": request_overrides.extra_headers or None,
+                "extra_query": request_overrides.extra_query or None,
+                "image": {
+                    "byte_size": len(request.image_bytes),
+                    "mime_type": request.mime_type,
+                },
+                "model": model_info.model_identifier,
+            },
+        }
+        try:
+            raw_response = await self.client.embeddings.create(
+                model=model_info.model_identifier,
+                input=cast(Any, image_input),
+                extra_headers=self._build_request_headers(request_overrides.extra_headers),
+                extra_query=request_overrides.extra_query or None,
+                extra_body=request_overrides.extra_body or None,
+            )
+        except APIConnectionError as exc:
+            wrapped_error: Exception = NetworkConnectionError(str(exc))
+        except APIStatusError as exc:
+            wrapped_error = RespNotOkException(exc.status_code, _build_api_status_message(exc))
+        except Exception as exc:
+            wrapped_error = exc
+        else:
+            if not raw_response.data:
+                wrapped_error = RespParseException(raw_response, "图片嵌入响应缺少 embeddings 数据")
+            else:
+                response = APIResponse(embedding=raw_response.data[0].embedding, raw_data=raw_response)
+                usage_record = _extract_usage_record(getattr(raw_response, "usage", None))
+                if usage_record is not None:
+                    response.usage = self._build_usage_record(model_info, usage_record)
+                return response
+
+        snapshot_path = save_failed_request_snapshot(
+            api_provider=self.api_provider,
+            client_type="openai",
+            error=wrapped_error,
+            internal_request=serialize_image_embedding_request_snapshot(request),
+            model_info=model_info,
+            operation="embeddings.create.image",
+            provider_request=provider_request,
+            trace_context=request.trace_context,
+        )
+        attach_request_snapshot(wrapped_error, snapshot_path)
+        raise wrapped_error
+
+    async def _get_native_image_embedding(self, request: ImageEmbeddingRequest, protocol: str) -> APIResponse:
+        """调用百炼/豆包官方原生多模态图片嵌入协议。
+
+        复用同一个 AsyncOpenAI 客户端向原生端点的完整 URL 发送请求：
+        绝对地址由 SDK 原样使用，鉴权头、默认 headers/query、超时与连接池均不变，
+        共享 `base_url` 不被修改，聊天与文本嵌入请求不受影响。
+        """
+
+        model_info = request.model_info
+        validate_image_embedding_transport(self.api_provider.base_url)
+        native_request = build_native_image_embedding_request(
+            protocol,
+            base_url=self.api_provider.base_url,
+            model_identifier=model_info.model_identifier,
+            image_bytes=request.image_bytes,
+            mime_type=request.mime_type,
+            extra_params=request.extra_params,
+        )
+        provider_request = {
+            "base_url": self.api_provider.base_url,
+            "endpoint": urlparse(native_request.endpoint_url).path,
+            "method": "POST",
+            "operation": f"{protocol}_image_embedding",
+            "request_kwargs": {
+                "extra_headers": native_request.extra_headers or None,
+                "extra_query": native_request.extra_query or None,
+                "image": {
+                    "byte_size": len(request.image_bytes),
+                    "mime_type": request.mime_type,
+                },
+                "model": model_info.model_identifier,
+                # 写入快照前用占位符替换 Data URI，避免原图 Base64 落盘
+                "payload": build_native_image_embedding_diagnostic_payload(native_request.payload),
+            },
+        }
+        options: Dict[str, Any] = {}
+        request_headers = self._build_request_headers(native_request.extra_headers)
+        if request_headers:
+            options["headers"] = request_headers
+        if native_request.extra_query:
+            options["params"] = native_request.extra_query
+        try:
+            raw_response = await self.client.post(
+                native_request.endpoint_url,
+                cast_to=object,
+                body=native_request.payload,
+                options=options,
+            )
+        except APIConnectionError as exc:
+            wrapped_error: Exception = NetworkConnectionError(str(exc))
+        except APIStatusError as exc:
+            wrapped_error = RespNotOkException(exc.status_code, _build_api_status_message(exc))
+        else:
+            try:
+                parsed = parse_native_image_embedding_response(protocol, raw_response)
+            except Exception as exc:
+                wrapped_error = RespParseException(raw_response, f"图片嵌入响应解析失败: {exc}")
+            else:
+                response = APIResponse(
+                    embedding=parsed.embedding,
+                    raw_data=raw_response,
+                    request_protocol_hash=build_native_image_embedding_fingerprint(
+                        native_request,
+                        model_info.model_identifier,
+                    ),
+                )
+                if parsed.usage is not None:
+                    response.usage = self._build_usage_record(model_info, parsed.usage)
+                return response
+
+        snapshot_path = save_failed_request_snapshot(
+            api_provider=self.api_provider,
+            client_type="openai",
+            error=wrapped_error,
+            internal_request=serialize_image_embedding_request_snapshot(request),
+            model_info=model_info,
+            operation=provider_request["operation"],
+            provider_request=provider_request,
+            trace_context=request.trace_context,
+        )
+        attach_request_snapshot(wrapped_error, snapshot_path)
+        raise wrapped_error
 
     async def _execute_embedding_request(
         self,
@@ -1582,7 +1973,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
             raw_response = await self.client.embeddings.create(
                 model=model_info.model_identifier,
                 input=embedding_input,
-                extra_headers=request_overrides.extra_headers or None,
+                extra_headers=self._build_request_headers(request_overrides.extra_headers),
                 extra_query=request_overrides.extra_query or None,
                 extra_body=request_overrides.extra_body or None,
             )
@@ -1595,6 +1986,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="embeddings.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             wrapped_error = NetworkConnectionError(str(exc))
             attach_request_snapshot(wrapped_error, snapshot_path)
@@ -1608,6 +2000,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="embeddings.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             wrapped_error = RespNotOkException(exc.status_code, _build_api_status_message(exc))
             attach_request_snapshot(wrapped_error, snapshot_path)
@@ -1623,6 +2016,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="embeddings.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             attach_request_snapshot(exc, snapshot_path)
             raise
@@ -1638,6 +2032,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="embeddings.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             attach_request_snapshot(exc, snapshot_path)
             raise exc
@@ -1688,7 +2083,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
             raw_response = await self.client.audio.transcriptions.create(
                 model=model_info.model_identifier,
                 file=audio_file,
-                extra_headers=request_overrides.extra_headers or None,
+                extra_headers=self._build_request_headers(request_overrides.extra_headers),
                 extra_query=request_overrides.extra_query or None,
                 extra_body=request_overrides.extra_body or None,
             )
@@ -1701,6 +2096,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="audio.transcriptions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             wrapped_error = NetworkConnectionError(str(exc))
             attach_request_snapshot(wrapped_error, snapshot_path)
@@ -1714,6 +2110,7 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="audio.transcriptions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             wrapped_error = RespNotOkException(exc.status_code, _build_api_status_message(exc))
             attach_request_snapshot(wrapped_error, snapshot_path)
@@ -1729,11 +2126,11 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="audio.transcriptions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             attach_request_snapshot(exc, snapshot_path)
             raise
 
-        response = APIResponse()
         transcription_text = raw_response if isinstance(raw_response, str) else getattr(raw_response, "text", None)
         if not isinstance(transcription_text, str):
             exc = RespParseException(raw_response, "音频转写响应解析失败，缺少文本内容。")
@@ -1745,12 +2142,18 @@ class OpenaiClient(AdapterClient[AsyncStream[ChatCompletionChunk], ChatCompletio
                 model_info=model_info,
                 operation="audio.transcriptions.create",
                 provider_request=snapshot_provider_request,
+                trace_context=request.trace_context,
             )
             attach_request_snapshot(exc, snapshot_path)
             raise exc
         if isinstance(transcription_text, str):
-            response.content = transcription_text
-            return response, None
+            return _build_portable_api_response(
+                content=transcription_text,
+                reasoning_content=None,
+                tool_calls=None,
+                logical_turn_id=uuid4().hex,
+                raw_data=raw_response,
+            ), None
         raise RespParseException(raw_response, "响应解析失败，缺失转录文本。")
 
     def get_support_image_formats(self) -> List[str]:

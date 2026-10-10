@@ -5,15 +5,13 @@ import {
   Bot,
   CheckCircle2,
   Globe,
-  Key,
+  ShieldCheck,
   SkipForward,
-  Sparkles,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
-import { Progress } from '@/components/ui/progress'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
   AlertDialog,
@@ -35,6 +33,7 @@ import {
 import { cn } from '@/lib/utils'
 import { APP_NAME } from '@/lib/version'
 import { useToast } from '@/hooks/use-toast'
+import { validateToken } from '@/lib/token-validator'
 import type {
   ApiProviderSetupConfig,
   SetupStep,
@@ -45,11 +44,13 @@ import type {
 import {
   ApiProviderSetupForm,
   BotBasicForm,
+  CustomTokenForm,
   ModelSetupForm,
   PersonalityForm,
 } from './StepForms'
 import {
   loadBotBasicConfig,
+  loadSetupStatus,
   loadPersonalityConfig,
   loadApiProviderSetupConfig,
   loadModelSetupConfig,
@@ -58,6 +59,7 @@ import {
   saveApiProviderSetupConfig,
   saveModelSetupConfig,
   completeSetup,
+  updateAccessToken,
 } from './api'
 
 const LANGUAGE_CODES = ['zh', 'en', 'ja', 'ko'] as const
@@ -93,6 +95,8 @@ function SetupPageContent() {
   const [isCompleting, setIsCompleting] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
   const [isLoading, setIsLoading] = useState(true)
+  const [requiresCustomToken, setRequiresCustomToken] = useState(false)
+  const [customToken, setCustomToken] = useState('')
 
   // 步骤1：Bot基础信息
   const [botBasic, setBotBasic] = useState<BotBasicConfig>({
@@ -127,18 +131,12 @@ function SetupPageContent() {
     replyer_thinking: true,
   })
 
-  const steps: SetupStep[] = [
+  const setupSteps: SetupStep[] = [
     {
       id: 'bot-profile',
       title: t('setupPage.steps.botProfile.title'),
       description: t('setupPage.steps.botProfile.description'),
       icon: Bot,
-    },
-    {
-      id: 'api-provider',
-      title: t('setupPage.steps.apiProvider.title'),
-      description: t('setupPage.steps.apiProvider.description'),
-      icon: Key,
     },
     {
       id: 'model-setup',
@@ -147,8 +145,19 @@ function SetupPageContent() {
       icon: Brain,
     },
   ]
+  const steps: SetupStep[] = requiresCustomToken
+    ? [
+        {
+          id: 'custom-token',
+          title: t('setupPage.steps.customToken.title'),
+          description: t('setupPage.steps.customToken.description'),
+          icon: ShieldCheck,
+        },
+        ...setupSteps,
+      ]
+    : setupSteps
 
-  const progress = ((currentStep + 1) / steps.length) * 100
+  const currentStepId = steps[currentStep]?.id
 
   // 加载现有配置
   useEffect(() => {
@@ -157,13 +166,15 @@ function SetupPageContent() {
         setIsLoading(true)
 
         // 并行加载所有配置
-        const [bot, personality, apiProvider, model] = await Promise.all([
+        const [setupStatus, bot, personality, apiProvider, model] = await Promise.all([
+          loadSetupStatus(),
           loadBotBasicConfig(),
           loadPersonalityConfig(),
           loadApiProviderSetupConfig(),
           loadModelSetupConfig(),
         ])
 
+        setRequiresCustomToken(setupStatus.requires_custom_token)
         setBotBasic(bot)
         setPersonality(personality)
         setApiProviderSetup(apiProvider)
@@ -187,15 +198,13 @@ function SetupPageContent() {
   const saveCurrentStep = async () => {
     setIsSaving(true)
     try {
-      switch (currentStep) {
-        case 0: // Bot基础与人格
+      switch (currentStepId) {
+        case 'bot-profile': // Bot基础与人格
           await saveBotBasicConfig(botBasic)
           await savePersonalityConfig(personality)
           break
-        case 1: // API 提供商
+        case 'model-setup': // API 提供商与基础模型
           await saveApiProviderSetupConfig(apiProviderSetup)
-          break
-        case 2: // 基础模型
           await saveModelSetupConfig(modelSetup, apiProviderSetup.provider_name)
           break
       }
@@ -207,6 +216,55 @@ function SetupPageContent() {
         }),
         duration: 1000,
       })
+      return true
+    } catch (error) {
+      toast({
+        title: t('setupPage.toast.saveFailedTitle'),
+        description: error instanceof Error ? error.message : t('setupPage.toast.unknownError'),
+        variant: 'destructive',
+      })
+      return false
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const saveCustomToken = async () => {
+    const trimmedToken = customToken.trim()
+    const tokenValidation = validateToken(trimmedToken)
+    if (!tokenValidation.isValid) {
+      const failedRules = tokenValidation.rules
+        .filter((rule) => !rule.passed)
+        .map((rule) => rule.label)
+        .join(', ')
+      toast({
+        title: t('setupPage.toast.validationFailedTitle'),
+        description: t('setupPage.validation.customTokenInvalid', { failedRules }),
+        variant: 'destructive',
+      })
+      return false
+    }
+
+    setIsSaving(true)
+    try {
+      const result = await updateAccessToken(trimmedToken)
+      if (!result.success) {
+        toast({
+          title: t('setupPage.toast.saveFailedTitle'),
+          description: result.message,
+          variant: 'destructive',
+        })
+        return false
+      }
+
+      toast({
+        title: t('setupPage.toast.customTokenSuccessTitle'),
+        description: t('setupPage.toast.customTokenSuccessDescription'),
+      })
+      setCustomToken('')
+      setTimeout(() => {
+        navigate({ to: '/auth' })
+      }, 1200)
       return true
     } catch (error) {
       toast({
@@ -245,8 +303,13 @@ function SetupPageContent() {
   }
 
   const handleNext = async () => {
+    if (currentStepId === 'custom-token') {
+      await saveCustomToken()
+      return
+    }
+
     // Step 1 验证
-    if (currentStep === 0) {
+    if (currentStepId === 'bot-profile') {
       const error = validateBotBasic(botBasic)
       if (error) {
         toast({
@@ -257,19 +320,8 @@ function SetupPageContent() {
         return
       }
     }
-    if (currentStep === 1) {
-      const error = validateApiProviderSetup(apiProviderSetup)
-      if (error) {
-        toast({
-          title: t('setupPage.toast.validationFailedTitle'),
-          description: error,
-          variant: 'destructive',
-        })
-        return
-      }
-    }
-    if (currentStep === 2) {
-      const error = validateModelSetup(modelSetup)
+    if (currentStepId === 'model-setup') {
+      const error = validateApiProviderSetup(apiProviderSetup) ?? validateModelSetup(modelSetup)
       if (error) {
         toast({
           title: t('setupPage.toast.validationFailedTitle'),
@@ -300,7 +352,7 @@ function SetupPageContent() {
     setIsCompleting(true)
 
     try {
-      const error = validateModelSetup(modelSetup)
+      const error = validateApiProviderSetup(apiProviderSetup) ?? validateModelSetup(modelSetup)
       if (error) {
         toast({
           title: t('setupPage.toast.validationFailedTitle'),
@@ -356,8 +408,10 @@ function SetupPageContent() {
 
   // 渲染当前步骤的表单
   const renderStepForm = () => {
-    switch (currentStep) {
-      case 0:
+    switch (currentStepId) {
+      case 'custom-token':
+        return <CustomTokenForm token={customToken} onChange={setCustomToken} />
+      case 'bot-profile':
         return (
           <div className="space-y-8">
             <BotBasicForm config={botBasic} onChange={setBotBasic} />
@@ -366,19 +420,24 @@ function SetupPageContent() {
             </div>
           </div>
         )
-      case 1:
-        return <ApiProviderSetupForm config={apiProviderSetup} onChange={setApiProviderSetup} />
-      case 2:
-        return <ModelSetupForm config={modelSetup} onChange={setModelSetup} />
+      case 'model-setup':
+        return (
+          <div className="space-y-8">
+            <ApiProviderSetupForm config={apiProviderSetup} onChange={setApiProviderSetup} />
+            <div className="border-t pt-6">
+              <ModelSetupForm config={modelSetup} onChange={setModelSetup} />
+            </div>
+          </div>
+        )
       default:
         return null
     }
   }
 
   return (
-    <div className="from-primary/5 via-background to-secondary/5 relative flex h-full min-h-screen flex-col items-center justify-center overflow-y-auto overflow-x-hidden bg-gradient-to-br p-4 md:p-6">
+    <div className="from-primary/5 via-background to-secondary/5 relative flex h-full min-h-screen flex-col items-center justify-center overflow-y-auto overflow-x-hidden bg-gradient-to-br p-3 md:p-4">
       {/* 语言切换 */}
-      <div className="absolute top-4 right-4 z-20">
+      <div className="absolute top-3 right-3 z-20">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <Button variant="ghost" size="sm" className="gap-2">
@@ -427,43 +486,24 @@ function SetupPageContent() {
           {/* 主要内容 */}
           <div className="relative z-10 w-full max-w-4xl">
             {/* 头部 */}
-            <div className="mb-6 text-center md:mb-8">
-              <div className="bg-primary/10 mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl md:h-16 md:w-16">
-                <Sparkles
-                  className="text-primary h-6 w-6 md:h-8 md:w-8"
-                  strokeWidth={2}
-                  fill="none"
-                />
-              </div>
-              <h1 className="mb-2 text-2xl font-bold md:text-3xl">{t('setupPage.header.title')}</h1>
-              <p className="text-muted-foreground text-sm md:text-base">
-                {t('setupPage.header.description', { appName: APP_NAME })}
-              </p>
-            </div>
-
-            {/* 进度条 */}
-            <div className="mb-6 md:mb-8">
-              <div className="mb-2 flex items-center justify-between text-xs md:text-sm">
-                <span className="text-muted-foreground">
-                  {t('setupPage.progress.stepCounter', {
-                    current: currentStep + 1,
-                    total: steps.length,
-                  })}
-                </span>
-                <span className="text-primary font-medium">{Math.round(progress)}%</span>
-              </div>
-              <Progress value={progress} className="h-2" />
+            <div className="mb-4 text-center md:mb-5">
+              <h1 className="mb-1 text-2xl font-bold md:text-3xl">{t('setupPage.header.title')}</h1>
+              {t('setupPage.header.description', { appName: APP_NAME }) ? (
+                <p className="text-muted-foreground text-sm md:text-base">
+                  {t('setupPage.header.description', { appName: APP_NAME })}
+                </p>
+              ) : null}
             </div>
 
             {/* 步骤指示器 */}
-            <div className="mb-6 flex justify-between md:mb-8">
+            <div className="mb-4 flex justify-between md:mb-5">
               {steps.map((step, index) => {
                 const Icon = step.icon
                 return (
                   <div
                     key={step.id}
                     className={cn(
-                      'flex flex-1 flex-col items-center gap-1 md:gap-2',
+                      'flex flex-1 flex-col items-center gap-1',
                       index < steps.length - 1 && 'relative'
                     )}
                   >
@@ -471,7 +511,7 @@ function SetupPageContent() {
                     {index < steps.length - 1 && (
                       <div
                         className={cn(
-                          'absolute top-3 left-1/2 h-0.5 w-full md:top-4',
+                          'absolute top-2.5 left-1/2 h-0.5 w-full md:top-3.5',
                           index < currentStep ? 'bg-primary' : 'bg-border'
                         )}
                       />
@@ -480,7 +520,7 @@ function SetupPageContent() {
                     {/* 步骤圆圈 */}
                     <div
                       className={cn(
-                        'relative z-10 flex h-6 w-6 items-center justify-center rounded-full border-2 transition-all md:h-8 md:w-8',
+                        'relative z-10 flex h-5 w-5 items-center justify-center rounded-full border-2 transition-all md:h-7 md:w-7',
                         index === currentStep
                           ? 'border-primary bg-primary text-primary-foreground'
                           : index < currentStep
@@ -490,12 +530,12 @@ function SetupPageContent() {
                     >
                       {index < currentStep ? (
                         <CheckCircle2
-                          className="h-3 w-3 md:h-4 md:w-4"
+                          className="h-2.5 w-2.5 md:h-3.5 md:w-3.5"
                           strokeWidth={2.5}
                           fill="none"
                         />
                       ) : (
-                        <Icon className="h-3 w-3 md:h-4 md:w-4" />
+                        <Icon className="h-2.5 w-2.5 md:h-3.5 md:w-3.5" />
                       )}
                     </div>
 
@@ -517,21 +557,23 @@ function SetupPageContent() {
             </div>
 
             {/* 步骤内容卡片 */}
-            <Card className="mb-6 shadow-lg md:mb-8">
+            <Card className="mb-4 shadow-lg md:mb-5">
               <CardContent className="p-4 md:p-8">
-                <div className="min-h-[300px] md:min-h-[400px]">
+                  <div className="min-h-0">
                   <div className="mb-4 md:mb-6">
                     <h2 className="mb-2 text-xl font-semibold md:text-2xl">
                       {steps[currentStep].title}
                     </h2>
-                    <p className="text-muted-foreground text-sm md:text-base">
-                      {steps[currentStep].description}
-                    </p>
+                    {steps[currentStep].description ? (
+                      <p className="text-muted-foreground text-sm md:text-base">
+                        {steps[currentStep].description}
+                      </p>
+                    ) : null}
                   </div>
 
                   {/* 表单内容 */}
                   <ScrollArea
-                    className="h-[400px] md:h-[500px]"
+                    className="h-[clamp(220px,42vh,500px)] min-h-0"
                     viewportClassName="overscroll-auto"
                   >
                     <div className="pr-2">{renderStepForm()}</div>
@@ -541,7 +583,7 @@ function SetupPageContent() {
             </Card>
 
             {/* 操作按钮 */}
-            <div className="flex flex-col items-center justify-between gap-3 sm:flex-row sm:gap-0">
+            <div className="flex flex-col items-center justify-between gap-2 sm:flex-row sm:gap-0">
               <Button
                 variant="outline"
                 onClick={handlePrevious}
@@ -557,7 +599,7 @@ function SetupPageContent() {
                     <Button
                       variant="ghost"
                       className="flex-1 gap-2 sm:flex-none"
-                      disabled={isSaving || isCompleting}
+                      disabled={isSaving || isCompleting || currentStepId === 'custom-token'}
                     >
                       <SkipForward className="h-4 w-4" strokeWidth={2} fill="none" />
                       {t('setupPage.actions.skip')}
@@ -579,7 +621,7 @@ function SetupPageContent() {
                   </AlertDialogContent>
                 </AlertDialog>
 
-                {currentStep === steps.length - 1 ? (
+                {currentStep === steps.length - 1 && currentStepId !== 'custom-token' ? (
                   <Button
                     onClick={handleComplete}
                     disabled={isCompleting || isSaving}
@@ -608,7 +650,9 @@ function SetupPageContent() {
                       </>
                     ) : (
                       <>
-                        {t('setupPage.actions.next')}
+                        {currentStepId === 'custom-token'
+                          ? t('setupPage.actions.saveToken')
+                          : t('setupPage.actions.next')}
                         <ArrowRight className="ml-2 h-4 w-4" strokeWidth={2} fill="none" />
                       </>
                     )}
@@ -618,10 +662,6 @@ function SetupPageContent() {
             </div>
           </div>
 
-          {/* 页脚提示 */}
-          <div className="text-muted-foreground relative z-10 mt-6 text-center text-xs md:mt-8">
-            <p>{t('setupPage.footer')}</p>
-          </div>
         </>
       )}
     </div>

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Check, ChevronsUpDown, Copy, Eye, EyeOff } from 'lucide-react'
+import { Check, ChevronDown, ChevronsUpDown, Copy, Eye, EyeOff } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Command, CommandEmpty, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
-import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Dialog, DialogBody, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { HelpTooltip } from '@/components/ui/help-tooltip'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { KeyValueEditor } from '@/components/ui/key-value-editor'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
@@ -17,13 +19,24 @@ import { PROVIDER_TEMPLATES } from '../providerTemplates'
 import type { APIProvider, FormErrors } from './types'
 import { validateProvider } from './utils'
 
+const PROVIDER_TEMPLATE_OPTIONS = PROVIDER_TEMPLATES.filter((template) => template.id !== 'custom')
+const DEFAULT_PROVIDER_TEMPLATE = PROVIDER_TEMPLATES.find(
+  (template) => template.id === 'deepseek'
+)!
+
+if (!DEFAULT_PROVIDER_TEMPLATE) {
+  throw new Error('缺少默认的 DeepSeek 提供商模板')
+}
+
+const DEFAULT_PROVIDER_TEMPLATE_ID = DEFAULT_PROVIDER_TEMPLATE.id
+
 interface ProviderFormProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   editingProvider: APIProvider | null
   editingIndex: number | null
   providers: APIProvider[]
-  onSave: (provider: APIProvider, index: number | null) => void
+  onSave: (provider: APIProvider, index: number | null) => Promise<void> | void
   tourState: { isRunning: boolean }
 }
 
@@ -37,11 +50,14 @@ export function ProviderForm({
   tourState,
 }: ProviderFormProps) {
   const [formErrors, setFormErrors] = useState<FormErrors>({})
-  const [selectedTemplate, setSelectedTemplate] = useState<string>('custom')
+  const [selectedTemplate, setSelectedTemplate] = useState<string>(DEFAULT_PROVIDER_TEMPLATE_ID)
+  const [lastTemplateId, setLastTemplateId] = useState(DEFAULT_PROVIDER_TEMPLATE_ID)
   const [templateComboboxOpen, setTemplateComboboxOpen] = useState(false)
   const [showApiKey, setShowApiKey] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const [localProvider, setLocalProvider] = useState<APIProvider | null>(editingProvider)
   const [clientTypes, setClientTypes] = useState<ModelClientType[]>([])
+  const [saving, setSaving] = useState(false)
   const { toast } = useToast()
 
   useEffect(() => {
@@ -71,38 +87,67 @@ export function ProviderForm({
       setLocalProvider(null)
       setFormErrors({})
       setShowApiKey(false)
-      setSelectedTemplate('custom')
+      setAdvancedOpen(false)
+      setSelectedTemplate(DEFAULT_PROVIDER_TEMPLATE_ID)
+      setLastTemplateId(DEFAULT_PROVIDER_TEMPLATE_ID)
+      setSaving(false)
       return
     }
 
     setLocalProvider(editingProvider)
     setFormErrors({})
     setShowApiKey(false)
+    setAdvancedOpen(false)
 
-    // 检测匹配的模板
-    if (editingProvider) {
+    // 编辑时匹配已有配置；新增时默认使用 DeepSeek 模板。
+    if (editingIndex !== null && editingProvider) {
       const matchedTemplate = PROVIDER_TEMPLATES.find(
-        t => t.base_url === editingProvider.base_url && t.client_type === editingProvider.client_type
+        (template) =>
+          template.base_url === editingProvider.base_url &&
+          (template.allowed_client_types ?? [template.client_type]).some(
+            (clientType) => clientType === editingProvider.client_type
+          )
       )
       setSelectedTemplate(matchedTemplate?.id || 'custom')
+      if (matchedTemplate && matchedTemplate.id !== 'custom') {
+        setLastTemplateId(matchedTemplate.id)
+      }
     } else {
-      setSelectedTemplate('custom')
+      setSelectedTemplate(DEFAULT_PROVIDER_TEMPLATE_ID)
+      setLastTemplateId(DEFAULT_PROVIDER_TEMPLATE_ID)
+      setLocalProvider((provider) =>
+        provider
+          ? {
+              ...provider,
+              name: DEFAULT_PROVIDER_TEMPLATE.name,
+              base_url: DEFAULT_PROVIDER_TEMPLATE.base_url,
+              client_type: DEFAULT_PROVIDER_TEMPLATE.client_type,
+            }
+          : null
+      )
     }
   }, [open, editingProvider, editingIndex])
 
   const isUsingTemplate = useMemo(() => selectedTemplate !== 'custom', [selectedTemplate])
+  const selectedTemplateConfig = useMemo(
+    () => PROVIDER_TEMPLATES.find((template) => template.id === selectedTemplate),
+    [selectedTemplate]
+  )
+  const isClientTypeLocked = Boolean(
+    isUsingTemplate && !selectedTemplateConfig?.allowed_client_types?.length
+  )
   const clientTypeOptions = useMemo(() => {
     const options = [...clientTypes]
     const knownTypes = new Set(options.map((item) => item.client_type))
 
-    for (const clientType of ['openai', 'gemini', localProvider?.client_type].filter(Boolean) as string[]) {
+    for (const clientType of ['openai', 'openai_responses', 'gemini', localProvider?.client_type].filter(Boolean) as string[]) {
       if (!knownTypes.has(clientType)) {
         options.push({
           client_type: clientType,
           owner_plugin_id: null,
           version: '',
           description: '',
-          builtin: clientType === 'openai' || clientType === 'gemini',
+          builtin: clientType === 'openai' || clientType === 'openai_responses' || clientType === 'gemini',
         })
         knownTypes.add(clientType)
       }
@@ -110,27 +155,41 @@ export function ProviderForm({
 
     return options
   }, [clientTypes, localProvider?.client_type])
+  const visibleClientTypeOptions = useMemo(() => {
+    const allowedClientTypes = selectedTemplateConfig?.allowed_client_types
+    if (!allowedClientTypes?.length) return clientTypeOptions
+
+    const allowedClientTypeSet = new Set<string>(allowedClientTypes)
+    return clientTypeOptions.filter((item) => allowedClientTypeSet.has(item.client_type))
+  }, [clientTypeOptions, selectedTemplateConfig])
 
   const handleTemplateChange = useCallback((templateId: string) => {
-    setSelectedTemplate(templateId)
-    setTemplateComboboxOpen(false)
     const template = PROVIDER_TEMPLATES.find(t => t.id === templateId)
-    if (template && template.id !== 'custom') {
-      setLocalProvider(prev => ({
-        ...prev!,
-        name: template.name,
-        base_url: template.base_url,
-        client_type: template.client_type,
-      }))
-    } else if (template?.id === 'custom') {
-      setLocalProvider(prev => ({
-        ...prev!,
-        name: '',
-        base_url: '',
-        client_type: 'openai',
-      }))
-    }
+    if (!template || template.id === 'custom') return
+
+    setSelectedTemplate(template.id)
+    setLastTemplateId(template.id)
+    setTemplateComboboxOpen(false)
+    setLocalProvider(prev => ({
+      ...prev!,
+      name: template.name,
+      base_url: template.base_url,
+      client_type: template.client_type,
+    }))
   }, [])
+
+  const handleTemplateModeToggle = useCallback(() => {
+    if (isUsingTemplate) {
+      setLastTemplateId(selectedTemplate)
+      setSelectedTemplate('custom')
+      setTemplateComboboxOpen(false)
+      return
+    }
+
+    if (lastTemplateId) {
+      handleTemplateChange(lastTemplateId)
+    }
+  }, [handleTemplateChange, isUsingTemplate, lastTemplateId, selectedTemplate])
 
   const copyApiKey = useCallback(async () => {
     if (!localProvider?.api_key) return
@@ -149,7 +208,7 @@ export function ProviderForm({
     }
   }, [localProvider?.api_key, toast])
 
-  const handleSaveEdit = () => {
+  const handleSaveEdit = async () => {
     if (!localProvider) return
 
     const { isValid, errors } = validateProvider(localProvider, providers, editingIndex)
@@ -160,13 +219,19 @@ export function ProviderForm({
     }
 
     setFormErrors({})
-    onSave(localProvider, editingIndex)
+    setSaving(true)
+    try {
+      await onSave(localProvider, editingIndex)
+    } finally {
+      setSaving(false)
+    }
   }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
-        className="max-w-[95vw] sm:max-w-2xl"
+        className="max-w-[95vw] sm:[--dialog-width:50rem]"
+        aria-describedby={undefined}
         data-tour="provider-dialog"
         preventOutsideClose={tourState.isRunning}
         confirmOnEnter
@@ -175,13 +240,10 @@ export function ProviderForm({
           <DialogTitle>
             {editingIndex !== null ? '编辑提供商' : '添加提供商'}
           </DialogTitle>
-          <DialogDescription>
-            配置 API 提供商的连接信息和参数
-          </DialogDescription>
         </DialogHeader>
 
         <form
-          onSubmit={(e) => { e.preventDefault(); handleSaveEdit(); }}
+          onSubmit={(e) => { e.preventDefault(); void handleSaveEdit(); }}
           autoComplete="off"
           className="contents"
         >
@@ -189,89 +251,150 @@ export function ProviderForm({
           <div className="grid gap-4 py-4">
             <div className="grid gap-2" data-tour="provider-template-select">
               <Label htmlFor="template">提供商模板</Label>
-              <Popover open={templateComboboxOpen} onOpenChange={setTemplateComboboxOpen}>
-                <PopoverTrigger asChild>
-                  <Button
-                    variant="outline"
-                    role="combobox"
-                    aria-expanded={templateComboboxOpen}
-                    className="w-full justify-between"
-                  >
-                    {selectedTemplate
-                      ? PROVIDER_TEMPLATES.find((template) => template.id === selectedTemplate)?.display_name
-                      : "选择提供商模板..."}
-                    <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-                  </Button>
-                </PopoverTrigger>
-                <PopoverContent className="p-0" align="start" style={{ width: 'var(--radix-popover-trigger-width)' }}>
-                  <Command>
-                    <CommandInput placeholder="搜索提供商模板..." />
-                    <ScrollArea className="h-[300px]">
-                      <CommandList className="max-h-none overflow-visible">
-                        <CommandEmpty>未找到匹配的模板</CommandEmpty>
-                        <CommandGroup>
-                          {PROVIDER_TEMPLATES.map((template) => (
-                            <CommandItem
-                              key={template.id}
-                              value={template.display_name}
-                              onSelect={() => handleTemplateChange(template.id)}
-                            >
-                              <Check
-                                className={`mr-2 h-4 w-4 ${
-                                  selectedTemplate === template.id ? "opacity-100" : "opacity-0"
-                                }`}
-                              />
-                              {template.display_name}
-                            </CommandItem>
-                          ))}
-                        </CommandGroup>
-                      </CommandList>
-                    </ScrollArea>
-                  </Command>
-                </PopoverContent>
-              </Popover>
+              <div className="flex items-center gap-2">
+                <Popover
+                  open={isUsingTemplate && templateComboboxOpen}
+                  onOpenChange={setTemplateComboboxOpen}
+                >
+                  <PopoverTrigger asChild>
+                    <Button
+                      variant="outline"
+                      role="combobox"
+                      aria-expanded={isUsingTemplate && templateComboboxOpen}
+                      disabled={!isUsingTemplate}
+                      className={`min-w-0 flex-1 justify-between ${
+                        isUsingTemplate ? '' : 'bg-muted cursor-not-allowed opacity-60'
+                      }`}
+                    >
+                      {isUsingTemplate
+                        ? selectedTemplateConfig?.display_name || '选择提供商模板...'
+                        : '自定义提供商'}
+                      <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </Button>
+                  </PopoverTrigger>
+                  <PopoverContent className="p-0" align="start" style={{ width: 'var(--radix-popover-trigger-width)' }}>
+                    <Command>
+                      <CommandInput placeholder="搜索提供商模板..." />
+                      <ScrollArea className="h-[300px]">
+                        <CommandList className="max-h-none overflow-visible">
+                          <CommandEmpty>未找到匹配的模板</CommandEmpty>
+                          <CommandGroup>
+                            {PROVIDER_TEMPLATE_OPTIONS.map((template) => (
+                              <CommandItem
+                                key={template.id}
+                                value={template.display_name}
+                                onSelect={() => handleTemplateChange(template.id)}
+                              >
+                                <Check
+                                  className={`mr-2 h-4 w-4 ${
+                                    selectedTemplate === template.id ? "opacity-100" : "opacity-0"
+                                  }`}
+                                />
+                                {template.display_name}
+                              </CommandItem>
+                            ))}
+                          </CommandGroup>
+                        </CommandList>
+                      </ScrollArea>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="shrink-0 whitespace-nowrap"
+                  onClick={handleTemplateModeToggle}
+                >
+                  {isUsingTemplate ? '使用自定义提供商' : '使用供应商模板'}
+                </Button>
+              </div>
               <p className="text-xs text-muted-foreground">
                 选择预设模板可自动填充 URL 和客户端类型,支持搜索
               </p>
             </div>
 
-            <div className="grid gap-2" data-tour="provider-name-input">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="name" className={formErrors.name ? 'text-destructive' : ''}>名称 *</Label>
-                <HelpTooltip
-                  content={
-                    <div className="space-y-2">
-                      <p className="font-medium">提供商名称</p>
-                      <p>为这个 API 提供商设置一个便于识别的名称，用于在模型配置中引用。</p>
-                      <ul className="list-disc list-inside space-y-1 text-xs">
-                        <li>推荐使用厂商官方名称，如 DeepSeek、OpenAI</li>
-                        <li>名称需要唯一，不能与现有提供商重复</li>
-                      </ul>
-                    </div>
-                  }
-                  side="right"
-                  maxWidth="350px"
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="grid gap-2" data-tour="provider-name-input">
+                <div className="flex items-center gap-1.5">
+                  <Label htmlFor="name" className={formErrors.name ? 'text-destructive' : ''}>名称 *</Label>
+                  <HelpTooltip
+                    content={
+                      <div className="space-y-2">
+                        <p className="font-medium">提供商名称</p>
+                        <p>为这个 API 提供商设置一个便于识别的名称，用于在模型配置中引用。</p>
+                        <ul className="list-disc list-inside space-y-1 text-xs">
+                          <li>推荐使用厂商官方名称，如 DeepSeek、OpenAI</li>
+                          <li>名称需要唯一，不能与现有提供商重复</li>
+                        </ul>
+                      </div>
+                    }
+                    side="right"
+                    maxWidth="350px"
+                  />
+                </div>
+                <Input
+                  id="name"
+                  value={localProvider?.name || ''}
+                  onChange={(e) => {
+                    setLocalProvider((prev) =>
+                      prev ? { ...prev, name: e.target.value } : null
+                    )
+                    if (formErrors.name) {
+                      setFormErrors((prev) => ({ ...prev, name: undefined }))
+                    }
+                  }}
+                  placeholder="例如: DeepSeek, SiliconFlow"
+                  aria-invalid={formErrors.name ? true : undefined}
+                  aria-describedby={formErrors.name ? 'name-error' : undefined}
+                  className={formErrors.name ? 'border-destructive focus-visible:ring-destructive' : ''}
                 />
+                {formErrors.name && (
+                  <p id="name-error" role="alert" className="text-xs text-destructive">{formErrors.name}</p>
+                )}
               </div>
-              <Input
-                id="name"
-                value={localProvider?.name || ''}
-                onChange={(e) => {
-                  setLocalProvider((prev) =>
-                    prev ? { ...prev, name: e.target.value } : null
-                  )
-                  if (formErrors.name) {
-                    setFormErrors((prev) => ({ ...prev, name: undefined }))
+
+              <div className="grid gap-2">
+                <div className="flex items-center gap-1.5">
+                  <Label htmlFor="client_type">客户端类型</Label>
+                  <HelpTooltip
+                    content={
+                      <div className="space-y-2">
+                        <p className="font-medium">API 客户端类型</p>
+                        <p>指定与提供商通信时使用的 API 协议格式。</p>
+                        <ul className="list-disc list-inside space-y-1 text-xs">
+                          <li><strong>OpenAI：</strong>兼容 OpenAI API 格式的提供商</li>
+                          <li><strong>OpenAI Responses：</strong>OpenAI Responses API 原生格式</li>
+                          <li><strong>Gemini：</strong>Google Gemini 专用格式</li>
+                          <li>已加载的插件可以在这里提供新的客户端类型</li>
+                        </ul>
+                      </div>
+                    }
+                    side="right"
+                    maxWidth="350px"
+                  />
+                </div>
+                <Select
+                  value={localProvider?.client_type || 'openai'}
+                  onValueChange={(value) =>
+                    setLocalProvider((prev) =>
+                      prev ? { ...prev, client_type: value } : null
+                    )
                   }
-                }}
-                placeholder="例如: DeepSeek, SiliconFlow"
-                aria-invalid={formErrors.name ? true : undefined}
-                aria-describedby={formErrors.name ? 'name-error' : undefined}
-                className={formErrors.name ? 'border-destructive focus-visible:ring-destructive' : ''}
-              />
-              {formErrors.name && (
-                <p id="name-error" role="alert" className="text-xs text-destructive">{formErrors.name}</p>
-              )}
+                  disabled={isClientTypeLocked}
+                >
+                  <SelectTrigger id="client_type" className={isClientTypeLocked ? 'bg-muted cursor-not-allowed' : ''}>
+                    <SelectValue placeholder="选择客户端类型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {visibleClientTypeOptions.map((item) => (
+                      <SelectItem key={item.client_type} value={item.client_type}>
+                        {item.client_type}
+                        {item.owner_plugin_id ? ` (${item.owner_plugin_id})` : ''}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
             </div>
 
             <div className="grid gap-2" data-tour="provider-url-input">
@@ -313,11 +436,6 @@ export function ProviderForm({
               />
               {formErrors.base_url && (
                 <p id="base-url-error" role="alert" className="text-xs text-destructive">{formErrors.base_url}</p>
-              )}
-              {isUsingTemplate && !formErrors.base_url && (
-                <p className="text-xs text-muted-foreground">
-                  使用模板时 URL 不可编辑,切换到"自定义"以手动配置
-                </p>
               )}
             </div>
 
@@ -387,128 +505,125 @@ export function ProviderForm({
               )}
             </div>
 
-            <div className="grid gap-2">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="client_type">客户端类型</Label>
-                <HelpTooltip
-                  content={
-                    <div className="space-y-2">
-                      <p className="font-medium">API 客户端类型</p>
-                      <p>指定与提供商通信时使用的 API 协议格式。</p>
-                      <ul className="list-disc list-inside space-y-1 text-xs">
-                        <li><strong>OpenAI：</strong>兼容 OpenAI API 格式的提供商</li>
-                        <li><strong>Gemini：</strong>Google Gemini 专用格式</li>
-                        <li>已加载的插件可以在这里提供新的客户端类型</li>
-                      </ul>
+            <Collapsible
+              open={advancedOpen}
+              onOpenChange={setAdvancedOpen}
+              className="rounded-lg border bg-muted/10"
+            >
+              <CollapsibleTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="flex w-full items-center justify-between px-3 hover:bg-muted/60"
+                >
+                  <span>高级配置</span>
+                  <ChevronDown
+                    className={`h-4 w-4 transition-transform ${advancedOpen ? 'rotate-180' : ''}`}
+                  />
+                </Button>
+              </CollapsibleTrigger>
+              <CollapsibleContent className="space-y-4 border-t px-3 py-4">
+                <div className="grid gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <Label>默认请求 Headers</Label>
+                    <HelpTooltip
+                      content="该提供商的每一次请求都会携带这些 HTTP 请求头。请求头名称和值均为字符串。"
+                      side="top"
+                      maxWidth="280px"
+                    />
+                  </div>
+                  <KeyValueEditor
+                    value={localProvider?.default_headers ?? {}}
+                    onChange={(headers) => {
+                      const normalizedHeaders = Object.fromEntries(
+                        Object.entries(headers).map(([key, value]) => [key, String(value)])
+                      )
+                      setLocalProvider((prev) =>
+                        prev ? { ...prev, default_headers: normalizedHeaders } : null
+                      )
+                    }}
+                    placeholder="添加请求头，例如 HTTP-Referer"
+                    className="min-h-48"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                  <div className="grid gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <Label htmlFor="max_retry">最大重试</Label>
+                      <HelpTooltip
+                        content="单个模型 API 请求的最大尝试次数（含首次请求），失败后按重试间隔重试。设置为 0 或 1 表示不重试。默认值：3"
+                        side="top"
+                        maxWidth="250px"
+                      />
                     </div>
-                  }
-                  side="right"
-                  maxWidth="350px"
-                />
-              </div>
-              <Select
-                value={localProvider?.client_type || 'openai'}
-                onValueChange={(value) =>
-                  setLocalProvider((prev) =>
-                    prev ? { ...prev, client_type: value } : null
-                  )
-                }
-                disabled={isUsingTemplate}
-              >
-                <SelectTrigger id="client_type" className={isUsingTemplate ? 'bg-muted cursor-not-allowed' : ''}>
-                  <SelectValue placeholder="选择客户端类型" />
-                </SelectTrigger>
-                <SelectContent>
-                  {clientTypeOptions.map((item) => (
-                    <SelectItem key={item.client_type} value={item.client_type}>
-                      {item.client_type}
-                      {item.owner_plugin_id ? ` (${item.owner_plugin_id})` : ''}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              {isUsingTemplate && (
-                <p className="text-xs text-muted-foreground">
-                  使用模板时客户端类型不可编辑,切换到"自定义"以手动配置
-                </p>
-              )}
-            </div>
+                    <Input
+                      id="max_retry"
+                      type="number"
+                      min="0"
+                      value={localProvider?.max_retry ?? ''}
+                      onChange={(e) => {
+                        const val = e.target.value === '' ? null : parseInt(e.target.value)
+                        setLocalProvider((prev) =>
+                          prev ? { ...prev, max_retry: val } : null
+                        )
+                      }}
+                      placeholder="默认: 3"
+                    />
+                  </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="grid gap-2">
-                <div className="flex items-center gap-1.5">
-                  <Label htmlFor="max_retry">最大重试</Label>
-                  <HelpTooltip
-                    content="API 请求失败时的最大重试次数。设置为 0 表示不重试。默认值：2"
-                    side="top"
-                    maxWidth="250px"
-                  />
-                </div>
-                <Input
-                  id="max_retry"
-                  type="number"
-                  min="0"
-                  value={localProvider?.max_retry ?? ''}
-                  onChange={(e) => {
-                    const val = e.target.value === '' ? null : parseInt(e.target.value)
-                    setLocalProvider((prev) =>
-                      prev ? { ...prev, max_retry: val } : null
-                    )
-                  }}
-                  placeholder="默认: 2"
-                />
-              </div>
+                  <div className="grid gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <Label htmlFor="timeout">超时(秒)</Label>
+                      <HelpTooltip
+                        content="单次 API 请求的超时时间（秒）。超时后会触发重试或报错。默认值：30 秒"
+                        side="top"
+                        maxWidth="250px"
+                      />
+                    </div>
+                    <Input
+                      id="timeout"
+                      type="number"
+                      min="1"
+                      value={localProvider?.timeout ?? ''}
+                      onChange={(e) => {
+                        const val = e.target.value === '' ? null : parseInt(e.target.value)
+                        setLocalProvider((prev) =>
+                          prev ? { ...prev, timeout: val } : null
+                        )
+                      }}
+                      placeholder="默认: 30"
+                    />
+                  </div>
 
-              <div className="grid gap-2">
-                <div className="flex items-center gap-1.5">
-                  <Label htmlFor="timeout">超时(秒)</Label>
-                  <HelpTooltip
-                    content="单次 API 请求的超时时间（秒）。超时后会触发重试或报错。默认值：30 秒"
-                    side="top"
-                    maxWidth="250px"
-                  />
+                  <div className="grid gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <Label htmlFor="retry_interval">重试间隔(秒)</Label>
+                      <HelpTooltip
+                        content="两次重试之间的等待时间（秒）。适当的间隔可以避免触发 API 限流。默认值：10 秒"
+                        side="top"
+                        maxWidth="250px"
+                      />
+                    </div>
+                    <Input
+                      id="retry_interval"
+                      type="number"
+                      min="1"
+                      value={localProvider?.retry_interval ?? ''}
+                      onChange={(e) => {
+                        const val = e.target.value === '' ? null : parseInt(e.target.value)
+                        setLocalProvider((prev) =>
+                          prev
+                            ? { ...prev, retry_interval: val }
+                            : null
+                        )
+                      }}
+                      placeholder="默认: 10"
+                    />
+                  </div>
                 </div>
-                <Input
-                  id="timeout"
-                  type="number"
-                  min="1"
-                  value={localProvider?.timeout ?? ''}
-                  onChange={(e) => {
-                    const val = e.target.value === '' ? null : parseInt(e.target.value)
-                    setLocalProvider((prev) =>
-                      prev ? { ...prev, timeout: val } : null
-                    )
-                  }}
-                  placeholder="默认: 30"
-                />
-              </div>
-
-              <div className="grid gap-2">
-                <div className="flex items-center gap-1.5">
-                  <Label htmlFor="retry_interval">重试间隔(秒)</Label>
-                  <HelpTooltip
-                    content="两次重试之间的等待时间（秒）。适当的间隔可以避免触发 API 限流。默认值：10 秒"
-                    side="top"
-                    maxWidth="250px"
-                  />
-                </div>
-                <Input
-                  id="retry_interval"
-                  type="number"
-                  min="1"
-                  value={localProvider?.retry_interval ?? ''}
-                  onChange={(e) => {
-                    const val = e.target.value === '' ? null : parseInt(e.target.value)
-                    setLocalProvider((prev) =>
-                      prev
-                        ? { ...prev, retry_interval: val }
-                        : null
-                    )
-                  }}
-                  placeholder="默认: 10"
-                />
-              </div>
-            </div>
+              </CollapsibleContent>
+            </Collapsible>
           </div>
           </DialogBody>
 
@@ -516,7 +631,14 @@ export function ProviderForm({
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)} data-tour="provider-cancel-button">
               取消
             </Button>
-            <Button type="submit" data-dialog-action="confirm" data-tour="provider-save-button">保存</Button>
+            <Button
+              type="submit"
+              data-dialog-action="confirm"
+              data-tour="provider-save-button"
+              disabled={saving}
+            >
+              {saving ? '保存中...' : '保存'}
+            </Button>
           </DialogFooter>
         </form>
       </DialogContent>

@@ -1,7 +1,7 @@
 "use client"
 
-import { useCallback, useEffect, useRef, useState } from "react"
-import { Plus, Trash2, ChevronRight, ChevronDown } from "lucide-react"
+import { useCallback, useEffect, useMemo, useState } from "react"
+import { AlertCircle, ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Switch } from "@/components/ui/switch"
@@ -28,6 +28,7 @@ interface TreeNode {
 interface NestedKeyValueEditorProps {
   value: Record<string, unknown>
   onChange: (value: Record<string, unknown>) => void
+  onValidationChange?: (error: string | null) => void
   placeholder?: string
 }
 
@@ -108,6 +109,27 @@ function treeToRecord(nodes: TreeNode[]): Record<string, unknown> {
     }
   }
   return record
+}
+
+// 检查同一对象层级的重复键；数组项的数字索引不属于对象键名。
+function findDuplicateKeyPaths(nodes: TreeNode[], parentPath = ''): string[] {
+  const counts = new Map<string, number>()
+  for (const node of nodes) {
+    const key = node.key.trim()
+    if (key) counts.set(key, (counts.get(key) ?? 0) + 1)
+  }
+
+  const duplicatePaths = Array.from(counts.entries())
+    .filter(([, count]) => count > 1)
+    .map(([key]) => parentPath ? `${parentPath}.${key}` : key)
+
+  for (const node of nodes) {
+    if (node.type !== 'object' || !node.children) continue
+    const key = node.key.trim()
+    const childPath = parentPath && key ? `${parentPath}.${key}` : key || parentPath
+    duplicatePaths.push(...findDuplicateKeyPaths(node.children, childPath))
+  }
+  return duplicatePaths
 }
 
 // 转换简单值
@@ -282,25 +304,36 @@ function TreeNodeItem({
 export function NestedKeyValueEditor({
   value,
   onChange,
+  onValidationChange,
   placeholder = "添加参数...",
 }: NestedKeyValueEditorProps) {
   const [nodes, setNodes] = useState<TreeNode[]>(() => recordToTree(value || {}))
-  const lastEmittedValueRef = useRef<string | null>(null)
+  const [seenIncomingJson, setSeenIncomingJson] = useState(() => JSON.stringify(value || {}))
+  const duplicateKeyPaths = useMemo(() => findDuplicateKeyPaths(nodes), [nodes])
 
   useEffect(() => {
-    const nextValueJson = JSON.stringify(value || {})
-    if (lastEmittedValueRef.current === nextValueJson) {
-      return
-    }
+    onValidationChange?.(
+      duplicateKeyPaths.length > 0
+        ? `检测到重复键：${duplicateKeyPaths.join('、')}`
+        : null
+    )
+  }, [duplicateKeyPaths, onValidationChange])
+
+  const incomingValueJson = JSON.stringify(value || {})
+  if (seenIncomingJson !== incomingValueJson) {
+    setSeenIncomingJson(incomingValueJson)
     setNodes(recordToTree(value || {}))
-  }, [value])
+  }
 
   // 同步到父组件
   const syncToParent = useCallback(
     (newNodes: TreeNode[]) => {
-      const nextValue = treeToRecord(newNodes)
-      lastEmittedValueRef.current = JSON.stringify(nextValue)
       setNodes(newNodes)
+      if (findDuplicateKeyPaths(newNodes).length > 0) return
+
+      const nextValue = treeToRecord(newNodes)
+      const nextValueJson = JSON.stringify(nextValue)
+      setSeenIncomingJson(nextValueJson)
       onChange(nextValue)
     },
     [onChange]
@@ -438,6 +471,13 @@ export function NestedKeyValueEditor({
           添加参数
         </Button>
       </div>
+
+      {duplicateKeyPaths.length > 0 && (
+        <div role="alert" className="flex items-center gap-1 text-xs text-destructive">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+          <span>检测到重复键：{duplicateKeyPaths.join('、')}，请修改后再保存</span>
+        </div>
+      )}
 
       {/* 内容区域 */}
       <div className="flex-1 overflow-y-auto space-y-1">

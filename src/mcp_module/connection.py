@@ -9,7 +9,9 @@ from contextlib import AsyncExitStack
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Callable, Optional, cast
 
+import asyncio
 import httpx
+import logging
 
 from src.cli.console import console
 from src.core.tooling import ToolExecutionResult
@@ -86,6 +88,9 @@ except ImportError:
     McpError = Exception  # type: ignore[assignment,misc]
 
 
+logger = logging.getLogger(__name__)
+
+
 class MCPConnection:
     """管理单个 MCP 服务器的连接生命周期。"""
 
@@ -94,6 +99,8 @@ class MCPConnection:
         config: MCPServerRuntimeConfig,
         client_config: MCPClientRuntimeConfig,
         host_callbacks: Optional[MCPHostCallbacks] = None,
+        *,
+        discover_extended_features: bool = True,
     ) -> None:
         """初始化单个 MCP 连接。
 
@@ -101,11 +108,13 @@ class MCPConnection:
             config: 当前服务器的运行时配置。
             client_config: MCP 客户端宿主能力运行时配置。
             host_callbacks: 宿主侧能力回调集合。
+            discover_extended_features: 是否在连接时发现 Prompt 和 Resource。
         """
 
         self.config = config
         self.client_config = client_config
         self.host_callbacks = host_callbacks or MCPHostCallbacks()
+        self.discover_extended_features = discover_extended_features
 
         self.session: Optional[Any] = None
         self.server_capabilities: Optional[Any] = None
@@ -114,10 +123,14 @@ class MCPConnection:
         self.resources: list[Any] = []
         self.resource_templates: list[Any] = []
         self.protocol_version: str = ""
+        self.last_error: str = ""
 
         self._http_client: Optional[httpx.AsyncClient] = None
         self._session_id_getter: Optional[Callable[[], str | None]] = None
         self._exit_stack = AsyncExitStack()
+        self._lifecycle_task: Optional[asyncio.Task[None]] = None
+        self._ready: Optional[asyncio.Future[bool]] = None
+        self._close_requested = asyncio.Event()
 
     @property
     def session_id(self) -> str:
@@ -139,25 +152,56 @@ class MCPConnection:
         """
 
         if not MCP_AVAILABLE:
+            self.last_error = "未安装 mcp SDK"
             console.print("[warning]⚠️ 未安装 mcp SDK，请运行: pip install mcp[/warning]")
             return False
 
+        if self._lifecycle_task is None or self._lifecycle_task.done():
+            self.last_error = ""
+            self._ready = asyncio.get_running_loop().create_future()
+            self._close_requested = asyncio.Event()
+            self._lifecycle_task = asyncio.create_task(self._run_connection(self._ready))
+
+        assert self._ready is not None
         try:
-            await self._exit_stack.__aenter__()
-            read_stream, write_stream = await self._connect_transport()
-            session = await self._create_client_session(read_stream, write_stream)
-            self.session = session
-            initialize_result = await session.initialize()
-            self.server_capabilities = getattr(initialize_result, "capabilities", None)
-            self.protocol_version = str(getattr(initialize_result, "protocolVersion", "") or "")
-
-            await self._load_server_features()
-            return True
-
-        except Exception as exc:
-            console.print(f"[warning]⚠️ MCP 服务器 '{self.config.name}' 连接失败: {exc}[/warning]")
+            return await asyncio.shield(self._ready) and self.session is not None
+        except asyncio.CancelledError:
             await self.close()
-            return False
+            raise
+
+    async def _run_connection(self, ready: asyncio.Future[bool]) -> None:
+        """由同一持续运行的任务进入、持有和退出 SDK 的异步作用域。"""
+        try:
+            async with self._exit_stack:
+                read_stream, write_stream = await self._connect_transport()
+                session = await self._create_client_session(read_stream, write_stream)
+                self.session = session
+                initialize_result = await session.initialize()
+                self.server_capabilities = initialize_result.capabilities
+                self.protocol_version = initialize_result.protocolVersion
+
+                await self._load_server_features()
+                ready.set_result(True)
+                try:
+                    await self._close_requested.wait()
+                finally:
+                    self.session = None
+        except Exception as exc:
+            self.last_error = str(exc).strip() or exc.__class__.__name__
+            logger.exception("MCP 服务器 '%s' 连接失败或异常断开", self.config.name)
+        finally:
+            self.session = None
+            self.server_capabilities = None
+            self.tools = []
+            self.prompts = []
+            self.resources = []
+            self.resource_templates = []
+            self.protocol_version = ""
+            self._http_client = None
+            self._session_id_getter = None
+            self._exit_stack = AsyncExitStack()
+            if not ready.done():
+                ready.set_result(False)
 
     async def _connect_transport(self) -> tuple[Any, Any]:
         """根据配置建立底层传输连接。
@@ -276,7 +320,13 @@ class MCPConnection:
             merged_headers.update(headers)
         return httpx.AsyncClient(
             headers=merged_headers,
-            timeout=timeout or httpx.Timeout(self.config.http_timeout_seconds),
+            timeout=timeout
+            or httpx.Timeout(
+                connect=self.config.http_timeout_seconds,
+                read=self.config.read_timeout_seconds,
+                write=self.config.http_timeout_seconds,
+                pool=self.config.http_timeout_seconds,
+            ),
         )
 
     async def _create_client_session(self, read_stream: Any, write_stream: Any) -> Any:
@@ -415,21 +465,44 @@ class MCPConnection:
         """根据服务端能力声明加载工具、Prompt 与 Resource。"""
 
         self.tools = await self._list_tools() if self.supports_tools() else []
-        self.prompts = await self._list_prompts() if self.supports_prompts() else []
-        self.resources = await self._list_resources() if self.supports_resources() else []
-        self.resource_templates = []
-        if self.supports_resources():
-            # list_resource_templates 在 MCP spec 中是 OPTIONAL，部分 server（如 moegirl-wiki-mcp）
-            # 仅实现 list_resources，遇到 METHOD_NOT_FOUND 时按空集合处理避免毁掉整个连接。
-            try:
-                self.resource_templates = await self._list_resource_templates()
-            except McpError as exc:
-                if exc.error.code != mcp_types.METHOD_NOT_FOUND:
-                    raise
-                console.print(
-                    f"[warning]⚠️ MCP 服务器 '{self.config.name}' 未实现 "
-                    f"list_resource_templates，按空集合处理[/warning]"
-                )
+        if not self.discover_extended_features:
+            self.prompts = []
+            self.resources = []
+            self.resource_templates = []
+            return
+
+        prompt_task = self._list_prompts() if self.supports_prompts() else self._empty_feature_list()
+        resource_task = self._list_resources() if self.supports_resources() else self._empty_feature_list()
+        template_task = self._load_resource_templates()
+        self.prompts, self.resources, self.resource_templates = await asyncio.gather(
+            prompt_task,
+            resource_task,
+            template_task,
+        )
+
+    @staticmethod
+    async def _empty_feature_list() -> list[Any]:
+        """为并行能力发现返回空列表。"""
+
+        return []
+
+    async def _load_resource_templates(self) -> list[Any]:
+        """加载可选 Resource Template，并兼容未实现该方法的服务端。"""
+
+        if not self.supports_resources():
+            return []
+        # list_resource_templates 在 MCP spec 中是 OPTIONAL，部分 server（如 moegirl-wiki-mcp）
+        # 仅实现 list_resources，遇到 METHOD_NOT_FOUND 时按空集合处理避免毁掉整个连接。
+        try:
+            return await self._list_resource_templates()
+        except McpError as exc:
+            if exc.error.code != mcp_types.METHOD_NOT_FOUND:
+                raise
+            console.print(
+                f"[warning]⚠️ MCP 服务器 '{self.config.name}' 未实现 "
+                f"list_resource_templates，按空集合处理[/warning]"
+            )
+            return []
 
     def supports_tools(self) -> bool:
         """判断服务端是否声明支持 Tools。
@@ -636,17 +709,18 @@ class MCPConnection:
     async def close(self) -> None:
         """关闭连接并释放资源。"""
 
-        try:
-            await self._exit_stack.aclose()
-        except Exception:
-            pass
-
+        task = self._lifecycle_task
+        if task is None:
+            return
+        ready = self._ready
+        close_already_requested = self._close_requested.is_set()
+        self._close_requested.set()
         self.session = None
-        self.server_capabilities = None
-        self.tools = []
-        self.prompts = []
-        self.resources = []
-        self.resource_templates = []
-        self.protocol_version = ""
-        self._http_client = None
-        self._session_id_getter = None
+        # 建连尚未完成时终止等待；已连接时让持有任务正常退出并清理资源。
+        # 重复关闭不能再次取消正在退出 anyio 作用域的任务。
+        if not close_already_requested and ready is not None and not ready.done():
+            task.cancel()
+        # 调用者超时或取消时，持有任务仍须完成同任务资源清理。
+        await asyncio.shield(asyncio.gather(task, return_exceptions=True))
+        if ready is not None and not ready.done():
+            ready.set_result(False)

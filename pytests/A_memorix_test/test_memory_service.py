@@ -26,7 +26,7 @@ async def test_graph_admin_invokes_plugin(monkeypatch):
     result = await service.graph_admin(action="get_graph", limit=12)
 
     assert result["success"] is True
-    assert calls == [("memory_graph_admin", {"action": "get_graph", "limit": 12}, {"timeout_ms": 30000})]
+    assert calls == [("memory_graph_admin", {"action": "get_graph", "limit": 12}, {})]
 
 
 @pytest.mark.asyncio
@@ -140,7 +140,7 @@ async def test_v5_admin_invokes_plugin(monkeypatch):
     result = await service.v5_admin(action="status", target="mai", limit=5)
 
     assert result["success"] is True
-    assert calls == [("memory_v5_admin", {"action": "status", "target": "mai", "limit": 5}, {"timeout_ms": 30000})]
+    assert calls == [("memory_v5_admin", {"action": "status", "target": "mai", "limit": 5}, {})]
 
 
 @pytest.mark.asyncio
@@ -253,6 +253,29 @@ async def test_import_admin_uses_long_timeout(monkeypatch):
         (
             "memory_import_admin",
             {"action": "create_lpmm_openie", "alias": "lpmm"},
+            {"timeout_ms": 120000},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_bundle_admin_uses_long_timeout(monkeypatch):
+    service = MemoryService()
+    calls = []
+
+    async def fake_invoke(component_name, args=None, **kwargs):
+        calls.append((component_name, args, kwargs))
+        return {"success": True, "file_name": "knowledge.amembundle"}
+
+    monkeypatch.setattr(service, "_invoke", fake_invoke)
+
+    result = await service.bundle_admin(action="export", content_level="knowledge")
+
+    assert result["success"] is True
+    assert calls == [
+        (
+            "memory_bundle_admin",
+            {"action": "export", "content_level": "knowledge"},
             {"timeout_ms": 120000},
         )
     ]

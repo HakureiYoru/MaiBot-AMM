@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 import { Trash2 } from 'lucide-react'
 
@@ -139,12 +139,9 @@ export function NodeDetailDialog({
 }: NodeDetailDialogProps) {
   const node = nodeDetail?.node ?? selectedNodeData
   const [includeParagraphs, setIncludeParagraphs] = useState(false)
-
-  useEffect(() => {
-    if (!open) {
-      setIncludeParagraphs(false)
-    }
-  }, [open, node?.id])
+  if (!open && includeParagraphs) {
+    setIncludeParagraphs(false)
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -159,8 +156,11 @@ export function NodeDetailDialog({
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge>{node.type === 'entity' ? '实体' : node.type}</Badge>
+                    {'active_evidence_count' in (nodeDetail?.node ?? {}) && (
+                      <Badge variant="secondary">有效证据 {nodeDetail?.node.active_evidence_count ?? 0}</Badge>
+                    )}
                     {'appearance_count' in (nodeDetail?.node ?? {}) && (
-                      <Badge variant="outline">出现次数 {nodeDetail?.node.appearance_count ?? 0}</Badge>
+                      <Badge variant="outline">累计出现 {nodeDetail?.node.appearance_count ?? 0}</Badge>
                     )}
                   </div>
                   <h3 className="mt-2 text-lg font-semibold">{node.content}</h3>
@@ -246,12 +246,9 @@ export function EdgeDetailDialog({
   const sourceLabel = selectedEdgeData?.source.content ?? edgeDetail?.edge.source ?? ''
   const targetLabel = selectedEdgeData?.target.content ?? edgeDetail?.edge.target ?? ''
   const [includeParagraphs, setIncludeParagraphs] = useState(false)
-
-  useEffect(() => {
-    if (!open) {
-      setIncludeParagraphs(false)
-    }
-  }, [open, edgeDetail?.edge.source, edgeDetail?.edge.target])
+  if (!open && includeParagraphs) {
+    setIncludeParagraphs(false)
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -350,12 +347,9 @@ export function RelationDetailDialog({
   onDeleteRelation,
 }: RelationDetailDialogProps) {
   const [includeParagraphs, setIncludeParagraphs] = useState(false)
-
-  useEffect(() => {
-    if (!open) {
-      setIncludeParagraphs(false)
-    }
-  }, [open, relation?.hash])
+  if (!open && includeParagraphs) {
+    setIncludeParagraphs(false)
+  }
 
   if (!relation) {
     return null

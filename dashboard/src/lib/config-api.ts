@@ -12,7 +12,10 @@ import type { ConfigSchema } from '@/types/config-schema'
 const API_BASE = '/api/webui/config'
 export const BOT_CONFIG_UPDATED_EVENT = 'maibot:bot-config-updated'
 const schemaRequestCache = new Map<string, Promise<ConfigSchema>>()
-const configDataCache = new Map<string, { timestamp: number; request: Promise<Record<string, unknown>> }>()
+const configDataCache = new Map<
+  string,
+  { timestamp: number; request: Promise<Record<string, unknown>> }
+>()
 const CONFIG_DATA_CACHE_TTL = 30_000
 
 function unwrapConfigResponse(data: unknown): Record<string, unknown> {
@@ -195,16 +198,108 @@ export async function updateModelConfig(
 }
 
 /**
+ * 模型配置文件副本信息
+ */
+export interface ModelConfigVersionInfo {
+  id: string
+  label: string
+  created_at: number
+  modified_at: number
+  size: number
+  active: boolean
+  inner_config_version: string | null
+  valid: boolean
+  error: string | null
+}
+
+/**
+ * 模型配置文件副本列表
+ */
+export interface ModelConfigVersionListResponse {
+  success: boolean
+  active_version: ModelConfigVersionInfo
+  versions: ModelConfigVersionInfo[]
+}
+
+/**
+ * 获取模型配置文件副本列表
+ */
+export async function getModelConfigVersions(): Promise<ModelConfigVersionListResponse> {
+  return backendApi.get<ModelConfigVersionListResponse>(`${API_BASE}/model/versions`, {
+    cache: 'no-store',
+    errorMessage: '获取模型配置副本失败',
+  })
+}
+
+/**
+ * 将当前模型配置保存为副本
+ */
+export async function createModelConfigVersion(label: string): Promise<ModelConfigVersionInfo> {
+  const result = await backendApi.post<{ version: ModelConfigVersionInfo }>(
+    `${API_BASE}/model/versions`,
+    {
+      body: { label },
+      errorMessage: '创建模型配置副本失败',
+    }
+  )
+  return result.version
+}
+
+/**
+ * 切换当前启用的模型配置文件副本
+ */
+export async function switchModelConfigVersion(versionId: string): Promise<ModelConfigVersionInfo> {
+  const result = await backendApi.post<{ version: ModelConfigVersionInfo }>(
+    `${API_BASE}/model/versions/${encodeURIComponent(versionId)}/activate`,
+    {
+      body: { archive_current: true },
+      errorMessage: '切换模型配置副本失败',
+    }
+  )
+  invalidateConfigDataCache('model')
+  return result.version
+}
+
+/**
+ * 更新模型配置副本名称
+ */
+export async function updateModelConfigVersionLabel(
+  versionId: string,
+  label: string
+): Promise<ModelConfigVersionInfo> {
+  const result = await backendApi.patch<{ version: ModelConfigVersionInfo }>(
+    `${API_BASE}/model/versions/${encodeURIComponent(versionId)}`,
+    {
+      body: { label },
+      errorMessage: '更新模型配置副本失败',
+    }
+  )
+  return result.version
+}
+
+/**
+ * 删除模型配置副本
+ */
+export async function deleteModelConfigVersion(versionId: string): Promise<void> {
+  await backendApi.delete(`${API_BASE}/model/versions/${encodeURIComponent(versionId)}`, {
+    errorMessage: '删除模型配置副本失败',
+  })
+}
+
+/**
  * 更新麦麦主程序配置的指定节
  */
 export async function updateBotConfigSection(
   sectionName: string,
   sectionData: unknown
 ): Promise<Record<string, unknown>> {
-  const result = await backendApi.post<Record<string, unknown>>(`${API_BASE}/bot/section/${sectionName}`, {
-    body: sectionData,
-    errorMessage: '更新配置失败',
-  })
+  const result = await backendApi.post<Record<string, unknown>>(
+    `${API_BASE}/bot/section/${sectionName}`,
+    {
+      body: sectionData,
+      errorMessage: '更新配置失败',
+    }
+  )
   invalidateConfigDataCache('bot')
   notifyBotConfigUpdated()
   return result
@@ -217,10 +312,13 @@ export async function updateModelConfigSection(
   sectionName: string,
   sectionData: unknown
 ): Promise<Record<string, unknown>> {
-  const result = await backendApi.post<Record<string, unknown>>(`${API_BASE}/model/section/${sectionName}`, {
-    body: sectionData,
-    errorMessage: '更新配置失败',
-  })
+  const result = await backendApi.post<Record<string, unknown>>(
+    `${API_BASE}/model/section/${sectionName}`,
+    {
+      body: sectionData,
+      errorMessage: '更新配置失败',
+    }
+  )
   invalidateConfigDataCache('model')
   return result
 }
@@ -315,6 +413,16 @@ export interface ModelTestToolCall {
 }
 
 /**
+ * 嵌入对比测试的单组相似度结果
+ */
+export interface ModelTestEmbeddingPair {
+  /** 对比说明，例如「相近文本」「不同图片」 */
+  label: string
+  /** 两组向量的余弦相似度 */
+  similarity: number
+}
+
+/**
  * 单个模型测试结果
  */
 export interface ModelTestResult {
@@ -330,15 +438,19 @@ export interface ModelTestResult {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  /** 测试类型：chat / text_embedding / image_embedding */
+  test_kind?: string
+  /** 嵌入向量维度；仅嵌入测试返回 */
+  embedding_dimension?: number | null
+  /** 嵌入对比相似度结果；仅嵌入测试返回 */
+  embedding_pairs?: ModelTestEmbeddingPair[]
 }
 
 /**
  * 测试提供商连接状态（通过提供商名称）
  * @param providerName 提供商名称
  */
-export async function testProviderConnection(
-  providerName: string
-): Promise<TestConnectionResult> {
+export async function testProviderConnection(providerName: string): Promise<TestConnectionResult> {
   return backendApi.post<TestConnectionResult>('/api/webui/models/test-connection-by-name', {
     query: { provider_name: providerName },
     errorMessage: '测试提供商连接失败',

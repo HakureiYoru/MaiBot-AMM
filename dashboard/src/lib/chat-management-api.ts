@@ -81,6 +81,100 @@ export interface ChatPromptRule {
   prompt: string
 }
 
+export interface AdapterPolicyStatus {
+  allowed: boolean
+  configured: boolean
+  chat_type: ChatStreamType | string
+  target_id: string
+  list_type: string
+  source: string
+  reason: string
+  matched_ids: string[]
+}
+
+export interface ChatAdapterStatus {
+  adapter_id: string
+  plugin_id: string
+  gateway_name: string
+  platform: string
+  account_id: string | null
+  scope: string | null
+  protocol: string
+  route_type: string
+  send_bound: boolean
+  receive_bound: boolean
+  routed: boolean
+  policy: AdapterPolicyStatus
+}
+
+export interface AdapterPolicyDefaults {
+  group: 'allow' | 'block'
+  private: 'allow' | 'block'
+}
+
+export type AdapterHostDefaultAction = 'inherit' | 'allow' | 'block'
+
+export interface AdapterHostPolicySection {
+  default_action: AdapterHostDefaultAction
+  allow_ids: string[]
+  deny_ids: string[]
+}
+
+export interface AdapterHostPolicy {
+  group: AdapterHostPolicySection
+  private: AdapterHostPolicySection
+  policy_groups?: AdapterHostPolicyGroup[]
+  active_group?: string
+}
+
+export interface AdapterHostPolicyGroup {
+  id: string
+  name: string
+  group: AdapterHostPolicySection
+  private: AdapterHostPolicySection
+}
+
+/** 聊天流的适配器放行状态：不允许时 reason 说明被阻止的原因 */
+export interface SessionAdapterStatus {
+  allowed: boolean
+  reason: string
+}
+
+interface SessionAdapterStatusResponse {
+  success: boolean
+  statuses?: Record<string, SessionAdapterStatus>
+}
+
+/** 适配器当前激活身份（换账号登录后 account_id 实时变化） */
+export interface AdapterActiveIdentity {
+  adapter_id: string
+  plugin_id: string
+  gateway_name: string
+  platform: string
+  account_id: string | null
+  scope: string | null
+}
+
+/** 同一插件名下某账号的规则条目摘要（旧账号条目换号后不再生效但保留在配置中） */
+export interface AdapterAccountEntry {
+  adapter_id: string
+  account_id: string
+  platform: string
+  gateway_name: string
+  scope: string
+  rules: Partial<Record<ChatStreamType, AdapterHostPolicySection>>
+}
+
+interface AdapterHostPolicyResponse {
+  success: boolean
+  plugin_id: string
+  global_defaults: AdapterPolicyDefaults
+  policy: AdapterHostPolicy
+  active_identity?: AdapterActiveIdentity | null
+  has_entry?: boolean
+  account_entries?: AdapterAccountEntry[]
+}
+
 export interface ChatStreamDetail {
   session_id: string
   display_name: string
@@ -94,6 +188,7 @@ export interface ChatStreamDetail {
   jargon: ChatLearningStatus
   talk_frequency: ChatTalkFrequencyDetail
   prompts: ChatPromptDetail
+  adapters: ChatAdapterStatus[]
 }
 
 interface ChatStreamsResponse {
@@ -161,11 +256,48 @@ interface UpdateChatPromptPayload {
   prompt: string
 }
 
+interface UpdateAdapterPolicyPayload {
+  adapter_id: string
+  action: 'allow' | 'block' | 'inherit'
+}
+
 export async function getChatStreams(limit = 1000): Promise<ChatStream[]> {
   const result = await backendApi.get<ChatStreamsResponse>('/api/chat/sessions', {
     query: { limit },
   })
   return result.sessions ?? []
+}
+
+/** 分页读取所有已存在的聊天流，供聊天工作区展示完整列表。 */
+export async function getAllChatStreams(): Promise<ChatStream[]> {
+  const pageSize = 1000
+  const streams: ChatStream[] = []
+
+  for (let offset = 0; ; offset += pageSize) {
+    const result = await backendApi.get<ChatStreamsResponse>('/api/chat/sessions', {
+      query: { limit: pageSize, offset },
+    })
+    const page = result.sessions ?? []
+    streams.push(...page)
+    if (page.length < pageSize) return streams
+  }
+}
+
+/** 聊天流适配器放行状态的查询键：适配器规则变化后按此前缀失效缓存 */
+export const CHAT_ADAPTER_STATUS_QUERY_KEY = 'chat-adapter-status'
+
+/** 批量读取聊天流的适配器放行状态，未返回的聊天流按放行处理 */
+export async function getChatSessionsAdapterStatus(
+  sessionIds: string[]
+): Promise<Record<string, SessionAdapterStatus>> {
+  const result = await backendApi.post<SessionAdapterStatusResponse>(
+    '/api/chat/sessions/adapter-status',
+    {
+      body: { session_ids: sessionIds },
+      errorMessage: '读取聊天流适配器放行状态失败',
+    }
+  )
+  return result.statuses ?? {}
 }
 
 export async function resolveChatTarget(
@@ -288,6 +420,58 @@ export async function deleteChatStreamPrompt(
     throw new Error('聊天流详情为空')
   }
   return result.detail
+}
+
+export async function updateChatStreamAdapterPolicy(
+  sessionId: string,
+  payload: UpdateAdapterPolicyPayload
+): Promise<ChatStreamDetail> {
+  const result = await backendApi.put<ChatStreamDetailResponse>(
+    `/api/chat/sessions/${encodeURIComponent(sessionId)}/adapters/policy`,
+    {
+      body: payload,
+      errorMessage: '保存适配器规则失败',
+    }
+  )
+  if (!result.detail) {
+    throw new Error('聊天流详情为空')
+  }
+  return result.detail
+}
+
+export async function getAdapterPolicyDefaults(): Promise<AdapterPolicyDefaults> {
+  const result = await backendApi.get<{ success: boolean; defaults: AdapterPolicyDefaults }>(
+    '/api/chat/adapters/policy/defaults',
+    { errorMessage: '获取适配器默认策略失败' }
+  )
+  return result.defaults
+}
+
+export async function updateAdapterPolicyDefaults(
+  defaults: AdapterPolicyDefaults
+): Promise<AdapterPolicyDefaults> {
+  const result = await backendApi.put<{ success: boolean; defaults: AdapterPolicyDefaults }>(
+    '/api/chat/adapters/policy/defaults',
+    { body: defaults, errorMessage: '保存适配器默认策略失败' }
+  )
+  return result.defaults
+}
+
+export async function getAdapterHostPolicy(pluginId: string): Promise<AdapterHostPolicyResponse> {
+  return backendApi.get<AdapterHostPolicyResponse>(
+    `/api/chat/adapters/plugins/${encodeURIComponent(pluginId)}/policy`,
+    { errorMessage: '获取主程序放行规则失败' }
+  )
+}
+
+export async function updateAdapterHostPolicy(
+  pluginId: string,
+  policy: AdapterHostPolicy
+): Promise<AdapterHostPolicyResponse> {
+  return backendApi.put<AdapterHostPolicyResponse>(
+    `/api/chat/adapters/plugins/${encodeURIComponent(pluginId)}/policy`,
+    { body: policy, errorMessage: '保存主程序放行规则失败' }
+  )
 }
 
 export async function deleteChatStream(sessionId: string): Promise<ChatStreamDeleteResult> {

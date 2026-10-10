@@ -1,5 +1,5 @@
 ﻿from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import base64
 
@@ -7,6 +7,47 @@ from src.common.logger import get_logger
 from src.config.config import global_config
 
 logger = get_logger("plugin_runtime.integration")
+
+_DEFAULT_PLUGIN_LLM_TASK = "utils"
+
+
+def _resolve_llm_capability_route(
+    args: Dict[str, Any],
+    available_tasks: Dict[str, Any],
+) -> Tuple[str, str | None]:
+    """解析插件 LLM 请求使用的任务与直选模型。
+
+    新版 SDK 会显式发送 ``task_name``，此时 ``model`` 与 ``model_name`` 都表示
+    具体模型。旧版 SDK 未发送 ``task_name``，需要继续兼容把 ``model`` 当作任务名
+    使用的插件。
+
+    Args:
+        args: capability 调用参数。
+        available_tasks: 当前 Host 可用的模型任务。
+
+    Returns:
+        Tuple[str, str | None]: 任务名与可选的直选模型名。
+
+    Raises:
+        ValueError: ``model`` 与 ``model_name`` 指定了不同模型时抛出。
+    """
+    requested_task_name = str(args.get("task_name", "") or "").strip()
+    model_alias = str(args.get("model", "") or "").strip()
+    requested_model_name = str(args.get("model_name", "") or "").strip()
+
+    if model_alias and requested_model_name and model_alias != requested_model_name:
+        raise ValueError("model 与 model_name 不能指定不同的模型")
+
+    if "task_name" in args:
+        return requested_task_name or _DEFAULT_PLUGIN_LLM_TASK, requested_model_name or model_alias or None
+
+    if requested_model_name:
+        return _DEFAULT_PLUGIN_LLM_TASK, requested_model_name
+
+    if model_alias in available_tasks:
+        return model_alias, None
+
+    return _DEFAULT_PLUGIN_LLM_TASK, model_alias or None
 
 
 def _get_nested_config_value(source: Any, key: str, default: Any = None) -> Any:
@@ -249,6 +290,19 @@ class RuntimeCoreCapabilityMixin:
             logger.error(f"[cap.maisaka.proactive.trigger] 执行失败: {exc}", exc_info=True)
             return {"success": False, "error": str(exc)}
 
+    @staticmethod
+    def _build_send_result(args: Dict[str, Any], sent_message: Any = None, error: str = "") -> Dict[str, Any]:
+        """按调用方选择返回兼容布尔结果或包含平台消息 ID 的详细结果。"""
+
+        sent = sent_message is not None
+        result: Dict[str, Any] = {"success": sent}
+        if bool(args.get("return_details", False)):
+            message_id = str(sent_message.platform_message_id or "").strip() if sent else ""
+            result.update({"sent": sent, "message_id": message_id or None})
+        if error:
+            result["error"] = error
+        return result
+
     async def _cap_send_text(self, plugin_id: str, capability: str, args: Dict[str, Any]) -> Any:
         """向指定流发送文本消息。
 
@@ -268,10 +322,10 @@ class RuntimeCoreCapabilityMixin:
         sync_to_maisaka_history = bool(args.get("sync_to_maisaka_history", False))
         maisaka_source_kind = str(args.get("maisaka_source_kind", "plugin_send") or "plugin_send")
         if not text or not stream_id:
-            return {"success": False, "error": "缺少必要参数 text 或 stream_id"}
+            return self._build_send_result(args, error="缺少必要参数 text 或 stream_id")
 
         try:
-            result = await send_api.text_to_stream(
+            sent_message = await send_api.text_to_stream_with_message(
                 text=text,
                 stream_id=stream_id,
                 typing=bool(args.get("typing", False)),
@@ -280,10 +334,10 @@ class RuntimeCoreCapabilityMixin:
                 sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind=maisaka_source_kind,
             )
-            return {"success": result}
+            return self._build_send_result(args, sent_message)
         except Exception as exc:
             logger.error(f"[cap.send.text] 执行失败: {exc}", exc_info=True)
-            return {"success": False, "error": str(exc)}
+            return self._build_send_result(args, error=str(exc))
 
     async def _cap_send_emoji(self, plugin_id: str, capability: str, args: Dict[str, Any]) -> Any:
         """向指定流发送表情图片。
@@ -304,20 +358,20 @@ class RuntimeCoreCapabilityMixin:
         sync_to_maisaka_history = bool(args.get("sync_to_maisaka_history", False))
         maisaka_source_kind = str(args.get("maisaka_source_kind", "plugin_send") or "plugin_send")
         if not emoji_base64 or not stream_id:
-            return {"success": False, "error": "缺少必要参数 emoji_base64 或 stream_id"}
+            return self._build_send_result(args, error="缺少必要参数 emoji_base64 或 stream_id")
 
         try:
-            result = await send_api.emoji_to_stream(
+            sent_message = await send_api.emoji_to_stream_with_message(
                 emoji_base64=emoji_base64,
                 stream_id=stream_id,
                 storage_message=bool(args.get("storage_message", True)),
                 sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind=maisaka_source_kind,
             )
-            return {"success": result}
+            return self._build_send_result(args, sent_message)
         except Exception as exc:
             logger.error(f"[cap.send.emoji] 执行失败: {exc}", exc_info=True)
-            return {"success": False, "error": str(exc)}
+            return self._build_send_result(args, error=str(exc))
 
     async def _cap_send_image(self, plugin_id: str, capability: str, args: Dict[str, Any]) -> Any:
         """向指定流发送图片。
@@ -338,20 +392,20 @@ class RuntimeCoreCapabilityMixin:
         sync_to_maisaka_history = bool(args.get("sync_to_maisaka_history", False))
         maisaka_source_kind = str(args.get("maisaka_source_kind", "plugin_send") or "plugin_send")
         if not image_base64 or not stream_id:
-            return {"success": False, "error": "缺少必要参数 image_base64 或 stream_id"}
+            return self._build_send_result(args, error="缺少必要参数 image_base64 或 stream_id")
 
         try:
-            result = await send_api.image_to_stream(
+            sent_message = await send_api.image_to_stream_with_message(
                 image_base64=image_base64,
                 stream_id=stream_id,
                 storage_message=bool(args.get("storage_message", True)),
                 sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind=maisaka_source_kind,
             )
-            return {"success": result}
+            return self._build_send_result(args, sent_message)
         except Exception as exc:
             logger.error(f"[cap.send.image] 执行失败: {exc}", exc_info=True)
-            return {"success": False, "error": str(exc)}
+            return self._build_send_result(args, error=str(exc))
 
     @staticmethod
     def _normalize_plugin_segment(segment: Dict[str, Any]) -> Dict[str, Any]:
@@ -394,11 +448,11 @@ class RuntimeCoreCapabilityMixin:
         sync_to_maisaka_history = bool(args.get("sync_to_maisaka_history", False))
         maisaka_source_kind = str(args.get("maisaka_source_kind", "plugin_send") or "plugin_send")
         if not segments or not stream_id:
-            return {"success": False, "error": "缺少必要参数 segments 或 stream_id"}
+            return self._build_send_result(args, error="缺少必要参数 segments 或 stream_id")
 
         try:
             message_sequence = PluginMessageUtils._message_sequence_from_dict(segments)
-            result = await send_api.custom_reply_set_to_stream(
+            sent_message = await send_api.custom_reply_set_to_stream_with_message(
                 reply_set=message_sequence,
                 stream_id=stream_id,
                 processed_plain_text=str(args.get("processed_plain_text", "")),
@@ -408,10 +462,10 @@ class RuntimeCoreCapabilityMixin:
                 sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind=maisaka_source_kind,
             )
-            return {"success": result}
+            return self._build_send_result(args, sent_message)
         except Exception as exc:
             logger.error(f"[cap.send.hybrid] 执行失败: {exc}", exc_info=True)
-            return {"success": False, "error": str(exc)}
+            return self._build_send_result(args, error=str(exc))
 
     async def _cap_send_forward(self, plugin_id: str, capability: str, args: Dict[str, Any]) -> Any:
         """向指定流发送转发消息。"""
@@ -425,7 +479,7 @@ class RuntimeCoreCapabilityMixin:
         sync_to_maisaka_history = bool(args.get("sync_to_maisaka_history", False))
         maisaka_source_kind = str(args.get("maisaka_source_kind", "plugin_send") or "plugin_send")
         if not isinstance(messages, list) or not messages or not stream_id:
-            return {"success": False, "error": "缺少必要参数 messages 或 stream_id"}
+            return self._build_send_result(args, error="缺少必要参数 messages 或 stream_id")
 
         forward_nodes: List[Dict[str, Any]] = []
         for index, message in enumerate(messages):
@@ -446,13 +500,13 @@ class RuntimeCoreCapabilityMixin:
             )
 
         if not forward_nodes:
-            return {"success": False, "error": "messages 中缺少有效的转发节点"}
+            return self._build_send_result(args, error="messages 中缺少有效的转发节点")
 
         try:
             message_sequence = PluginMessageUtils._message_sequence_from_dict(
                 [{"type": "forward", "data": forward_nodes}]
             )
-            result = await send_api.custom_reply_set_to_stream(
+            sent_message = await send_api.custom_reply_set_to_stream_with_message(
                 reply_set=message_sequence,
                 stream_id=stream_id,
                 processed_plain_text=str(args.get("processed_plain_text", "[转发消息]")),
@@ -462,10 +516,10 @@ class RuntimeCoreCapabilityMixin:
                 sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind=maisaka_source_kind,
             )
-            return {"success": result}
+            return self._build_send_result(args, sent_message)
         except Exception as exc:
             logger.error(f"[cap.send.forward] 执行失败: {exc}", exc_info=True)
-            return {"success": False, "error": str(exc)}
+            return self._build_send_result(args, error=str(exc))
 
     async def _cap_send_command(self, plugin_id: str, capability: str, args: Dict[str, Any]) -> Any:
         """向指定流发送命令消息。
@@ -486,10 +540,10 @@ class RuntimeCoreCapabilityMixin:
         sync_to_maisaka_history = bool(args.get("sync_to_maisaka_history", False))
         maisaka_source_kind = str(args.get("maisaka_source_kind", "plugin_send") or "plugin_send")
         if not command or not stream_id:
-            return {"success": False, "error": "缺少必要参数 command 或 stream_id"}
+            return self._build_send_result(args, error="缺少必要参数 command 或 stream_id")
 
         try:
-            result = await send_api.custom_to_stream(
+            sent_message = await send_api.custom_to_stream_with_message(
                 message_type="command",
                 content=command,
                 stream_id=stream_id,
@@ -498,10 +552,10 @@ class RuntimeCoreCapabilityMixin:
                 sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind=maisaka_source_kind,
             )
-            return {"success": result}
+            return self._build_send_result(args, sent_message)
         except Exception as exc:
             logger.error(f"[cap.send.command] 执行失败: {exc}", exc_info=True)
-            return {"success": False, "error": str(exc)}
+            return self._build_send_result(args, error=str(exc))
 
     async def _cap_send_custom(self, plugin_id: str, capability: str, args: Dict[str, Any]) -> Any:
         """向指定流发送自定义消息。
@@ -525,10 +579,10 @@ class RuntimeCoreCapabilityMixin:
         sync_to_maisaka_history = bool(args.get("sync_to_maisaka_history", False))
         maisaka_source_kind = str(args.get("maisaka_source_kind", "plugin_send") or "plugin_send")
         if not message_type or not stream_id:
-            return {"success": False, "error": "缺少必要参数 message_type 或 stream_id"}
+            return self._build_send_result(args, error="缺少必要参数 message_type 或 stream_id")
 
         try:
-            result = await send_api.custom_to_stream(
+            sent_message = await send_api.custom_to_stream_with_message(
                 message_type=message_type,
                 content=content,
                 stream_id=stream_id,
@@ -538,10 +592,10 @@ class RuntimeCoreCapabilityMixin:
                 sync_to_maisaka_history=sync_to_maisaka_history,
                 maisaka_source_kind=maisaka_source_kind,
             )
-            return {"success": result}
+            return self._build_send_result(args, sent_message)
         except Exception as exc:
             logger.error(f"[cap.send.custom] 执行失败: {exc}", exc_info=True)
-            return {"success": False, "error": str(exc)}
+            return self._build_send_result(args, error=str(exc))
 
     async def _cap_llm_generate(self, plugin_id: str, capability: str, args: Dict[str, Any]) -> Any:
         """执行无工具的 LLM 生成能力。
@@ -559,12 +613,14 @@ class RuntimeCoreCapabilityMixin:
 
         try:
             prompt = _normalize_prompt_arg(args.get("prompt"))
-            task_name = llm_api.resolve_task_name(str(args.get("model", "") or args.get("model_name", "")))
+            task_name, model_name = _resolve_llm_capability_route(args, llm_api.get_available_models())
+            task_name = llm_api.resolve_task_name(task_name)
             result = await llm_api.generate(
                 llm_api.LLMServiceRequest(
                     task_name=task_name,
                     request_type=f"plugin.{plugin_id}",
                     prompt=prompt,
+                    model_name=model_name,
                     temperature=args.get("temperature"),
                     max_tokens=args.get("max_tokens"),
                 )
@@ -594,12 +650,14 @@ class RuntimeCoreCapabilityMixin:
 
         try:
             prompt = _normalize_prompt_arg(args.get("prompt"))
-            task_name = llm_api.resolve_task_name(str(args.get("model", "") or args.get("model_name", "")))
+            task_name, model_name = _resolve_llm_capability_route(args, llm_api.get_available_models())
+            task_name = llm_api.resolve_task_name(task_name)
             result = await llm_api.generate(
                 llm_api.LLMServiceRequest(
                     task_name=task_name,
                     request_type=f"plugin.{plugin_id}",
                     prompt=prompt,
+                    model_name=model_name,
                     tool_options=tool_options,
                     temperature=args.get("temperature"),
                     max_tokens=args.get("max_tokens"),

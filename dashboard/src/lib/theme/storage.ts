@@ -4,6 +4,7 @@
 
 import { DEFAULT_ACCENT_COLOR_HSL, normalizeAccentColor } from './palette'
 import {
+  DASHBOARD_STYLES,
   DEFAULT_DASHBOARD_STYLE,
   DEFAULT_DASHBOARD_STYLE_CONFIG,
   DEFAULT_FUTURE_RETRO_STYLE_CONFIG,
@@ -42,7 +43,8 @@ const DEFAULT_THEME_CONFIG: UserThemeConfig = {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null
 
-type ImportThemeConfigRecord = Record<string, unknown> & Pick<UserThemeConfig, 'selectedPreset' | 'accentColor'>
+type ImportThemeConfigRecord = Record<string, unknown> &
+  Pick<UserThemeConfig, 'selectedPreset' | 'accentColor'>
 
 function hasRequiredImportThemeFields(
   config: Record<string, unknown>,
@@ -63,8 +65,8 @@ function hasRequiredImportThemeFields(
 }
 
 function normalizeDashboardStyle(value: unknown): DashboardStyle {
-  if (value === 'modern' || value === 'future-retro') {
-    return value
+  if (DASHBOARD_STYLES.includes(value as DashboardStyle)) {
+    return value as DashboardStyle
   }
 
   return DEFAULT_DASHBOARD_STYLE
@@ -76,7 +78,7 @@ function normalizeStyleTokenOverrides(value: unknown): StyleTokenOverrides {
   }
 
   const nextOverrides: StyleTokenOverrides = {}
-  for (const style of ['modern', 'future-retro'] as const) {
+  for (const style of DASHBOARD_STYLES) {
     if (isRecord(value[style])) {
       nextOverrides[style] = value[style] as StyleTokenOverrides[typeof style]
     }
@@ -104,7 +106,7 @@ function normalizeStyleBackgroundConfig(value: unknown): StyleBackgroundConfigMa
   }
 
   const nextBackgroundConfig: StyleBackgroundConfigMap = {}
-  for (const style of ['modern', 'future-retro'] as const) {
+  for (const style of DASHBOARD_STYLES) {
     if (isRecord(value[style])) {
       nextBackgroundConfig[style] = value[style] as BackgroundConfigMap
     }
@@ -116,17 +118,35 @@ function normalizeStyleBackgroundConfig(value: unknown): StyleBackgroundConfigMa
 function normalizeStyleConfig(value: unknown): DashboardStyleConfig {
   const config = isRecord(value) ? value : {}
   const futureRetro = isRecord(config.futureRetro) ? config.futureRetro : {}
+  const textureStyles = new Set(['fine', 'coarse', 'dot-grid', 'ruled', 'none'])
+  const clampPercent = (candidate: unknown, fallback: number) =>
+    typeof candidate === 'number' && Number.isFinite(candidate)
+      ? Math.max(0, Math.min(100, candidate))
+      : fallback
+  const legacyTextureStyle =
+    futureRetro.paperTexture === false
+      ? 'none'
+      : DEFAULT_FUTURE_RETRO_STYLE_CONFIG.textureStyle
 
   return {
     futureRetro: {
-      focusHighlight:
-        typeof futureRetro.focusHighlight === 'boolean'
-          ? futureRetro.focusHighlight
-          : DEFAULT_FUTURE_RETRO_STYLE_CONFIG.focusHighlight,
-      paperTexture:
-        typeof futureRetro.paperTexture === 'boolean'
-          ? futureRetro.paperTexture
-          : DEFAULT_FUTURE_RETRO_STYLE_CONFIG.paperTexture,
+      paperWarmth: clampPercent(
+        futureRetro.paperWarmth,
+        DEFAULT_FUTURE_RETRO_STYLE_CONFIG.paperWarmth
+      ),
+      textureStyle:
+        typeof futureRetro.textureStyle === 'string' &&
+        textureStyles.has(futureRetro.textureStyle)
+          ? (futureRetro.textureStyle as DashboardStyleConfig['futureRetro']['textureStyle'])
+          : legacyTextureStyle,
+      textureIntensity: clampPercent(
+        futureRetro.textureIntensity,
+        DEFAULT_FUTURE_RETRO_STYLE_CONFIG.textureIntensity
+      ),
+      panelDepth: clampPercent(
+        futureRetro.panelDepth,
+        DEFAULT_FUTURE_RETRO_STYLE_CONFIG.panelDepth
+      ),
     },
   }
 }

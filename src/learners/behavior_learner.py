@@ -9,11 +9,11 @@ import json
 import re
 
 from src.chat.utils.utils import is_bot_self
-from src.common.data_models.llm_service_data_models import LLMGenerationOptions
+from src.common.data_models.llm_service_data_models import LLMResponseResult
 from src.common.logger import get_logger
 from src.common.prompt_i18n import load_prompt
 from src.config.config import global_config
-from src.llm_models.payload_content.message import Message, MessageBuilder, RoleType
+from src.llm_models.payload_content.context_item import ContextItem, ContextItemBuilder, RoleType
 from src.maisaka.display.prompt_cli_renderer import PromptCLIVisualizer
 from src.services.llm_service import LLMServiceClient
 
@@ -54,6 +54,7 @@ ALLOWED_FEEDBACK_STATUSES = {
     FEEDBACK_STATUS_FAILED,
     FEEDBACK_STATUS_NEUTRAL,
 }
+
 
 @dataclass(frozen=True)
 class BehaviorCandidate:
@@ -666,7 +667,7 @@ class BehaviorLearner:
             ]
         )
 
-    def _build_behavior_feedback_messages(self, feedback_context: BehaviorFeedbackContext) -> list[Message]:
+    def _build_behavior_feedback_messages(self, feedback_context: BehaviorFeedbackContext) -> list[ContextItem]:
         """构造行为路径反馈使用的多 message 请求。"""
 
         prompt = load_prompt(
@@ -675,7 +676,7 @@ class BehaviorLearner:
             behavior_references=self._format_feedback_references_for_system_prompt(feedback_context.references),
         )
         feedback_messages = [
-            MessageBuilder()
+            ContextItemBuilder()
             .set_role(RoleType.System)
             .add_text_content(
                 f"{prompt}\n\n"
@@ -684,18 +685,18 @@ class BehaviorLearner:
                 "source_ids 必须引用时间线消息中的 item_id。"
             )
             .build(),
-            MessageBuilder().set_role(RoleType.User).add_text_content("以下是后续聊天时间线。").build()
+            ContextItemBuilder().set_role(RoleType.User).add_text_content("以下是后续聊天时间线。").build(),
         ]
         for item in feedback_context.timeline_items:
             feedback_messages.append(
-                MessageBuilder()
+                ContextItemBuilder()
                 .set_role(RoleType.User)
                 .add_text_content(self._format_feedback_timeline_message(item))
                 .build()
             )
 
         feedback_messages.append(
-            MessageBuilder()
+            ContextItemBuilder()
             .set_role(RoleType.User)
             .add_text_content("请根据以上行为参考和后续聊天时间线输出反馈 JSON。")
             .build()
@@ -709,9 +710,8 @@ class BehaviorLearner:
         feedback_messages = self._build_behavior_feedback_messages(feedback_context)
 
         try:
-            generation_result = await behavior_feedback_model.generate_response_with_messages(
+            generation_result = await behavior_feedback_model.generate_response_with_context(
                 lambda _client: feedback_messages,
-                options=LLMGenerationOptions(temperature=0.15),
                 session_id=self.session_id,
             )
             response = generation_result.response or ""
@@ -719,7 +719,7 @@ class BehaviorLearner:
                 feedback_messages,
                 reference_count=len(feedback_context.references),
                 timeline_count=len(feedback_context.timeline_items),
-                output_content=response,
+                generation_result=generation_result,
             )
         except Exception as exc:
             logger.error(f"行为路径反馈评估失败: {exc}")
@@ -777,9 +777,7 @@ class BehaviorLearner:
         session_display_name = self._get_session_display_name(learning_session_id)
         log_prefix = f"[{session_display_name}]"
         if learning_session_id != self.session_id:
-            logger.info(
-                f"{log_prefix} 行为学习会话已按真实消息修正到当前聊天流"
-            )
+            logger.info(f"{log_prefix} 行为学习会话已按真实消息修正到当前聊天流")
 
         acquire_result = await behavior_learning_batch_gate.acquire(learning_session_id)
         if not acquire_result.acquired:
@@ -844,8 +842,7 @@ class BehaviorLearner:
             return self.session_id
 
         logger.warning(
-            "行为学习无法从真实消息中找到已注册聊天流，也无法确认学习归属: "
-            f"候选聊天流数量={len(set(candidates))}"
+            f"行为学习无法从真实消息中找到已注册聊天流，也无法确认学习归属: 候选聊天流数量={len(set(candidates))}"
         )
         return None
 
@@ -888,9 +885,8 @@ class BehaviorLearner:
 
         try:
             learning_messages = await self._build_multi_learning_messages(pending_messages, prompt)
-            generation_result = await behavior_learn_model.generate_response_with_messages(
+            generation_result = await behavior_learn_model.generate_response_with_context(
                 lambda _client: learning_messages,
-                options=LLMGenerationOptions(temperature=0.25),
                 session_id=learning_session_id,
             )
             response = generation_result.response or ""
@@ -899,7 +895,7 @@ class BehaviorLearner:
                 session_id=learning_session_id,
                 session_display_name=session_display_name,
                 source_message_count=len(pending_messages),
-                output_content=response,
+                generation_result=generation_result,
             )
         except Exception as exc:
             logger.error(f"{log_prefix} 学习行为表现失败: {exc}")
@@ -960,7 +956,11 @@ class BehaviorLearner:
                 for candidate, matched_segment, candidate_scene_start in write_plans
             ],
         )
-        for (candidate, matched_segment, candidate_scene_start), write_result in zip(write_plans, write_results):
+        for (candidate, matched_segment, candidate_scene_start), write_result in zip(
+            write_plans,
+            write_results,
+            strict=False,
+        ):
             if write_result.path is None:
                 skipped_reason = write_result.skipped_reason or "未知原因"
                 if write_result.skipped_reason:
@@ -1118,9 +1118,8 @@ class BehaviorLearner:
 
         async def run_scene_prompt(prompt: str) -> str:
             scene_messages = await self._build_scene_analysis_messages(messages, prompt)
-            generation_result = await behavior_scene_model.generate_response_with_messages(
+            generation_result = await behavior_scene_model.generate_response_with_context(
                 lambda _client: scene_messages,
-                options=LLMGenerationOptions(temperature=0.2),
                 session_id=learning_session_id,
             )
             response = generation_result.response or ""
@@ -1130,7 +1129,7 @@ class BehaviorLearner:
                 session_display_name=session_display_name,
                 source_message_count=len(messages),
                 request_messages=scene_messages,
-                output_content=response,
+                generation_result=generation_result,
             )
             return response
 
@@ -1154,9 +1153,8 @@ class BehaviorLearner:
 
         async def run_scene_prompt(prompt: str) -> str:
             scene_messages = await self._build_scene_analysis_messages(messages, prompt)
-            generation_result = await behavior_scene_model.generate_response_with_messages(
+            generation_result = await behavior_scene_model.generate_response_with_context(
                 lambda _client: scene_messages,
-                options=LLMGenerationOptions(temperature=0.2),
                 session_id=learning_session_id,
             )
             response = generation_result.response or ""
@@ -1166,7 +1164,7 @@ class BehaviorLearner:
                 session_display_name=session_display_name,
                 source_message_count=len(messages),
                 request_messages=scene_messages,
-                output_content=response,
+                generation_result=generation_result,
             )
             return response
 
@@ -1228,11 +1226,11 @@ class BehaviorLearner:
         self,
         messages: list["SessionMessage"],
         system_prompt: str,
-    ) -> list[Message]:
+    ) -> list[ContextItem]:
         """构造场景概括请求：规则在 system，真实聊天作为后续 user 消息。"""
 
         scene_messages = [
-            MessageBuilder()
+            ContextItemBuilder()
             .set_role(RoleType.System)
             .add_text_content(
                 f"{system_prompt}\n\n"
@@ -1251,7 +1249,7 @@ class BehaviorLearner:
             if not content:
                 content = "[空消息]"
             scene_messages.append(
-                MessageBuilder()
+                ContextItemBuilder()
                 .set_role(RoleType.User)
                 .add_text_content(
                     "\n".join(
@@ -1269,7 +1267,7 @@ class BehaviorLearner:
             )
 
         scene_messages.append(
-            MessageBuilder()
+            ContextItemBuilder()
             .set_role(RoleType.User)
             .add_text_content("请根据以上真实聊天消息输出场景片段 JSON。")
             .build()
@@ -1280,11 +1278,11 @@ class BehaviorLearner:
         self,
         messages: list["SessionMessage"],
         system_prompt: str,
-    ) -> list[Message]:
+    ) -> list[ContextItem]:
         """构造行为学习使用的多 message 请求。"""
 
         learning_messages = [
-            MessageBuilder()
+            ContextItemBuilder()
             .set_role(RoleType.System)
             .add_text_content(
                 f"{system_prompt}\n\n"
@@ -1305,7 +1303,7 @@ class BehaviorLearner:
             if not content:
                 content = "[空消息]"
             learning_messages.append(
-                MessageBuilder()
+                ContextItemBuilder()
                 .set_role(RoleType.User)
                 .add_text_content(
                     "\n".join(
@@ -1323,10 +1321,7 @@ class BehaviorLearner:
             )
 
         learning_messages.append(
-            MessageBuilder()
-            .set_role(RoleType.User)
-            .add_text_content("请根据以上聊天消息输出 JSON。")
-            .build()
+            ContextItemBuilder().set_role(RoleType.User).add_text_content("请根据以上聊天消息输出 JSON。").build()
         )
         return learning_messages
 
@@ -1337,20 +1332,14 @@ class BehaviorLearner:
         session_id: str,
         session_display_name: str,
         source_message_count: int,
-        request_messages: Optional[list[Message]] = None,
-        output_content: str,
+        request_messages: Optional[list[ContextItem]] = None,
+        generation_result: LLMResponseResult,
     ) -> None:
         """保存行为学习前的场景画像请求预览。"""
 
         try:
             preview_access = PromptCLIVisualizer.build_prompt_preview_access(
-                request_messages
-                or [
-                    MessageBuilder()
-                    .set_role(RoleType.User)
-                    .add_text_content(prompt)
-                    .build()
-                ],
+                request_messages or [ContextItemBuilder().set_role(RoleType.User).add_text_content(prompt).build()],
                 category="behavior_scenario_analyzer",
                 chat_id=session_id,
                 request_kind="behavior_scenario_analyzer",
@@ -1361,7 +1350,8 @@ class BehaviorLearner:
                     f"真实聊天消息数: {source_message_count}\n"
                     f"构建消息数: {len(request_messages or [])}"
                 ),
-                output_content=output_content,
+                output_items=generation_result.output_items,
+                generation_attempts=generation_result.generation_attempts,
             )
         except Exception as exc:
             logger.warning(f"[{session_display_name}] 行为学习场景画像预览保存失败: {exc}")
@@ -1375,12 +1365,12 @@ class BehaviorLearner:
 
     def _log_learning_context_preview(
         self,
-        messages: list[Message],
+        messages: list[ContextItem],
         *,
         session_id: str,
         session_display_name: str,
         source_message_count: int,
-        output_content: str,
+        generation_result: LLMResponseResult,
     ) -> None:
         """保存行为学习上下文预览，并在日志中输出查看入口。"""
 
@@ -1397,7 +1387,8 @@ class BehaviorLearner:
                     f"真实聊天消息数: {source_message_count}\n"
                     f"构建消息数: {len(messages)}"
                 ),
-                output_content=output_content,
+                output_items=generation_result.output_items,
+                generation_attempts=generation_result.generation_attempts,
             )
         except Exception as exc:
             logger.warning(f"[{session_display_name}] 行为学习上下文预览保存失败: {exc}")
@@ -1411,11 +1402,11 @@ class BehaviorLearner:
 
     def _log_behavior_feedback_preview(
         self,
-        messages: list[Message],
+        messages: list[ContextItem],
         *,
         reference_count: int,
         timeline_count: int,
-        output_content: str,
+        generation_result: LLMResponseResult,
     ) -> None:
         """保存行为路径反馈评估上下文预览。"""
 
@@ -1434,7 +1425,8 @@ class BehaviorLearner:
                     f"时间线项数: {timeline_count}\n"
                     f"构建消息数: {len(messages)}"
                 ),
-                output_content=output_content,
+                output_items=generation_result.output_items,
+                generation_attempts=generation_result.generation_attempts,
             )
         except Exception as exc:
             logger.warning(f"{log_prefix} 行为路径反馈预览保存失败: {exc}")
@@ -1458,10 +1450,7 @@ class BehaviorLearner:
         for candidate in candidates:
             if "SELF" in candidate.action or "SELF" in candidate.outcome:
                 skipped_reasons["contains_self_literal"] += 1
-                logger.info(
-                    f"跳过包含 SELF 字面量的行为表现："
-                    f"action={candidate.action}, outcome={candidate.outcome}"
-                )
+                logger.info(f"跳过包含 SELF 字面量的行为表现：action={candidate.action}, outcome={candidate.outcome}")
                 continue
 
             valid_source_ids: list[str] = []
@@ -1483,8 +1472,7 @@ class BehaviorLearner:
                 continue
 
             has_source_text = any(
-                (messages[int(source_id) - 1].processed_plain_text or "").strip()
-                for source_id in valid_source_ids
+                (messages[int(source_id) - 1].processed_plain_text or "").strip() for source_id in valid_source_ids
             )
             if not has_source_text:
                 skipped_reasons["empty_source_text"] += 1

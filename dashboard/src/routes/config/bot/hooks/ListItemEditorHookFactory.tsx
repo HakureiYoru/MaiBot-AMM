@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
-import * as LucideIcons from 'lucide-react'
-import { ChevronDown, ChevronUp, Plus, Trash2 } from 'lucide-react'
+import { useCallback, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { ChevronDown, ChevronUp, CircleAlert, Plus, Trash2 } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import {
@@ -39,12 +38,12 @@ export interface ListItemEditorOptions {
   infoText?: string
   /** 列表为空时的占位说明 */
   emptyText?: string
-  /** 顶部图标（覆盖 schema 自带的 x-icon） */
-  iconName?: string
   /** 紧凑布局：把指定字段放在同一行展示 */
   fieldRows?: string[][]
   /** Hook-local field UI metadata overrides */
   fieldSchemaOverrides?: Record<string, Partial<FieldSchema>>
+  /** 只在列表项编辑器中展示这些字段；未展示字段由后端默认值或 normalizeItems 处理 */
+  visibleFields?: string[]
   /** 后端 schema 暂时缺失时用于维持富编辑器可用的本地子项 schema */
   fallbackNestedSchema?: ConfigSchema
   /** 添加按钮位置 */
@@ -107,24 +106,6 @@ function resolveDescription(schema?: ConfigSchema | FieldSchema): string {
   if ('description' in schema && schema.description) return schema.description
   if ('classDoc' in schema && schema.classDoc) return schema.classDoc
   return ''
-}
-
-function resolveIconName(
-  iconOverride: string | undefined,
-  schema?: ConfigSchema | FieldSchema,
-): string | undefined {
-  if (iconOverride) return iconOverride
-  if (schema && 'x-icon' in schema && schema['x-icon']) return schema['x-icon']
-  return undefined
-}
-
-function renderLucideIcon(iconName: string | undefined, className: string) {
-  if (!iconName) return null
-  const Icon = LucideIcons[iconName as keyof typeof LucideIcons] as
-    | React.ComponentType<{ className?: string }>
-    | undefined
-  if (!Icon) return null
-  return <Icon className={className} />
 }
 
 /** 根据 itemSchema 字段默认值构造一个新 item */
@@ -255,15 +236,27 @@ export function createListItemEditorHook(
       [emitItems, items],
     )
 
+    const effectiveEditorSchema = useMemo<ConfigSchema | undefined>(() => {
+      if (!effectiveNestedSchema || !options.visibleFields?.length) {
+        return effectiveNestedSchema
+      }
+
+      const visibleFieldSet = new Set(options.visibleFields)
+      return {
+        ...effectiveNestedSchema,
+        fields: effectiveNestedSchema.fields.filter((field) => visibleFieldSet.has(field.name)),
+      }
+    }, [effectiveNestedSchema])
+
     const renderItemEditor = (item: Record<string, unknown>, index: number) => {
-      if (!effectiveNestedSchema) {
+      if (!effectiveEditorSchema) {
         return null
       }
 
       if (!options.fieldRows?.length) {
         return (
           <DynamicConfigForm
-            schema={effectiveNestedSchema}
+            schema={effectiveEditorSchema}
             values={item}
             onChange={(field, fieldValue) =>
               handleItemFieldChange(index, field, fieldValue)
@@ -279,14 +272,14 @@ export function createListItemEditorHook(
         ...(options.fieldSchemaOverrides?.[field.name] ?? {}),
       })
       const fieldMap = new Map(
-        effectiveNestedSchema.fields.map((field) => [field.name, applyFieldOverride(field)]),
+        effectiveEditorSchema.fields.map((field) => [field.name, applyFieldOverride(field)]),
       )
       const rowFieldNames = new Set(options.fieldRows.flat())
-      const remainingFields = effectiveNestedSchema.fields
+      const remainingFields = effectiveEditorSchema.fields
         .filter((field) => !rowFieldNames.has(field.name))
         .map(applyFieldOverride)
       const buildRowSchema = (fields: FieldSchema[]): ConfigSchema => ({
-        ...effectiveNestedSchema,
+        ...effectiveEditorSchema,
         fields,
         nested: undefined,
       })
@@ -340,7 +333,6 @@ export function createListItemEditorHook(
 
     const label = resolveLabel(schema, fieldPath)
     const description = resolveDescription(schema)
-    const iconName = resolveIconName(options.iconName, schema)
     const addButtonPlacement = options.addButtonPlacement ?? 'bottom'
     const shouldCollapse = options.collapseWhen?.({ parentValues }) ?? false
     const [manuallyExpanded, setManuallyExpanded] = useState(false)
@@ -349,11 +341,9 @@ export function createListItemEditorHook(
       ? (options.expandLabel ?? '灞曞紑')
       : (options.collapseLabel ?? '鎶樺彔')
 
-    useEffect(() => {
-      if (!shouldCollapse) {
-        setManuallyExpanded(false)
-      }
-    }, [shouldCollapse])
+    if (!shouldCollapse && manuallyExpanded) {
+      setManuallyExpanded(false)
+    }
 
     const addButton = (
       <Button
@@ -384,7 +374,6 @@ export function createListItemEditorHook(
         <CardHeader className="space-y-2 pb-4">
           <div className="flex items-start justify-between gap-3">
             <div className="flex min-w-0 items-center gap-2">
-              {renderLucideIcon(iconName, 'h-5 w-5 flex-shrink-0 text-muted-foreground')}
               <CardTitle className={fieldTitleClassName(schema, 'truncate text-base')}>{label}</CardTitle>
               {options.infoText && (
                 <TooltipProvider delayDuration={150}>
@@ -395,7 +384,7 @@ export function createListItemEditorHook(
                         aria-label={`${label} 说明`}
                         className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                       >
-                        <LucideIcons.CircleAlert className="h-4 w-4" />
+                        <CircleAlert className="h-4 w-4" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent

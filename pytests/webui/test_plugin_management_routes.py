@@ -1,14 +1,28 @@
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict, Generator, List, Optional, Tuple
 
 import asyncio
 import json
+import sys
+import tomllib
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from src.plugin_runtime import integration as integration_module
+from src.plugin_runtime.protocol.envelope import (
+    Envelope,
+    InspectPluginConfigPayload,
+    InspectPluginConfigResultPayload,
+    MessageType,
+    ValidatePluginConfigPayload,
+    ValidatePluginConfigResultPayload,
+)
+from src.plugin_runtime.runner.runner_main import PluginRunner
 from src.webui.services import git_mirror_service as mirror_service_module
+from src.webui.routers.plugin import config_routes as config_routes_module
 from src.webui.routers.plugin import icon_routes as icon_routes_module
 from src.webui.routers.plugin import management as management_module
 from src.webui.routers.plugin import support as support_module
@@ -16,6 +30,8 @@ from src.webui.routers.plugin import support as support_module
 
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> TestClient:
+    manager = integration_module.PluginRuntimeManager()
+    monkeypatch.setattr(integration_module, "get_plugin_runtime_manager", lambda: manager)
     plugins_dir = tmp_path / "plugins"
     plugins_dir.mkdir(parents=True, exist_ok=True)
 
@@ -55,6 +71,303 @@ def test_installed_plugins_only_scan_plugins_dir_and_exclude_a_memorix(client: T
     assert ids == ["test.demo"]
     assert "a-dawn.a-memorix" not in ids
     assert all("/src/plugins/built_in/" not in plugin["path"] for plugin in payload["plugins"])
+
+
+def test_installed_plugins_expose_duplicate_id_failure_reason(client: TestClient, monkeypatch) -> None:
+    plugins_dir = support_module.get_plugins_dir()
+    (plugins_dir / "demo_plugin" / "config.toml").write_text("[plugin]\nenabled = true\n", encoding="utf-8")
+    duplicate_dir = plugins_dir / "demo_plugin_copy"
+    duplicate_dir.mkdir()
+    duplicate_manifest = json.loads((plugins_dir / "demo_plugin" / "_manifest.json").read_text(encoding="utf-8"))
+    (duplicate_dir / "_manifest.json").write_text(json.dumps(duplicate_manifest), encoding="utf-8")
+    failure_reason = (
+        "插件 ID 重复，已阻止加载；冲突目录: "
+        f"{plugins_dir / 'demo_plugin'}, {duplicate_dir}"
+    )
+    async def snapshot():
+        return {"statuses": {"test.demo": "failed"}, "failure_reasons": {"test.demo": failure_reason},
+                "circuit_statuses": {}, "running": True}
+    monkeypatch.setattr(integration_module.get_plugin_runtime_manager(), "get_plugin_state_snapshot", snapshot)
+    response = client.get("/api/webui/plugins/installed")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["plugins"][0]["load_status"] == "failed"
+    assert payload["plugins"][0]["load_error"] == failure_reason
+
+
+@pytest.mark.parametrize("runtime_status, expected", [
+    ("failed", "disabled"), ("offline", "disabled"),
+    ("success", "success"), ("loading", "loading"), ("stopping", "stopping"),
+])
+def test_disabled_plugin_ignores_scan_failures_but_preserves_live_state(
+    client: TestClient, monkeypatch, runtime_status: str, expected: str,
+) -> None:
+    plugin_path = support_module.resolve_installed_plugin_path("test.demo")
+    (plugin_path / "config.toml").write_text("[plugin]\nenabled = false\n", encoding="utf-8")
+
+    async def snapshot():
+        return {"statuses": {"test.demo": runtime_status},
+                "failure_reasons": {"test.demo": "Host 版本不兼容"},
+                "circuit_statuses": {}, "running": True}
+
+    monkeypatch.setattr(integration_module.get_plugin_runtime_manager(), "get_plugin_state_snapshot", snapshot)
+    response = client.get("/api/webui/plugins/installed")
+    assert response.status_code == 200
+    plugin = response.json()["plugins"][0]
+    assert plugin["enabled"] is False
+    assert plugin["load_status"] == expected
+    assert plugin["load_error"] == ""
+
+
+def test_installed_plugins_expose_offline_adapter_status(client: TestClient, monkeypatch) -> None:
+    async def snapshot():
+        return {"statuses": {"test.demo": "offline"}, "failure_reasons": {}, "circuit_statuses": {}, "running": True}
+    monkeypatch.setattr(integration_module.get_plugin_runtime_manager(), "get_plugin_state_snapshot", snapshot)
+
+    response = client.get("/api/webui/plugins/installed")
+
+    assert response.status_code == 200
+    plugin = response.json()["plugins"][0]
+    assert plugin["load_status"] == "offline"
+    assert plugin["load_error"] == ""
+
+
+def test_toggle_plugin_applies_enabled_state_before_returning(client: TestClient, monkeypatch) -> None:
+    plugin_path = support_module.resolve_installed_plugin_path("test.demo")
+    assert plugin_path is not None
+    (plugin_path / "config.toml").write_text("[plugin]\nenabled = false\n", encoding="utf-8")
+    waited_states: List[Tuple[str, bool]] = []
+
+    async def fake_inspect_plugin_config(
+        plugin_id: str,
+        config_data: Optional[Dict[str, Any]] = None,
+        *,
+        use_provided_config: bool = False,
+    ) -> SimpleNamespace:
+        assert plugin_id == "test.demo"
+        assert config_data is None
+        assert use_provided_config is False
+        return SimpleNamespace(
+            enabled=False,
+            normalized_config={"plugin": {"enabled": False}},
+        )
+
+    async def fake_apply_config(plugin_id: str, write_config) -> str:
+        await write_config()
+        waited_states.append((plugin_id, True))
+        assert "enabled = true" in (plugin_path / "config.toml").read_text(encoding="utf-8")
+        return "success"
+
+    monkeypatch.setattr(config_routes_module, "_inspect_plugin_config_via_runtime", fake_inspect_plugin_config)
+    monkeypatch.setattr(integration_module.get_plugin_runtime_manager(), "apply_plugin_config", fake_apply_config)
+    monkeypatch.setattr(config_routes_module, "require_plugin_token", lambda _: "ok")
+
+    app = FastAPI()
+    app.include_router(config_routes_module.router, prefix="/api/webui/plugins")
+
+    response = TestClient(app).post("/api/webui/plugins/config/test.demo/toggle")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "success": True,
+        "enabled": True,
+        "runtime_status": "success",
+        "message": "插件已启用",
+        "note": "状态更改已同步到插件运行时",
+    }
+    assert waited_states == [("test.demo", True)]
+
+
+def test_toggle_exposes_runtime_failure_instead_of_reporting_success(client: TestClient, monkeypatch) -> None:
+    async def fail(plugin_id, write_config):
+        await write_config()
+        raise RuntimeError("模拟插件加载失败")
+    monkeypatch.setattr(integration_module.get_plugin_runtime_manager(), "apply_plugin_config", fail)
+    monkeypatch.setattr(config_routes_module, "require_plugin_token", lambda _: "ok")
+    app = FastAPI()
+    app.include_router(config_routes_module.router, prefix="/api/webui/plugins")
+    response = TestClient(app).post("/api/webui/plugins/config/test.demo/toggle")
+    assert response.status_code == 409
+    assert "模拟插件加载失败" in response.json()["detail"]
+
+
+_CONFIG_MODEL_PLUGIN_ID = "test.config_model"
+
+# 真实 SDK 插件：[plugin] 节只声明 SDK 要求的 config_version，未声明 enabled（#2080）
+_CONFIG_MODEL_PLUGIN_SOURCE = """
+from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase
+
+
+class PluginSection(PluginConfigBase):
+    config_version: str = Field(default="1.0.0")
+
+
+class GreetingSection(PluginConfigBase):
+    message: str = Field(default="hi")
+
+
+class DemoConfig(PluginConfigBase):
+    plugin: PluginSection = Field(default_factory=PluginSection)
+    greeting: GreetingSection = Field(default_factory=GreetingSection)
+
+
+class DemoPlugin(MaiBotPlugin):
+    config_model = DemoConfig
+
+    async def on_load(self):
+        pass
+
+    async def on_unload(self):
+        pass
+
+    async def on_config_update(self, scope, config_data, version):
+        pass
+
+
+def create_plugin():
+    return DemoPlugin()
+"""
+
+
+def _write_config_model_plugin_config(plugin_path: Path, *, enabled: bool) -> None:
+    (plugin_path / "config.toml").write_text(
+        "[plugin]\n"
+        'config_version = "1.0.0"\n'
+        f"enabled = {'true' if enabled else 'false'}\n"
+        "\n"
+        "[greeting]\n"
+        'message = "hi"\n',
+        encoding="utf-8",
+    )
+
+
+def _read_plugin_config(plugin_path: Path) -> Dict[str, Any]:
+    with (plugin_path / "config.toml").open("rb") as file_obj:
+        return tomllib.load(file_obj)
+
+
+@pytest.fixture
+def config_model_plugin(client: TestClient, monkeypatch) -> Generator[Tuple[TestClient, Path], None, None]:
+    """安装一个声明 config_model 的真实 SDK 插件，并把配置路由接到真实 Runner 的配置解析。"""
+
+    plugins_dir = support_module.get_plugins_dir()
+    plugin_path = plugins_dir / "config_model_plugin"
+    plugin_path.mkdir()
+    (plugin_path / "plugin.py").write_text(_CONFIG_MODEL_PLUGIN_SOURCE, encoding="utf-8")
+    (plugin_path / "_manifest.json").write_text(
+        json.dumps(
+            {
+                "manifest_version": 2,
+                "version": "1.0.0",
+                "name": _CONFIG_MODEL_PLUGIN_ID,
+                "description": _CONFIG_MODEL_PLUGIN_ID,
+                "author": {"name": "MaiBot", "url": "https://example.com"},
+                "license": "GPL-v3.0-or-later",
+                "urls": {"repository": "https://example.com/repo"},
+                "host_application": {"min_version": "0.0.0", "max_version": "9999.9999.9999"},
+                "sdk": {"min_version": "0.0.0", "max_version": "9999.9999.9999"},
+                "dependencies": [],
+                "capabilities": [],
+                "i18n": {"default_locale": "zh-CN", "supported_locales": ["zh-CN"]},
+                "id": _CONFIG_MODEL_PLUGIN_ID,
+                "plugin_type": "extension",
+            }
+        ),
+        encoding="utf-8",
+    )
+    runner = PluginRunner(host_address="unused", session_token="test", plugin_dirs=[str(plugins_dir)])
+    # 加载 SDK 插件可能安装旧版导入钩子，限制在本测试内
+    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
+
+    def runner_request(method: str, plugin_id: str, payload: Dict[str, Any]) -> Envelope:
+        return Envelope(
+            request_id=1,
+            message_type=MessageType.REQUEST,
+            method=method,
+            plugin_id=plugin_id,
+            payload=payload,
+        )
+
+    async def inspect_via_runner(
+        plugin_id: str,
+        config_data: Optional[Dict[str, Any]] = None,
+        *,
+        use_provided_config: bool = False,
+    ) -> InspectPluginConfigResultPayload:
+        payload = InspectPluginConfigPayload(config_data=config_data or {}, use_provided_config=use_provided_config)
+        response = await runner._handle_inspect_plugin_config(
+            runner_request("plugin.inspect_config", plugin_id, payload.model_dump())
+        )
+        assert response.error is None
+        return InspectPluginConfigResultPayload.model_validate(response.payload)
+
+    async def validate_via_runner(plugin_id: str, config_data: Dict[str, Any]) -> Dict[str, Any]:
+        payload = ValidatePluginConfigPayload(config_data=config_data)
+        response = await runner._handle_validate_plugin_config(
+            runner_request("plugin.validate_config", plugin_id, payload.model_dump())
+        )
+        assert response.error is None
+        return dict(ValidatePluginConfigResultPayload.model_validate(response.payload).normalized_config)
+
+    monkeypatch.setattr(config_routes_module, "_inspect_plugin_config_via_runtime", inspect_via_runner)
+    monkeypatch.setattr(config_routes_module, "_validate_plugin_config_via_runtime", validate_via_runner)
+    monkeypatch.setattr(config_routes_module, "require_plugin_token", lambda _: "ok")
+
+    app = FastAPI()
+    app.include_router(config_routes_module.router, prefix="/api/webui/plugins")
+    try:
+        yield TestClient(app), plugin_path
+    finally:
+        runner._loader.purge_plugin_modules(_CONFIG_MODEL_PLUGIN_ID, str(plugin_path))
+
+
+def test_toggle_round_trips_config_model_plugin_without_declared_enabled(
+    config_model_plugin: Tuple[TestClient, Path], monkeypatch
+) -> None:
+    config_client, plugin_path = config_model_plugin
+    _write_config_model_plugin_config(plugin_path, enabled=True)
+    waited_states: List[bool] = []
+
+    async def fake_apply_config(plugin_id: str, write_config) -> str:
+        await write_config()
+        enabled = _read_plugin_config(plugin_path)["plugin"]["enabled"]
+        waited_states.append(enabled)
+        return "success" if enabled else "inactive"
+
+    monkeypatch.setattr(integration_module.get_plugin_runtime_manager(), "apply_plugin_config", fake_apply_config)
+
+    toggled_states: List[bool] = []
+    for _ in range(3):
+        response = config_client.post(f"/api/webui/plugins/config/{_CONFIG_MODEL_PLUGIN_ID}/toggle")
+        assert response.status_code == 200
+        toggled_states.append(response.json()["enabled"])
+        assert _read_plugin_config(plugin_path)["plugin"]["enabled"] is toggled_states[-1]
+
+    assert toggled_states == [False, True, False]
+    assert waited_states == [False, True, False]
+
+
+def test_saving_config_keeps_config_model_plugin_disabled(config_model_plugin: Tuple[TestClient, Path]) -> None:
+    config_client, plugin_path = config_model_plugin
+    _write_config_model_plugin_config(plugin_path, enabled=False)
+
+    bundle = config_client.get(f"/api/webui/plugins/config/{_CONFIG_MODEL_PLUGIN_ID}/bundle").json()
+    # 配置页的启用开关读取 config.plugin.enabled
+    assert bundle["config"]["plugin"]["enabled"] is False
+
+    form_config = bundle["config"]
+    form_config["greeting"]["message"] = "hello"
+    response = config_client.put(
+        f"/api/webui/plugins/config/{_CONFIG_MODEL_PLUGIN_ID}",
+        json={"config": form_config},
+    )
+
+    assert response.status_code == 200
+    saved_config = _read_plugin_config(plugin_path)
+    assert saved_config["plugin"] == {"config_version": "1.0.0", "enabled": False}
+    assert saved_config["greeting"] == {"message": "hello"}
 
 
 def test_resolve_installed_plugin_path_falls_back_to_manifest_id(client: TestClient):
@@ -421,3 +734,41 @@ def test_update_non_git_plugin_rolls_back_when_manifest_id_mismatches(client: Te
     assert (plugin_path / "plugin.py").read_text(encoding="utf-8") == "old source"
     assert (plugin_path / "custom.json").read_text(encoding="utf-8") == '{"user": true}'
     assert not (plugin_path / ".git").exists()
+
+
+@pytest.mark.parametrize(
+    ("active_operation", "active_label"),
+    [("install", "安装"), ("uninstall", "卸载"), ("update", "更新")],
+)
+def test_update_rejects_conflicting_operation_for_same_plugin(
+    client: TestClient,
+    active_operation: str,
+    active_label: str,
+):
+    with management_module._reserve_plugin_operation("test.demo", active_operation):
+        response = client.post(
+            "/api/webui/plugins/update",
+            json={
+                "plugin_id": "test.demo",
+                "repository_url": "https://github.com/test/demo",
+                "branch": "main",
+            },
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == f"插件 test.demo 正在执行{active_label}操作，请等待完成后重试"
+
+
+def test_plugin_operation_reservation_allows_different_plugins(client: TestClient):
+    with management_module._reserve_plugin_operation("test.demo", "update"):
+        with management_module._reserve_plugin_operation("other.demo", "update"):
+            pass
+
+
+def test_plugin_operation_reservation_releases_after_failure(client: TestClient):
+    with pytest.raises(RuntimeError, match="模拟操作失败"):
+        with management_module._reserve_plugin_operation("test.demo", "update"):
+            raise RuntimeError("模拟操作失败")
+
+    with management_module._reserve_plugin_operation("test.demo", "update"):
+        pass

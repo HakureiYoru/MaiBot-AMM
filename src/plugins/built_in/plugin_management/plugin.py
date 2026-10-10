@@ -10,6 +10,8 @@ import shlex
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
 
+from src.core.local_operator import has_command_permission
+
 
 _VALID_COMPONENT_TYPES = ("tool", "command", "event_handler")
 _PLUGIN_MANAGEMENT_ID = "builtin.plugin-management"
@@ -35,25 +37,6 @@ _COMMAND_ALIAS_TARGETS: dict[str, str] = {
     "config.set": "/pm config set",
 }
 
-
-def _build_scoped_user_id(platform: str, user_id: str) -> str:
-    """构造跨平台用户 ID。"""
-
-    normalized_platform = str(platform or "").strip().lower()
-    normalized_user_id = str(user_id or "").strip()
-    if not normalized_platform or not normalized_user_id:
-        return ""
-    return f"{normalized_platform}:{normalized_user_id}"
-
-
-def _normalize_permission_list(permission_list: list[object]) -> set[str]:
-    """规范化插件管理权限列表。"""
-
-    return {
-        str(permission or "").strip().lower()
-        for permission in permission_list
-        if str(permission or "").strip()
-    }
 
 HELP_ALL = (
     "管理命令帮助\n"
@@ -151,6 +134,7 @@ class PluginManagementPlugin(MaiBotPlugin):
         "management",
         description="管理插件和组件的生命周期",
         pattern=r"(?P<manage_command>^/pm(?:\s+.+)?\s*$)",
+        permission="operator",
     )
     async def handle_management(
         self, stream_id: str = "", platform: str = "", user_id: str = "", matched_groups: dict | None = None, **kwargs
@@ -159,9 +143,21 @@ class PluginManagementPlugin(MaiBotPlugin):
         # 权限检查
         permission_result = await self.ctx.config.get("plugin.permission")
         permission_list = permission_result if isinstance(permission_result, list) else []
-        scoped_user_id = _build_scoped_user_id(platform, user_id)
-        if not scoped_user_id or scoped_user_id not in _normalize_permission_list(permission_list):
-            await self.ctx.send.text("你没有权限使用插件管理命令", stream_id)
+        command_permission_result = await self.ctx.config.get("plugin.command_permissions")
+        command_permissions = command_permission_result if isinstance(command_permission_result, dict) else {}
+        silent_denied_result = await self.ctx.config.get("plugin.silent_permission_denied")
+        is_local_operator = kwargs.get("is_local_operator") is True
+        if not has_command_permission(
+            f"{_PLUGIN_MANAGEMENT_ID}.management",
+            platform,
+            user_id,
+            stream_id,
+            permission_list,
+            command_permissions,
+            local_operator=is_local_operator,
+        ):
+            if not silent_denied_result:
+                await self.ctx.send.text("你没有权限使用插件管理命令", stream_id)
             return False, "没有权限", True
 
         if not stream_id:

@@ -24,6 +24,7 @@ export interface MaimaiVersion {
  * 已安装插件信息
  */
 export interface InstalledPlugin {
+  release?: { version: string; commit: string } | null
   id: string
   manifest: {
     manifest_version: number
@@ -46,14 +47,14 @@ export interface InstalledPlugin {
     plugin_type?: PluginType | string
     display?: PluginDisplay
     changelog?: string
-    [key: string]: unknown  // 允许其他字段
+    [key: string]: unknown // 允许其他字段
   }
   path: string
   changelog?: string | null
-  enabled?: boolean
+  enabled?: boolean | null
   disabled?: boolean
   loaded?: boolean
-  load_status?: 'success' | 'failed' | 'inactive' | 'disabled' | 'unknown' | 'loading'
+  load_status?: 'success' | 'failed' | 'inactive' | 'disabled' | 'offline' | 'unknown' | 'loading' | 'stopping' | 'not_loaded' | 'stopped'
   load_error?: string
   circuit_status?: {
     state: 'open' | 'half_open'
@@ -71,13 +72,24 @@ export interface LegacyInstalledPlugin {
   path: string
 }
 
+export interface RuntimeCommand {
+  aliases: string[]
+  description: string
+  enabled: boolean
+  id: string
+  name: string
+  pattern: string
+  permission: 'public' | 'operator'
+  plugin_name: string
+}
+
 /**
  * 插件加载进度
  */
 export interface PluginLoadProgress {
   operation: 'idle' | 'fetch' | 'install' | 'uninstall' | 'update'
   stage: 'idle' | 'loading' | 'success' | 'error'
-  progress: number  // 0-100
+  progress: number // 0-100
   message: string
   error?: string
   plugin_id?: string
@@ -143,7 +155,7 @@ export interface ConfigFieldSchema {
   depends_on?: string
   depends_value?: unknown
   // 列表类型专用
-  item_type?: string  // "string" | "number" | "object"
+  item_type?: string // "string" | "number" | "object"
   item_fields?: Record<string, ItemFieldDefinition>
   min_items?: number
   max_items?: number

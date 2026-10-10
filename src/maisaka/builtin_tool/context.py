@@ -1,14 +1,20 @@
-﻿"""Maisaka 内置工具执行上下文。"""
+"""Maisaka 内置工具执行上下文。"""
 
 from __future__ import annotations
 
 from base64 import b64decode
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
 
-import re
+import asyncio
 
-from src.chat.utils.utils import process_llm_response
+from src.chat.utils.utils import (
+    ProcessedResponseSegment,
+    process_llm_response,
+    process_llm_response_segments,
+    process_llm_response_segments_async,
+)
 from src.common.data_models.message_component_data_model import (
     AtComponent,
     EmojiComponent,
@@ -19,15 +25,18 @@ from src.common.data_models.message_component_data_model import (
 from src.common.logger import get_logger
 from src.config.config import global_config
 from src.core.tooling import ToolExecutionResult
-from src.plugin_runtime.integration import get_plugin_runtime_manager
-
-from src.maisaka.context.messages import SessionBackedMessage
 from src.maisaka.context.message_adapter import format_speaker_content
+from src.maisaka.context.emoji_candidates import EmojiCandidateMessage
+from src.maisaka.context.message_id_alias import to_display_message_id
+from src.maisaka.context.messages import SessionBackedMessage
 from src.maisaka.context.planner_messages import (
     build_planner_prefix,
     build_session_backed_text_message,
     extract_quote_ids_from_message_sequence,
 )
+from src.plugin_runtime.integration import get_plugin_runtime_manager
+
+from .image_attachment import resolve_image_attachment
 
 if TYPE_CHECKING:
     from src.maisaka.reasoning_engine import MaisakaReasoningEngine
@@ -35,10 +44,13 @@ if TYPE_CHECKING:
 
 logger = get_logger("maisaka_builtin_context")
 
-RICH_REPLY_TAG_PATTERN = re.compile(
-    r"<(?P<tag>send|text|pic|emoji|at|split)\b(?P<body>[^>]*)>",
-    re.IGNORECASE,
-)
+
+@dataclass
+class PostProcessedReplyMessage:
+    """一条待发送的后处理回复及其引用提示。"""
+
+    sequence: MessageSequence
+    quote_previous: bool = False
 
 
 class BuiltinToolRuntimeContext:
@@ -141,11 +153,24 @@ class BuiltinToolRuntimeContext:
         return normalized_results
 
     @staticmethod
-    def post_process_reply_text(reply_text: str) -> List[str]:
+    def post_process_reply_text(
+        reply_text: str,
+        *,
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
+    ) -> List[str]:
         """沿用旧回复链的文本后处理，执行分段与错别字注入。"""
 
+        if skip_post_process:
+            return [reply_text]
+
         processed_segments: List[str] = []
-        for segment in process_llm_response(reply_text):
+        for segment in process_llm_response(
+            reply_text,
+            enable_splitter=enable_splitter,
+            enable_chinese_typo=enable_chinese_typo,
+        ):
             normalized_segment = segment.strip()
             if normalized_segment:
                 processed_segments.append(normalized_segment)
@@ -154,59 +179,117 @@ class BuiltinToolRuntimeContext:
             return processed_segments
         return [reply_text.strip()]
 
-    async def post_process_reply_message_sequences_async(self, reply_text: str) -> List[MessageSequence]:
+    @staticmethod
+    def post_process_reply_segments(
+        reply_text: str,
+        *,
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
+    ) -> List[ProcessedResponseSegment]:
+        """执行文本后处理，并保留错别字纠正段的引用提示。"""
+
+        if skip_post_process:
+            return [ProcessedResponseSegment(reply_text.strip())]
+
+        processed_segments: List[ProcessedResponseSegment] = []
+        for segment in process_llm_response_segments(
+            reply_text,
+            enable_splitter=enable_splitter,
+            enable_chinese_typo=enable_chinese_typo,
+        ):
+            normalized_text = segment.text.strip()
+            if normalized_text:
+                processed_segments.append(
+                    ProcessedResponseSegment(
+                        normalized_text,
+                        quote_previous=segment.quote_previous,
+                    )
+                )
+
+        if processed_segments:
+            return processed_segments
+        return [ProcessedResponseSegment(reply_text.strip())]
+
+    def post_process_reply_message_items(
+        self,
+        reply_text: str,
+        *,
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
+    ) -> List[PostProcessedReplyMessage]:
+        """将纯文本回复处理为带发送提示的组件序列。"""
+
+        return [
+            PostProcessedReplyMessage(
+                sequence=MessageSequence([TextComponent(segment.text)]),
+                quote_previous=segment.quote_previous,
+            )
+            for segment in self.post_process_reply_segments(
+                reply_text,
+                skip_post_process=skip_post_process,
+                enable_splitter=enable_splitter,
+                enable_chinese_typo=enable_chinese_typo,
+            )
+        ]
+
+    async def post_process_reply_message_sequences_async(
+        self,
+        reply_text: str,
+        attachments: Optional[Dict[str, Any]] = None,
+        *,
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
+    ) -> List[MessageSequence]:
         """将 replyer 输出处理为可发送组件序列。"""
 
-        return self.post_process_reply_message_sequences(reply_text)
+        items = await self.post_process_reply_message_items_async(
+            reply_text,
+            attachments,
+            skip_post_process=skip_post_process,
+            enable_splitter=enable_splitter,
+            enable_chinese_typo=enable_chinese_typo,
+        )
+        return [item.sequence for item in items]
 
-    def post_process_reply_message_sequences(self, reply_text: str) -> List[MessageSequence]:
+    def post_process_reply_message_sequences(
+        self,
+        reply_text: str,
+        *,
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
+    ) -> List[MessageSequence]:
         """将纯文本回复处理为可发送组件序列。"""
 
-        return [MessageSequence([TextComponent(segment)]) for segment in self.post_process_reply_text(reply_text)]
+        return [
+            item.sequence
+            for item in self.post_process_reply_message_items(
+                reply_text,
+                skip_post_process=skip_post_process,
+                enable_splitter=enable_splitter,
+                enable_chinese_typo=enable_chinese_typo,
+            )
+        ]
 
-    @staticmethod
-    def is_rich_reply_send(reply_text: str) -> bool:
-        """判断检查器是否要求原样发送 replyer 输出。"""
+    def _resolve_at_attachment(self, raw_target: Any) -> AtComponent:
+        """把 attach_at 参数解析为对目标消息发送者的 at 组件。"""
 
-        return (reply_text or "").strip().lower() == "<send>"
-
-    @staticmethod
-    def _parse_rich_reply_tag_body(raw_body: str) -> tuple[List[str], Dict[str, str]]:
-        """解析 `<pic msg_id=... index=0>` 这类标签参数。"""
-
-        body = str(raw_body or "").strip()
-        if not body:
-            return [], {}
-
-        positional: List[str] = []
-        keyword_args: Dict[str, str] = {}
-        for token in re.split(r"\s+", body):
-            if not token:
-                continue
-            if "=" not in token:
-                positional.append(token)
-                continue
-            key, value = token.split("=", 1)
-            normalized_key = key.strip().lower()
-            if normalized_key:
-                keyword_args[normalized_key] = value.strip()
-        return positional, keyword_args
-
-    def _resolve_at_component(self, raw_body: str) -> AtComponent:
-        """把 `<at msg_id>` 解析为对该消息发送者的 at 组件。"""
-
-        positional, keyword_args = self._parse_rich_reply_tag_body(raw_body)
-        target_user_id = str(keyword_args.get("user_id") or "").strip()
-        target_message_id = str(keyword_args.get("msg_id") or keyword_args.get("message_id") or "").strip()
-        if not target_user_id and positional:
-            target_message_id = positional[0].strip()
+        if isinstance(raw_target, dict):
+            target_user_id = str(raw_target.get("user_id") or "").strip()
+            target_message_id = str(raw_target.get("msg_id") or raw_target.get("message_id") or "").strip()
+        else:
+            target_user_id = ""
+            target_message_id = str(raw_target or "").strip()
 
         if target_user_id:
             return AtComponent(target_user_id=target_user_id)
 
         target_message = self.runtime.find_source_message_by_id(target_message_id)
         if target_message is None:
-            raise ValueError(f"无法解析 at 目标消息：msg_id={target_message_id}")
+            raise ValueError(f"无法解析 at 目标消息：msg_id={to_display_message_id(target_message_id)}")
 
         user_info = target_message.message_info.user_info
         return AtComponent(
@@ -215,121 +298,132 @@ class BuiltinToolRuntimeContext:
             target_user_cardname=user_info.user_cardname,
         )
 
-    async def _resolve_image_component(self, raw_body: str) -> ImageComponent:
-        """把 `<pic ...>` 按 send_image 的 msg_id/index 语义解析为图片组件。"""
+    async def _resolve_image_attachment(self, raw_attachment: Any) -> ImageComponent:
+        """把 attach_pic 参数按消息或工具媒体索引解析为图片组件。"""
 
-        from .send_image import _collect_message_images
+        if isinstance(raw_attachment, dict):
+            target_message_id = str(
+                raw_attachment.get("media_index")
+                or raw_attachment.get("msg_id")
+                or raw_attachment.get("message_id")
+                or raw_attachment.get("source")
+                or ""
+            ).strip()
+            raw_index = raw_attachment.get("index", raw_attachment.get("image_index", 0))
+        else:
+            target_message_id = str(raw_attachment or "").strip()
+            raw_index = 0
 
-        positional, keyword_args = self._parse_rich_reply_tag_body(raw_body)
-        target_message_id = str(
-            keyword_args.get("media_index")
-            or keyword_args.get("msg_id")
-            or keyword_args.get("message_id")
-            or keyword_args.get("source")
-            or ""
-        ).strip()
-        if not target_message_id and positional:
-            target_message_id = positional[0].strip()
-
-        raw_index = keyword_args.get("index") or keyword_args.get("image_index") or ""
-        if not raw_index and len(positional) >= 2:
-            raw_index = positional[1]
         try:
             image_index = int(raw_index or 0)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"图片序号无效：index={raw_index}") from exc
 
-        images, error = await _collect_message_images(self, target_message_id)
-        if error is not None:
-            raise ValueError(error)
-        if image_index < 0 or image_index >= len(images):
-            raise ValueError(f"图片序号超出范围：index={image_index}，该消息共有 {len(images)} 张图片。")
+        return await resolve_image_attachment(self, target_message_id, image_index)
 
-        image = images[image_index]
-        return ImageComponent(
-            binary_hash=image.binary_hash,
-            content=image.content,
-            binary_data=image.binary_data,
-        )
-
-    async def _resolve_emoji_component(self, raw_body: str) -> EmojiComponent:
-        """把 `<emoji 情绪>` 解析为表情包组件。"""
+    async def _resolve_emoji_attachment(self, raw_index: Any) -> EmojiComponent:
+        """把 attach_emoji 参数解析为表情包组件。"""
 
         from src.common.utils.image_path import resolve_stored_image_path
         from src.emoji_system.emoji_manager import emoji_manager
 
-        requested_emotion = str(raw_body or "").strip()
-        selected_emoji = await emoji_manager.get_emoji_for_emotion(requested_emotion)
+        if type(raw_index) is not int or raw_index < 1:
+            raise ValueError("attach_emoji 必须填写 show_emoji_list 拼图中的正整数序号。")
+        emoji_hash = next(
+            (
+                message.emoji_hashes[raw_index]
+                for message in self.runtime._chat_history
+                if isinstance(message, EmojiCandidateMessage) and raw_index in message.emoji_hashes
+            ),
+            None,
+        )
+        if emoji_hash is None:
+            raise ValueError(f"表情包序号 {raw_index} 不在当前历史中，请先调用 show_emoji_list。")
+        selected_emoji = emoji_manager.get_emoji_by_hash(emoji_hash)
         if selected_emoji is None:
-            available_emojis = list(emoji_manager.emojis)
-            if not available_emojis:
-                raise ValueError("当前表情包库中没有可用表情。")
-            selected_emoji = min(available_emojis, key=lambda item: int(getattr(item, "query_count", 0) or 0))
+            raise ValueError(f"表情包序号 {raw_index} 对应的表情已不可用，请重新调用 show_emoji_list。")
 
         emoji_path = resolve_stored_image_path(selected_emoji.full_path)
-        emoji_bytes = emoji_path.read_bytes()
-        emoji_manager.update_emoji_usage(selected_emoji)
+        emoji_bytes = await asyncio.to_thread(emoji_path.read_bytes)
+        await asyncio.to_thread(emoji_manager.update_emoji_usage, selected_emoji)
         return EmojiComponent(
             binary_hash=selected_emoji.file_hash,
             content=selected_emoji.description.strip() or "[表情包]",
             binary_data=emoji_bytes,
         )
 
-    async def post_process_rich_reply_message_sequences_async(
+    @staticmethod
+    def _normalize_attachment_list(raw_value: Any, argument_name: str) -> List[Any]:
+        """将可重复附件参数规范化为列表。"""
+
+        if raw_value is None or raw_value == "":
+            return []
+        if isinstance(raw_value, list):
+            return raw_value
+        if isinstance(raw_value, (str, dict)):
+            return [raw_value]
+        raise ValueError(f"{argument_name} 参数类型无效，应为字符串、对象或列表。")
+
+    async def post_process_reply_message_items_async(
         self,
-        checker_output: str,
-        original_reply_text: str,
-    ) -> List[MessageSequence]:
-        """将检查器格式化输出处理为可发送组件序列。"""
+        reply_text: str,
+        attachments: Optional[Dict[str, Any]] = None,
+        *,
+        skip_post_process: bool = False,
+        enable_splitter: bool = True,
+        enable_chinese_typo: bool = True,
+    ) -> List[PostProcessedReplyMessage]:
+        """异步处理 replyer 正文和附件，并保留每条消息的发送提示。"""
 
-        normalized_output = (checker_output or "").strip()
-        if self.is_rich_reply_send(normalized_output):
-            return self.post_process_reply_message_sequences(original_reply_text)
-        if not RICH_REPLY_TAG_PATTERN.search(normalized_output):
-            return self.post_process_reply_message_sequences(normalized_output)
+        if skip_post_process:
+            segments = [ProcessedResponseSegment(reply_text.strip())]
+        else:
+            segments = await process_llm_response_segments_async(
+                reply_text,
+                enable_splitter=enable_splitter,
+                enable_chinese_typo=enable_chinese_typo,
+            )
+        items = [
+            PostProcessedReplyMessage(
+                sequence=MessageSequence([TextComponent(segment.text.strip())]),
+                quote_previous=segment.quote_previous,
+            )
+            for segment in segments
+            if segment.text.strip()
+        ]
+        attachment_args = dict(attachments or {})
 
-        sequences: List[MessageSequence] = []
-        components: List[Any] = []
+        if attachment_args.get("attach_at") and not global_config.chat.enable_reply_at:
+            raise ValueError("回复时 @ 用户已关闭，不能使用 attach_at。")
+        if attachment_args.get("attach_emoji") is not None and not global_config.emoji.use_new_send_logic:
+            raise ValueError("新表情包发送逻辑未开启，请使用 send_emoji 工具。")
 
-        def flush_components() -> None:
-            nonlocal components
-            if not components:
-                return
-            sequences.append(MessageSequence(components))
-            components = []
+        at_components = [
+            self._resolve_at_attachment(raw_target)
+            for raw_target in self._normalize_attachment_list(attachment_args.get("attach_at"), "attach_at")
+        ]
+        image_components = [
+            await self._resolve_image_attachment(raw_attachment)
+            for raw_attachment in self._normalize_attachment_list(attachment_args.get("attach_pic"), "attach_pic")
+        ]
+        raw_emoji = attachment_args.get("attach_emoji")
+        emoji_components = [await self._resolve_emoji_attachment(raw_emoji)] if raw_emoji is not None else []
 
-        cursor = 0
-        for match in RICH_REPLY_TAG_PATTERN.finditer(normalized_output):
-            prefix_text = normalized_output[cursor : match.start()]
-            if prefix_text:
-                components.append(TextComponent(prefix_text))
+        if not at_components and not image_components and not emoji_components:
+            return items
 
-            tag = match.group("tag").lower()
-            body = match.group("body") or ""
-            if tag == "split":
-                flush_components()
-            elif tag == "send":
-                components.append(TextComponent(original_reply_text))
-            elif tag == "text":
-                replacement_text = body.strip() or original_reply_text
-                if replacement_text:
-                    components.append(TextComponent(replacement_text))
-            elif tag == "pic":
-                components.append(await self._resolve_image_component(body))
-            elif tag == "emoji":
-                components.append(await self._resolve_emoji_component(body))
-            elif tag == "at":
-                components.append(self._resolve_at_component(body))
-            cursor = match.end()
+        if not items:
+            raise ValueError("回复附件需要搭配非空的文字回复。")
 
-        suffix_text = normalized_output[cursor:]
-        if suffix_text:
-            components.append(TextComponent(suffix_text))
-        flush_components()
+        at_prefix_components = []
+        for at_component in at_components:
+            at_prefix_components.extend([at_component, TextComponent(" ")])
 
-        if not sequences:
-            return self.post_process_reply_message_sequences(original_reply_text)
-        return sequences
+        items[0].sequence.components = at_prefix_components + items[0].sequence.components
+        items[-1].sequence.components.extend(image_components)
+        if emoji_components:
+            items.append(PostProcessedReplyMessage(sequence=MessageSequence(emoji_components)))
+        return items
 
     def get_runtime_manager(self) -> Any:
         """获取插件运行时管理器。"""
@@ -354,7 +448,7 @@ class BuiltinToolRuntimeContext:
             source_kind="guided_reply",
             chat_id=self.runtime.session_id,
             include_chat_id=include_chat_id,
-            is_self_message=global_config.chat.self_message_special_mark,
+            is_self_message=True,
         )
         self.runtime._chat_history.append(history_message)
 
@@ -379,7 +473,7 @@ class BuiltinToolRuntimeContext:
             quote_ids=extract_quote_ids_from_message_sequence(message.raw_message),
             include_message_id=not message.is_notify and bool(message.message_id),
             include_chat_id=include_chat_id,
-            is_self_message=source_kind == "guided_reply" and global_config.chat.self_message_special_mark,
+            is_self_message=source_kind == "guided_reply",
         )
         history_message = SessionBackedMessage.from_session_message(
             message,
@@ -409,7 +503,7 @@ class BuiltinToolRuntimeContext:
             user_name=bot_name,
             chat_id=self.runtime.session_id,
             include_chat_id=include_chat_id,
-            is_self_message=global_config.chat.self_message_special_mark,
+            is_self_message=True,
         )
         history_message = SessionBackedMessage(
             raw_message=MessageSequence(

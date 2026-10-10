@@ -18,6 +18,7 @@ from src.common.i18n import set_locale, t, tn
 from src.common.logger import get_logger, initialize_logging, shutdown_logging
 from src.common.runtime_loop import set_main_loop
 from src.common.shutdown import request_shutdown
+from src.common.update_notice import emit_terminal_update_notice_if_needed
 from src.config.legacy_upgrade_confirmation import require_legacy_upgrade_confirmation
 
 # 设置工作目录为脚本所在目录
@@ -89,7 +90,6 @@ def run_runner_process():
 
     while True:
         logger.info(t("startup.launching_script", script_file=script_file))
-        logger.info(t("startup.compiling_shaders"))
 
         # 启动子进程 (Worker)
         # 使用 sys.executable 确保使用相同的 Python 解释器
@@ -142,6 +142,7 @@ if os.environ.get("MAIBOT_WORKER_PROCESS") != "1":
 # 不过由于是不同进程，每个进程仍会初始化一次，这是预期的行为
 
 require_legacy_upgrade_confirmation(Path(script_dir))
+asyncio.run(emit_terminal_update_notice_if_needed())
 
 logger.info(t("startup.worker_dir_set", script_dir=script_dir))
 
@@ -237,6 +238,11 @@ async def graceful_shutdown(main_system: MainSystem | None = None):  # sourcery 
             timeout=8.0,
             step_name="停止插件运行时",
         )
+
+        # 先等待图片描述写回，再关闭记忆内核，避免未完成同步被统一取消。
+        from src.chat.image_system.image_manager import image_manager
+
+        await _await_shutdown_step(image_manager.shutdown(), timeout=120.0, step_name="等待图片描述同步")
 
         # 停止所有异步任务
         await _await_shutdown_step(
@@ -480,8 +486,6 @@ if __name__ == "__main__":
             initialize_task = loop.create_task(main_system.initialize())
             _active_main_task = initialize_task
             _run_until_complete(loop, initialize_task)
-            # Schedule tasks returns a future that runs forever.
-            # We can run console_input_loop concurrently.
             main_tasks = loop.create_task(main_system.schedule_tasks())
             _active_main_task = main_tasks
             _run_until_complete(loop, main_tasks)

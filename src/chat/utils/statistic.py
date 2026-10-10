@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from html import escape
 from os import getenv
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, DefaultDict, cast
 
 import asyncio
 import concurrent.futures
@@ -13,6 +13,14 @@ from typing_extensions import TypedDict
 
 from src.common.logger import get_logger
 from src.manager.async_task_manager import AsyncTask
+
+if TYPE_CHECKING:
+    from src.webui.schemas.statistics import (
+        DetailedDistributionItem,
+        DetailedStatisticsBreakdown,
+        DetailedStatisticsData,
+        DetailedStatisticsDistributions,
+    )
 
 logger = get_logger("maibot_statistic")
 
@@ -114,22 +122,27 @@ class StatPeriodData(TypedDict):
     requests_by_user: defaultdict[str, int]
     requests_by_model: defaultdict[str, int]
     requests_by_module: defaultdict[str, int]
+    requests_by_task: DefaultDict[str, int]
     in_tokens_by_type: defaultdict[str, int]
     in_tokens_by_user: defaultdict[str, int]
     in_tokens_by_model: defaultdict[str, int]
     in_tokens_by_module: defaultdict[str, int]
+    in_tokens_by_task: DefaultDict[str, int]
     out_tokens_by_type: defaultdict[str, int]
     out_tokens_by_user: defaultdict[str, int]
     out_tokens_by_model: defaultdict[str, int]
     out_tokens_by_module: defaultdict[str, int]
+    out_tokens_by_task: DefaultDict[str, int]
     tokens_by_type: defaultdict[str, int]
     tokens_by_user: defaultdict[str, int]
     tokens_by_model: defaultdict[str, int]
     tokens_by_module: defaultdict[str, int]
+    tokens_by_task: DefaultDict[str, int]
     costs_by_type: defaultdict[str, float]
     costs_by_user: defaultdict[str, float]
     costs_by_model: defaultdict[str, float]
     costs_by_module: defaultdict[str, float]
+    costs_by_task: DefaultDict[str, float]
     costs_by_chat: defaultdict[str, float]
     cache_hit_tokens: int
     cache_miss_tokens: int
@@ -137,10 +150,12 @@ class StatPeriodData(TypedDict):
     cache_hit_tokens_by_user: defaultdict[str, int]
     cache_hit_tokens_by_model: defaultdict[str, int]
     cache_hit_tokens_by_module: defaultdict[str, int]
+    cache_hit_tokens_by_task: DefaultDict[str, int]
     cache_miss_tokens_by_type: defaultdict[str, int]
     cache_miss_tokens_by_user: defaultdict[str, int]
     cache_miss_tokens_by_model: defaultdict[str, int]
     cache_miss_tokens_by_module: defaultdict[str, int]
+    cache_miss_tokens_by_task: DefaultDict[str, int]
     time_costs_by_type: defaultdict[str, list[float]]
     time_costs_by_user: defaultdict[str, list[float]]
     time_costs_by_model: defaultdict[str, list[float]]
@@ -149,10 +164,12 @@ class StatPeriodData(TypedDict):
     avg_time_costs_by_user: defaultdict[str, float]
     avg_time_costs_by_model: defaultdict[str, float]
     avg_time_costs_by_module: defaultdict[str, float]
+    avg_time_costs_by_task: DefaultDict[str, float]
     std_time_costs_by_type: defaultdict[str, float]
     std_time_costs_by_user: defaultdict[str, float]
     std_time_costs_by_model: defaultdict[str, float]
     std_time_costs_by_module: defaultdict[str, float]
+    std_time_costs_by_task: DefaultDict[str, float]
     online_time: float
     total_messages: int
     messages_by_chat: defaultdict[str, int]
@@ -168,22 +185,27 @@ REQ_CNT_BY_TYPE = "requests_by_type"
 REQ_CNT_BY_USER = "requests_by_user"
 REQ_CNT_BY_MODEL = "requests_by_model"
 REQ_CNT_BY_MODULE = "requests_by_module"
+REQ_CNT_BY_TASK = "requests_by_task"
 IN_TOK_BY_TYPE = "in_tokens_by_type"
 IN_TOK_BY_USER = "in_tokens_by_user"
 IN_TOK_BY_MODEL = "in_tokens_by_model"
 IN_TOK_BY_MODULE = "in_tokens_by_module"
+IN_TOK_BY_TASK = "in_tokens_by_task"
 OUT_TOK_BY_TYPE = "out_tokens_by_type"
 OUT_TOK_BY_USER = "out_tokens_by_user"
 OUT_TOK_BY_MODEL = "out_tokens_by_model"
 OUT_TOK_BY_MODULE = "out_tokens_by_module"
+OUT_TOK_BY_TASK = "out_tokens_by_task"
 TOTAL_TOK_BY_TYPE = "tokens_by_type"
 TOTAL_TOK_BY_USER = "tokens_by_user"
 TOTAL_TOK_BY_MODEL = "tokens_by_model"
 TOTAL_TOK_BY_MODULE = "tokens_by_module"
+TOTAL_TOK_BY_TASK = "tokens_by_task"
 COST_BY_TYPE = "costs_by_type"
 COST_BY_USER = "costs_by_user"
 COST_BY_MODEL = "costs_by_model"
 COST_BY_MODULE = "costs_by_module"
+COST_BY_TASK = "costs_by_task"
 COST_BY_CHAT = "costs_by_chat"
 GLOBAL_COST_SESSION_KEY = "__global__"
 CACHE_HIT_TOK = "cache_hit_tokens"
@@ -192,10 +214,12 @@ CACHE_HIT_TOK_BY_TYPE = "cache_hit_tokens_by_type"
 CACHE_HIT_TOK_BY_USER = "cache_hit_tokens_by_user"
 CACHE_HIT_TOK_BY_MODEL = "cache_hit_tokens_by_model"
 CACHE_HIT_TOK_BY_MODULE = "cache_hit_tokens_by_module"
+CACHE_HIT_TOK_BY_TASK = "cache_hit_tokens_by_task"
 CACHE_MISS_TOK_BY_TYPE = "cache_miss_tokens_by_type"
 CACHE_MISS_TOK_BY_USER = "cache_miss_tokens_by_user"
 CACHE_MISS_TOK_BY_MODEL = "cache_miss_tokens_by_model"
 CACHE_MISS_TOK_BY_MODULE = "cache_miss_tokens_by_module"
+CACHE_MISS_TOK_BY_TASK = "cache_miss_tokens_by_task"
 TIME_COST_BY_TYPE = "time_costs_by_type"
 TIME_COST_BY_USER = "time_costs_by_user"
 TIME_COST_BY_MODEL = "time_costs_by_model"
@@ -204,10 +228,12 @@ AVG_TIME_COST_BY_TYPE = "avg_time_costs_by_type"
 AVG_TIME_COST_BY_USER = "avg_time_costs_by_user"
 AVG_TIME_COST_BY_MODEL = "avg_time_costs_by_model"
 AVG_TIME_COST_BY_MODULE = "avg_time_costs_by_module"
+AVG_TIME_COST_BY_TASK = "avg_time_costs_by_task"
 STD_TIME_COST_BY_TYPE = "std_time_costs_by_type"
 STD_TIME_COST_BY_USER = "std_time_costs_by_user"
 STD_TIME_COST_BY_MODEL = "std_time_costs_by_model"
 STD_TIME_COST_BY_MODULE = "std_time_costs_by_module"
+STD_TIME_COST_BY_TASK = "std_time_costs_by_task"
 ONLINE_TIME = "online_time"
 TOTAL_MSG_CNT = "total_messages"
 MSG_CNT_BY_CHAT = "messages_by_chat"
@@ -571,10 +597,12 @@ class StatisticOutputTask(AsyncTask):
         avg_time_costs_by_user: defaultdict[str, float] = defaultdict(float)
         avg_time_costs_by_model: defaultdict[str, float] = defaultdict(float)
         avg_time_costs_by_module: defaultdict[str, float] = defaultdict(float)
+        avg_time_costs_by_task: DefaultDict[str, float] = defaultdict(float)
         std_time_costs_by_type: defaultdict[str, float] = defaultdict(float)
         std_time_costs_by_user: defaultdict[str, float] = defaultdict(float)
         std_time_costs_by_model: defaultdict[str, float] = defaultdict(float)
         std_time_costs_by_module: defaultdict[str, float] = defaultdict(float)
+        std_time_costs_by_task: DefaultDict[str, float] = defaultdict(float)
 
         return {
             TOTAL_REQ_CNT: 0,
@@ -582,23 +610,28 @@ class StatisticOutputTask(AsyncTask):
             REQ_CNT_BY_USER: defaultdict(int),
             REQ_CNT_BY_MODEL: defaultdict(int),
             REQ_CNT_BY_MODULE: defaultdict(int),
+            REQ_CNT_BY_TASK: defaultdict(int),
             IN_TOK_BY_TYPE: defaultdict(int),
             IN_TOK_BY_USER: defaultdict(int),
             IN_TOK_BY_MODEL: defaultdict(int),
             IN_TOK_BY_MODULE: defaultdict(int),
+            IN_TOK_BY_TASK: defaultdict(int),
             OUT_TOK_BY_TYPE: defaultdict(int),
             OUT_TOK_BY_USER: defaultdict(int),
             OUT_TOK_BY_MODEL: defaultdict(int),
             OUT_TOK_BY_MODULE: defaultdict(int),
+            OUT_TOK_BY_TASK: defaultdict(int),
             TOTAL_TOK_BY_TYPE: defaultdict(int),
             TOTAL_TOK_BY_USER: defaultdict(int),
             TOTAL_TOK_BY_MODEL: defaultdict(int),
             TOTAL_TOK_BY_MODULE: defaultdict(int),
+            TOTAL_TOK_BY_TASK: defaultdict(int),
             TOTAL_COST: 0.0,
             COST_BY_TYPE: defaultdict(float),
             COST_BY_USER: defaultdict(float),
             COST_BY_MODEL: defaultdict(float),
             COST_BY_MODULE: defaultdict(float),
+            COST_BY_TASK: defaultdict(float),
             COST_BY_CHAT: defaultdict(float),
             CACHE_HIT_TOK: 0,
             CACHE_MISS_TOK: 0,
@@ -606,10 +639,12 @@ class StatisticOutputTask(AsyncTask):
             CACHE_HIT_TOK_BY_USER: defaultdict(int),
             CACHE_HIT_TOK_BY_MODEL: defaultdict(int),
             CACHE_HIT_TOK_BY_MODULE: defaultdict(int),
+            CACHE_HIT_TOK_BY_TASK: defaultdict(int),
             CACHE_MISS_TOK_BY_TYPE: defaultdict(int),
             CACHE_MISS_TOK_BY_USER: defaultdict(int),
             CACHE_MISS_TOK_BY_MODEL: defaultdict(int),
             CACHE_MISS_TOK_BY_MODULE: defaultdict(int),
+            CACHE_MISS_TOK_BY_TASK: defaultdict(int),
             TIME_COST_BY_TYPE: time_costs_by_type,
             TIME_COST_BY_USER: time_costs_by_user,
             TIME_COST_BY_MODEL: time_costs_by_model,
@@ -618,10 +653,12 @@ class StatisticOutputTask(AsyncTask):
             AVG_TIME_COST_BY_USER: avg_time_costs_by_user,
             AVG_TIME_COST_BY_MODEL: avg_time_costs_by_model,
             AVG_TIME_COST_BY_MODULE: avg_time_costs_by_module,
+            AVG_TIME_COST_BY_TASK: avg_time_costs_by_task,
             STD_TIME_COST_BY_TYPE: std_time_costs_by_type,
             STD_TIME_COST_BY_USER: std_time_costs_by_user,
             STD_TIME_COST_BY_MODEL: std_time_costs_by_model,
             STD_TIME_COST_BY_MODULE: std_time_costs_by_module,
+            STD_TIME_COST_BY_TASK: std_time_costs_by_task,
             ONLINE_TIME: 0.0,
             TOTAL_MSG_CNT: 0,
             MSG_CNT_BY_CHAT: defaultdict(int),
@@ -647,11 +684,6 @@ class StatisticOutputTask(AsyncTask):
         counter[subkey] += amount
 
     @staticmethod
-    def _append_defaultdict_list(stats_period: StatPeriodData, key: str, subkey: str, value: float) -> None:
-        counter = cast(defaultdict[str, list[float]], stats_period[key])
-        counter[subkey].append(value)
-
-    @staticmethod
     def _collect_model_request_for_period(collect_period: list[tuple[str, datetime]]) -> StatPeriodMapping:
         """
         收集指定时间段的LLM请求统计数据
@@ -666,6 +698,16 @@ class StatisticOutputTask(AsyncTask):
 
         stats: StatPeriodMapping = {
             period_key: StatisticOutputTask._build_stat_period_data() for period_key, _ in collect_period
+        }
+        duration_stats: dict[str, dict[str, defaultdict[str, dict[str, float]]]] = {
+            period_key: {
+                "type": defaultdict(lambda: {"count": 0.0, "mean": 0.0, "m2": 0.0}),
+                "user": defaultdict(lambda: {"count": 0.0, "mean": 0.0, "m2": 0.0}),
+                "model": defaultdict(lambda: {"count": 0.0, "mean": 0.0, "m2": 0.0}),
+                "module": defaultdict(lambda: {"count": 0.0, "mean": 0.0, "m2": 0.0}),
+                "task": defaultdict(lambda: {"count": 0.0, "mean": 0.0, "m2": 0.0}),
+            }
+            for period_key, _ in collect_period
         }
 
         # 以最早的时间戳为起始时间获取记录
@@ -688,11 +730,14 @@ class StatisticOutputTask(AsyncTask):
 
                         # 提取模块名：如果请求类型包含"."，取第一个"."之前的部分
                         module_name = request_type.split(".")[0] if "." in request_type else request_type
+                        # 历史记录可能没有任务名，单独归为未记录，不根据请求前缀或当前配置推断。
+                        task_name = cast(str | None, record.get("task_name")) or "未记录"
 
                         StatisticOutputTask._add_defaultdict_int(stats[period_key], REQ_CNT_BY_TYPE, request_type, 1)
                         StatisticOutputTask._add_defaultdict_int(stats[period_key], REQ_CNT_BY_USER, user_id, 1)
                         StatisticOutputTask._add_defaultdict_int(stats[period_key], REQ_CNT_BY_MODEL, model_name, 1)
                         StatisticOutputTask._add_defaultdict_int(stats[period_key], REQ_CNT_BY_MODULE, module_name, 1)
+                        StatisticOutputTask._add_defaultdict_int(stats[period_key], REQ_CNT_BY_TASK, task_name, 1)
 
                         prompt_tokens = cast(int | None, record["prompt_tokens"]) or 0
                         completion_tokens = cast(int | None, record["completion_tokens"]) or 0
@@ -719,6 +764,9 @@ class StatisticOutputTask(AsyncTask):
                         StatisticOutputTask._add_defaultdict_int(
                             stats[period_key], IN_TOK_BY_MODULE, module_name, prompt_tokens
                         )
+                        StatisticOutputTask._add_defaultdict_int(
+                            stats[period_key], IN_TOK_BY_TASK, task_name, prompt_tokens
+                        )
 
                         StatisticOutputTask._add_defaultdict_int(
                             stats[period_key], OUT_TOK_BY_TYPE, request_type, completion_tokens
@@ -732,6 +780,9 @@ class StatisticOutputTask(AsyncTask):
                         StatisticOutputTask._add_defaultdict_int(
                             stats[period_key], OUT_TOK_BY_MODULE, module_name, completion_tokens
                         )
+                        StatisticOutputTask._add_defaultdict_int(
+                            stats[period_key], OUT_TOK_BY_TASK, task_name, completion_tokens
+                        )
 
                         StatisticOutputTask._add_defaultdict_int(
                             stats[period_key], TOTAL_TOK_BY_TYPE, request_type, total_tokens
@@ -744,6 +795,9 @@ class StatisticOutputTask(AsyncTask):
                         )
                         StatisticOutputTask._add_defaultdict_int(
                             stats[period_key], TOTAL_TOK_BY_MODULE, module_name, total_tokens
+                        )
+                        StatisticOutputTask._add_defaultdict_int(
+                            stats[period_key], TOTAL_TOK_BY_TASK, task_name, total_tokens
                         )
 
                         StatisticOutputTask._add_int_stat(stats[period_key], CACHE_HIT_TOK, prompt_cache_hit_tokens)
@@ -761,6 +815,9 @@ class StatisticOutputTask(AsyncTask):
                             stats[period_key], CACHE_HIT_TOK_BY_MODULE, module_name, prompt_cache_hit_tokens
                         )
                         StatisticOutputTask._add_defaultdict_int(
+                            stats[period_key], CACHE_HIT_TOK_BY_TASK, task_name, prompt_cache_hit_tokens
+                        )
+                        StatisticOutputTask._add_defaultdict_int(
                             stats[period_key], CACHE_MISS_TOK_BY_TYPE, request_type, prompt_cache_miss_tokens
                         )
                         StatisticOutputTask._add_defaultdict_int(
@@ -772,6 +829,9 @@ class StatisticOutputTask(AsyncTask):
                         StatisticOutputTask._add_defaultdict_int(
                             stats[period_key], CACHE_MISS_TOK_BY_MODULE, module_name, prompt_cache_miss_tokens
                         )
+                        StatisticOutputTask._add_defaultdict_int(
+                            stats[period_key], CACHE_MISS_TOK_BY_TASK, task_name, prompt_cache_miss_tokens
+                        )
 
                         cost = cast(float | None, record["cost"]) or 0.0
                         StatisticOutputTask._add_float_stat(stats[period_key], TOTAL_COST, cost)
@@ -779,51 +839,47 @@ class StatisticOutputTask(AsyncTask):
                         StatisticOutputTask._add_defaultdict_float(stats[period_key], COST_BY_USER, user_id, cost)
                         StatisticOutputTask._add_defaultdict_float(stats[period_key], COST_BY_MODEL, model_name, cost)
                         StatisticOutputTask._add_defaultdict_float(stats[period_key], COST_BY_MODULE, module_name, cost)
+                        StatisticOutputTask._add_defaultdict_float(stats[period_key], COST_BY_TASK, task_name, cost)
                         StatisticOutputTask._add_defaultdict_float(stats[period_key], COST_BY_CHAT, chat_cost_key, cost)
 
                         # 收集time_cost数据
                         time_cost = cast(float | None, record["time_cost"]) or 0.0
                         if time_cost > 0:  # 只记录有效的time_cost
-                            StatisticOutputTask._append_defaultdict_list(
-                                stats[period_key], TIME_COST_BY_TYPE, request_type, time_cost
-                            )
-                            StatisticOutputTask._append_defaultdict_list(
-                                stats[period_key], TIME_COST_BY_USER, user_id, time_cost
-                            )
-                            StatisticOutputTask._append_defaultdict_list(
-                                stats[period_key], TIME_COST_BY_MODEL, model_name, time_cost
-                            )
-                            StatisticOutputTask._append_defaultdict_list(
-                                stats[period_key], TIME_COST_BY_MODULE, module_name, time_cost
-                            )
+                            for category, item_name in [
+                                ("type", request_type),
+                                ("user", user_id),
+                                ("model", model_name),
+                                ("module", module_name),
+                                ("task", task_name),
+                            ]:
+                                item_stats = duration_stats[period_key][category][item_name]
+                                item_stats["count"] += 1
+                                delta = time_cost - item_stats["mean"]
+                                item_stats["mean"] += delta / item_stats["count"]
+                                item_stats["m2"] += delta * (time_cost - item_stats["mean"])
                     break
 
         # 计算平均耗时和标准差
         for period_key in stats:
-            for category in [REQ_CNT_BY_TYPE, REQ_CNT_BY_USER, REQ_CNT_BY_MODEL, REQ_CNT_BY_MODULE]:
-                time_cost_key = f"time_costs_by_{category.split('_')[-1]}"
-                avg_key = f"avg_time_costs_by_{category.split('_')[-1]}"
-                std_key = f"std_time_costs_by_{category.split('_')[-1]}"
-
-                category_data = cast(dict[str, int], stats[period_key].get(category, {}))
-                time_cost_data = cast(dict[str, list[float]], stats[period_key].get(time_cost_key, {}))
+            for category, request_count_key, avg_key, std_key in [
+                ("type", REQ_CNT_BY_TYPE, AVG_TIME_COST_BY_TYPE, STD_TIME_COST_BY_TYPE),
+                ("user", REQ_CNT_BY_USER, AVG_TIME_COST_BY_USER, STD_TIME_COST_BY_USER),
+                ("model", REQ_CNT_BY_MODEL, AVG_TIME_COST_BY_MODEL, STD_TIME_COST_BY_MODEL),
+                ("module", REQ_CNT_BY_MODULE, AVG_TIME_COST_BY_MODULE, STD_TIME_COST_BY_MODULE),
+                ("task", REQ_CNT_BY_TASK, AVG_TIME_COST_BY_TASK, STD_TIME_COST_BY_TASK),
+            ]:
+                category_data = cast(dict[str, int], stats[period_key].get(request_count_key, {}))
                 avg_cost_data = cast(dict[str, float], stats[period_key].get(avg_key, {}))
                 std_cost_data = cast(dict[str, float], stats[period_key].get(std_key, {}))
 
                 for item_name in category_data:
-                    time_costs = time_cost_data.get(item_name, [])
-                    if time_costs:
-                        # 计算平均耗时
-                        avg_time_cost = sum(time_costs) / len(time_costs)
+                    item_stats = duration_stats[period_key][category].get(item_name)
+                    if item_stats and item_stats["count"] > 0:
+                        count = item_stats["count"]
+                        avg_time_cost = item_stats["mean"]
                         avg_cost_data[item_name] = round(avg_time_cost, 3)
-
-                        # 计算标准差
-                        if len(time_costs) > 1:
-                            variance = sum((x - avg_time_cost) ** 2 for x in time_costs) / len(time_costs)
-                            std_time_cost = variance**0.5
-                            std_cost_data[item_name] = round(std_time_cost, 3)
-                        else:
-                            std_cost_data[item_name] = 0.0
+                        variance = max(item_stats["m2"] / count, 0.0)
+                        std_cost_data[item_name] = round(variance**0.5, 3)
                     else:
                         avg_cost_data[item_name] = 0.0
                         std_cost_data[item_name] = 0.0
@@ -937,7 +993,11 @@ class StatisticOutputTask(AsyncTask):
         last_all_time_stat: dict[str, object] | None = None
 
         try:
-            if "last_full_statistics" in local_storage:
+            # 新增任务维度后旧缓存缺少此数据，首次刷新重新收集完整历史。
+            if (
+                "last_full_statistics" in local_storage
+                and REQ_CNT_BY_TASK in local_storage["last_full_statistics"]["stat_data"]
+            ):
                 # 如果存在上次完整统计数据，则使用该数据进行增量统计
                 last_stat = cast(dict[str, object], local_storage["last_full_statistics"])
 
@@ -1036,34 +1096,40 @@ class StatisticOutputTask(AsyncTask):
             "user": defaultdict(lambda: {"count": 0.0, "sum": 0.0, "sum_sq": 0.0}),
             "model": defaultdict(lambda: {"count": 0.0, "sum": 0.0, "sum_sq": 0.0}),
             "module": defaultdict(lambda: {"count": 0.0, "sum": 0.0, "sum_sq": 0.0}),
+            "task": defaultdict(lambda: {"count": 0.0, "sum": 0.0, "sum_sq": 0.0}),
         }
 
-        # 在 SQLite 内聚合，避免每轮为历史请求创建整份 Python 明细。
         records = fetch_model_duration_aggregates_since(self.all_time_start_time)
         for record in records:
-
             request_type = cast(str | None, record["request_type"]) or "unknown"
             user_id = cast(str | None, record["model_api_provider_name"]) or "unknown"
             model_assign_name = cast(str | None, record["model_assign_name"])
             model_name = model_assign_name or cast(str | None, record["model_name"]) or "unknown"
             module_name = request_type.split(".")[0] if "." in request_type else request_type
+            # 历史记录可能没有任务名，单独归为未记录，不根据请求前缀或当前配置推断。
+            task_name = cast(str | None, record.get("task_name")) or "未记录"
+            count = float(cast(int, record["count"]))
+            time_cost_sum = cast(float, record["sum"])
+            time_cost_sq_sum = cast(float, record["sum_sq"])
 
             for category, item_name in [
                 ("type", request_type),
                 ("user", user_id),
                 ("model", model_name),
                 ("module", module_name),
+                ("task", task_name),
             ]:
                 item_stats = duration_stats[category][item_name]
-                item_stats["count"] += cast(int, record["count"])
-                item_stats["sum"] += cast(float, record["sum"])
-                item_stats["sum_sq"] += cast(float, record["sum_sq"])
+                item_stats["count"] += count
+                item_stats["sum"] += time_cost_sum
+                item_stats["sum_sq"] += time_cost_sq_sum
 
         for category, avg_key, std_key in [
             ("type", AVG_TIME_COST_BY_TYPE, STD_TIME_COST_BY_TYPE),
             ("user", AVG_TIME_COST_BY_USER, STD_TIME_COST_BY_USER),
             ("model", AVG_TIME_COST_BY_MODEL, STD_TIME_COST_BY_MODEL),
             ("module", AVG_TIME_COST_BY_MODULE, STD_TIME_COST_BY_MODULE),
+            ("task", AVG_TIME_COST_BY_TASK, STD_TIME_COST_BY_TASK),
         ]:
             avg_data = cast(defaultdict[str, float], stat_data[avg_key])
             std_data = cast(defaultdict[str, float], stat_data[std_key])
@@ -1127,6 +1193,8 @@ class StatisticOutputTask(AsyncTask):
         """
         # 计算总token数（从所有模型的token数中累加）
         total_tokens = sum(stats[TOTAL_TOK_BY_MODEL].values()) if stats[TOTAL_TOK_BY_MODEL] else 0
+        total_input_tokens = sum(stats[IN_TOK_BY_MODEL].values()) if stats[IN_TOK_BY_MODEL] else 0
+        total_output_tokens = sum(stats[OUT_TOK_BY_MODEL].values()) if stats[OUT_TOK_BY_MODEL] else 0
         cache_hit_tokens = cast(int, stats.get(CACHE_HIT_TOK, 0))
         cache_miss_tokens = cast(int, stats.get(CACHE_MISS_TOK, 0))
 
@@ -1158,8 +1226,11 @@ class StatisticOutputTask(AsyncTask):
             f"总回复数: {_format_large_number(total_replies)}",
             f"总请求数: {_format_large_number(stats[TOTAL_REQ_CNT])}",
             f"总Token数: {_format_large_number(total_tokens)}",
+            f"总输入Token: {_format_large_number(total_input_tokens)}",
+            f"总输出Token: {_format_large_number(total_output_tokens)}",
             f"Prompt缓存命中率: {_format_cache_hit_rate(cache_hit_tokens, cache_miss_tokens)}",
             f"Prompt缓存命中Token: {_format_large_number(cache_hit_tokens)}",
+            f"Prompt缓存未命中Token: {_format_large_number(cache_miss_tokens)}",
             f"总花费: {stats[TOTAL_COST]:.2f}¥",
             f"花费/消息数量: {cost_per_100_messages:.4f}¥/100条" if stats[TOTAL_MSG_CNT] > 0 else "花费/消息数量: N/A",
             f"花费/接受消息数量: {cost_per_100_messages_excluding_replies:.4f}¥/100条"
@@ -1344,6 +1415,244 @@ class StatisticOutputTask(AsyncTask):
 
     # 移除_generate_versions_tab方法
 
+    @staticmethod
+    def _calculate_cache_hit_rate_value(hit_tokens: int, miss_tokens: int) -> float | None:
+        total_cache_tokens = hit_tokens + miss_tokens
+        if total_cache_tokens <= 0:
+            return None
+        return hit_tokens / total_cache_tokens
+
+    @classmethod
+    def _build_breakdown_rows(
+        cls,
+        stat_data: StatPeriodData,
+        dimension: str,
+    ) -> list["DetailedStatisticsBreakdown"]:
+        """将模型、模块或请求类型统计转换为统一的前端表格行。"""
+
+        from src.webui.schemas.statistics import DetailedStatisticsBreakdown
+
+        dimension_keys = {
+            "model": (
+                REQ_CNT_BY_MODEL,
+                IN_TOK_BY_MODEL,
+                OUT_TOK_BY_MODEL,
+                TOTAL_TOK_BY_MODEL,
+                CACHE_HIT_TOK_BY_MODEL,
+                CACHE_MISS_TOK_BY_MODEL,
+                COST_BY_MODEL,
+                AVG_TIME_COST_BY_MODEL,
+                STD_TIME_COST_BY_MODEL,
+            ),
+            "module": (
+                REQ_CNT_BY_MODULE,
+                IN_TOK_BY_MODULE,
+                OUT_TOK_BY_MODULE,
+                TOTAL_TOK_BY_MODULE,
+                CACHE_HIT_TOK_BY_MODULE,
+                CACHE_MISS_TOK_BY_MODULE,
+                COST_BY_MODULE,
+                AVG_TIME_COST_BY_MODULE,
+                STD_TIME_COST_BY_MODULE,
+            ),
+            "task": (
+                REQ_CNT_BY_TASK,
+                IN_TOK_BY_TASK,
+                OUT_TOK_BY_TASK,
+                TOTAL_TOK_BY_TASK,
+                CACHE_HIT_TOK_BY_TASK,
+                CACHE_MISS_TOK_BY_TASK,
+                COST_BY_TASK,
+                AVG_TIME_COST_BY_TASK,
+                STD_TIME_COST_BY_TASK,
+            ),
+            "request_type": (
+                REQ_CNT_BY_TYPE,
+                IN_TOK_BY_TYPE,
+                OUT_TOK_BY_TYPE,
+                TOTAL_TOK_BY_TYPE,
+                CACHE_HIT_TOK_BY_TYPE,
+                CACHE_MISS_TOK_BY_TYPE,
+                COST_BY_TYPE,
+                AVG_TIME_COST_BY_TYPE,
+                STD_TIME_COST_BY_TYPE,
+            ),
+        }
+        if dimension not in dimension_keys:
+            raise ValueError(f"不支持的详细统计维度: {dimension}")
+
+        (
+            request_key,
+            input_key,
+            output_key,
+            token_key,
+            cache_hit_key,
+            cache_miss_key,
+            cost_key,
+            avg_time_key,
+            std_time_key,
+        ) = dimension_keys[dimension]
+        request_counts = cast(dict[str, int], stat_data[request_key])
+        total_replies = int(stat_data.get(TOTAL_REPLY_CNT, 0))
+
+        rows = []
+        for name, request_count in sorted(request_counts.items()):
+            input_tokens = cast(dict[str, int], stat_data[input_key])[name]
+            output_tokens = cast(dict[str, int], stat_data[output_key])[name]
+            total_tokens = cast(dict[str, int], stat_data[token_key])[name]
+            cache_hit_tokens = cast(dict[str, int], stat_data[cache_hit_key])[name]
+            cache_miss_tokens = cast(dict[str, int], stat_data[cache_miss_key])[name]
+            rows.append(
+                DetailedStatisticsBreakdown(
+                    name=name,
+                    request_count=request_count,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=total_tokens,
+                    cache_hit_tokens=cache_hit_tokens,
+                    cache_miss_tokens=cache_miss_tokens,
+                    cache_hit_rate=cls._calculate_cache_hit_rate_value(cache_hit_tokens, cache_miss_tokens),
+                    total_cost=cast(dict[str, float], stat_data[cost_key])[name],
+                    avg_time_cost=cast(dict[str, float], stat_data[avg_time_key])[name],
+                    std_time_cost=cast(dict[str, float], stat_data[std_time_key])[name],
+                    avg_calls_per_reply=request_count / total_replies if total_replies > 0 else None,
+                    avg_tokens_per_reply=total_tokens / total_replies if total_replies > 0 else None,
+                    avg_tokens_per_call=total_tokens / request_count if request_count > 0 else None,
+                )
+            )
+        return rows
+
+    @staticmethod
+    def _build_distribution_items(values: dict[str, float | int]) -> list["DetailedDistributionItem"]:
+        from src.webui.schemas.statistics import DetailedDistributionItem
+
+        return [
+            DetailedDistributionItem(name=name, value=float(value))
+            for name, value in sorted(values.items())
+        ]
+
+    def _build_period_distributions(
+        self,
+        stat_data: StatPeriodData,
+    ) -> "DetailedStatisticsDistributions":
+        from src.webui.schemas.statistics import DetailedStatisticsDistributions
+
+        chat_messages: defaultdict[str, int] = defaultdict(int)
+        for chat_id, count in stat_data[MSG_CNT_BY_CHAT].items():
+            chat_name = str(self.name_mapping.get(chat_id, ("未知聊天", 0))[0])
+            chat_messages[chat_name] += count
+
+        chat_costs: defaultdict[str, float] = defaultdict(float)
+        for chat_id, cost in stat_data[COST_BY_CHAT].items():
+            chat_name = (
+                "全局"
+                if chat_id == GLOBAL_COST_SESSION_KEY
+                else str(self.name_mapping.get(chat_id, (self._get_chat_display_name_from_id(chat_id), 0))[0])
+            )
+            chat_costs[chat_name] += cost
+        owner_costs = _build_llm_owner_costs(stat_data[COST_BY_TYPE])
+
+        return DetailedStatisticsDistributions(
+            owner_costs=self._build_distribution_items(dict(owner_costs)),
+            model_costs=self._build_distribution_items(dict(stat_data[COST_BY_MODEL])),
+            module_costs=self._build_distribution_items(dict(stat_data[COST_BY_MODULE])),
+            request_type_costs=self._build_distribution_items(dict(stat_data[COST_BY_TYPE])),
+            chat_messages=self._build_distribution_items(chat_messages),
+            chat_costs=self._build_distribution_items(chat_costs),
+        )
+
+    def _build_detailed_statistics_snapshot(
+        self,
+        stat: StatPeriodMapping,
+        now: datetime,
+        chart_data: dict[str, dict[str, object]],
+        metrics_data: dict[str, object],
+    ) -> "DetailedStatisticsData":
+        """构造与当前 HTML 报告完全同源的 WebUI 详细统计快照。"""
+
+        from src.webui.schemas.statistics import (
+            DetailedChatStatistics,
+            DetailedStatisticsData,
+            DetailedStatisticsMetricsData,
+            DetailedStatisticsPeriod,
+            DetailedStatisticsSummary,
+            DetailedStatisticsTrendData,
+        )
+
+        periods = []
+        for period_key, duration, _ in self.stat_period:
+            stat_data = stat[period_key]
+            total_tokens = sum(stat_data[TOTAL_TOK_BY_MODEL].values())
+            input_tokens = sum(stat_data[IN_TOK_BY_MODEL].values())
+            output_tokens = sum(stat_data[OUT_TOK_BY_MODEL].values())
+            cache_hit_tokens = int(stat_data.get(CACHE_HIT_TOK, 0))
+            cache_miss_tokens = int(stat_data.get(CACHE_MISS_TOK, 0))
+            total_messages = int(stat_data[TOTAL_MSG_CNT])
+            total_replies = int(stat_data.get(TOTAL_REPLY_CNT, 0))
+            received_messages = total_messages - total_replies
+            online_hours = stat_data[ONLINE_TIME] / 3600.0
+            period_start_time = self.all_time_start_time if period_key == "all_time" else now - duration
+
+            periods.append(
+                DetailedStatisticsPeriod(
+                    key=period_key,
+                    start_time=period_start_time.isoformat(),
+                    end_time=now.isoformat(),
+                    summary=DetailedStatisticsSummary(
+                        online_time=stat_data[ONLINE_TIME],
+                        total_messages=total_messages,
+                        total_replies=total_replies,
+                        total_requests=stat_data[TOTAL_REQ_CNT],
+                        total_tokens=total_tokens,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        cache_hit_tokens=cache_hit_tokens,
+                        cache_miss_tokens=cache_miss_tokens,
+                        cache_hit_rate=self._calculate_cache_hit_rate_value(
+                            cache_hit_tokens,
+                            cache_miss_tokens,
+                        ),
+                        total_cost=stat_data[TOTAL_COST],
+                        cost_per_100_messages=(
+                            stat_data[TOTAL_COST] / total_messages * 100 if total_messages > 0 else 0.0
+                        ),
+                        cost_per_100_messages_excluding_replies=(
+                            stat_data[TOTAL_COST] / received_messages * 100 if received_messages > 0 else 0.0
+                        ),
+                        cost_per_100_replies=(
+                            stat_data[TOTAL_COST] / total_replies * 100 if total_replies > 0 else 0.0
+                        ),
+                        cost_per_hour=stat_data[TOTAL_COST] / online_hours if online_hours > 0 else 0.0,
+                        tokens_per_hour=total_tokens / online_hours if online_hours > 0 else 0.0,
+                    ),
+                    models=self._build_breakdown_rows(stat_data, "model"),
+                    modules=self._build_breakdown_rows(stat_data, "module"),
+                    task_groups=self._build_breakdown_rows(stat_data, "task"),
+                    request_types=self._build_breakdown_rows(stat_data, "request_type"),
+                    chats=[
+                        DetailedChatStatistics(
+                            name=str(self.name_mapping.get(chat_id, ("未知聊天", 0))[0]),
+                            message_count=count,
+                        )
+                        for chat_id, count in sorted(stat_data[MSG_CNT_BY_CHAT].items())
+                    ],
+                    distributions=self._build_period_distributions(stat_data),
+                )
+            )
+
+        return DetailedStatisticsData(
+            generated_at=now.isoformat(),
+            periods=periods,
+            trends={
+                range_key: DetailedStatisticsTrendData.model_validate(range_data)
+                for range_key, range_data in chart_data.items()
+            },
+            metrics={
+                range_key: DetailedStatisticsMetricsData.model_validate(range_data)
+                for range_key, range_data in metrics_data.items()
+            },
+        )
+
     def _generate_html_report(self, stat: StatPeriodMapping, now: datetime):
         """
         生成HTML格式的统计报告
@@ -1371,6 +1680,8 @@ class StatisticOutputTask(AsyncTask):
 
             # 按模型分类统计
             total_replies = stat_data.get(TOTAL_REPLY_CNT, 0)
+            total_input_tokens = sum(stat_data[IN_TOK_BY_MODEL].values()) if stat_data[IN_TOK_BY_MODEL] else 0
+            total_output_tokens = sum(stat_data[OUT_TOK_BY_MODEL].values()) if stat_data[OUT_TOK_BY_MODEL] else 0
             total_cache_hit_tokens = cast(int, stat_data.get(CACHE_HIT_TOK, 0))
             total_cache_miss_tokens = cast(int, stat_data.get(CACHE_MISS_TOK, 0))
             model_rows = "\n".join(
@@ -1514,12 +1825,24 @@ class StatisticOutputTask(AsyncTask):
                         <div class=\"kpi-value\">{_format_large_number(sum(stat_data[TOTAL_TOK_BY_MODEL].values()) if stat_data[TOTAL_TOK_BY_MODEL] else 0, html=True)}</div>
                     </div>
                     <div class=\"kpi-card\">
+                        <div class=\"kpi-title\">总输入Token</div>
+                        <div class=\"kpi-value\">{_format_large_number(total_input_tokens, html=True)}</div>
+                    </div>
+                    <div class=\"kpi-card\">
+                        <div class=\"kpi-title\">总输出Token</div>
+                        <div class=\"kpi-value\">{_format_large_number(total_output_tokens, html=True)}</div>
+                    </div>
+                    <div class=\"kpi-card\">
                         <div class=\"kpi-title\">Prompt缓存命中率</div>
                         <div class=\"kpi-value\">{_format_cache_hit_rate(total_cache_hit_tokens, total_cache_miss_tokens)}</div>
                     </div>
                     <div class=\"kpi-card\">
                         <div class=\"kpi-title\">Prompt缓存命中Token</div>
                         <div class=\"kpi-value\">{_format_large_number(total_cache_hit_tokens, html=True)}</div>
+                    </div>
+                    <div class=\"kpi-card\">
+                        <div class=\"kpi-title\">Prompt缓存未命中Token</div>
+                        <div class=\"kpi-value\">{_format_large_number(total_cache_miss_tokens, html=True)}</div>
                     </div>
                     <div class=\"kpi-card\">
                         <div class=\"kpi-title\">总花费</div>
@@ -2185,6 +2508,12 @@ class StatisticOutputTask(AsyncTask):
 
         with open(record_file, "w", encoding="utf-8") as f:
             f.write(html_template)
+
+        from src.services.statistics_service import store_detailed_statistics_snapshot
+
+        store_detailed_statistics_snapshot(
+            self._build_detailed_statistics_snapshot(stat, now, chart_data, metrics_data)
+        )
 
     def _generate_chart_data(self, stat: StatPeriodMapping) -> dict[str, dict[str, object]]:
         """生成图表数据"""

@@ -24,16 +24,14 @@ import {
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { useTheme } from '@/components/use-theme'
 
-import { checkAuthStatus } from '@/lib/auth'
+import { checkAuthStatus, getSetupStatus } from '@/lib/auth'
 import { authApi } from '@/lib/http'
 import { cn } from '@/lib/utils'
 import { APP_FULL_NAME } from '@/lib/version'
@@ -80,6 +78,13 @@ function AuthRetroGears() {
   )
 }
 
+function resolvePostAuthTarget(): '/' | '/chat/embed' {
+  if (typeof window === 'undefined') return '/'
+  return new URLSearchParams(window.location.search).get('redirect') === '/chat/embed'
+    ? '/chat/embed'
+    : '/'
+}
+
 export function AuthPage() {
   const [token, setToken] = useState('')
   const [isValidating, setIsValidating] = useState(false)
@@ -91,6 +96,7 @@ export function AuthPage() {
   const showRetroGears = themeConfig.dashboardStyle === 'future-retro'
   // 避免 React StrictMode 下重复触发 URL token 自动登录。
   const urlTokenHandledRef = useRef(false)
+  const tokenAutofocusedRef = useRef(false)
 
   // 从 URL 中提取 token（支持 query 与 hash 两种位置）。
   // 允许 ?token=xxx 、&token=xxx（query）以及 #/foo?token=xxx、#token=xxx（hash）。
@@ -175,6 +181,7 @@ export function AuthPage() {
         const data = await authApi.post<{
           valid: boolean
           is_first_setup?: boolean
+          requires_custom_token?: boolean
           message?: string
         }>('/api/webui/auth/verify', {
           body: { token: trimmed },
@@ -190,10 +197,10 @@ export function AuthPage() {
           await checkAuthStatus()
 
           // 直接使用验证响应中的 is_first_setup 字段，避免额外请求
-          if (data.is_first_setup) {
+          if (data.requires_custom_token || data.is_first_setup) {
             navigate({ to: '/setup' })
           } else {
-            navigate({ to: '/' })
+            navigate({ to: resolvePostAuthTarget() })
           }
           return true
         }
@@ -225,7 +232,13 @@ export function AuthPage() {
         if (isAuth) {
           // 已登录场景下，URL 中残留的 token 也清掉，避免外泄。
           stripTokenFromUrl()
-          navigate({ to: '/' })
+          const setupStatus = await getSetupStatus()
+          navigate({
+            to:
+              setupStatus?.requires_custom_token || setupStatus?.is_first_setup
+                ? '/setup'
+                : resolvePostAuthTarget(),
+          })
           return
         }
 
@@ -279,15 +292,11 @@ export function AuthPage() {
           )}
         </button>
 
-        <CardHeader className="space-y-4 text-center">
-          {/* Logo/Icon */}
-          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-2xl bg-primary/10">
-            <Lock className="h-8 w-8 text-primary" strokeWidth={2} fill="none" />
-          </div>
-
+        <CardHeader className="pr-16 text-left">
           <div className="space-y-2">
             <CardTitle className="text-2xl font-bold">{t('auth.welcome')}</CardTitle>
-            <CardDescription className="text-base">
+            <CardDescription className="flex items-center gap-2 text-base">
+              <span aria-hidden="true" className="font-mono text-primary">&gt;</span>
               {t('auth.accessDesc')}
             </CardDescription>
           </div>
@@ -297,20 +306,23 @@ export function AuthPage() {
           <form onSubmit={handleSubmit} className="space-y-4">
             {/* Token 输入框 */}
             <div className="space-y-2">
-              <Label htmlFor="token" className="text-sm font-medium">
-                Access Token
-              </Label>
               <div className="relative">
                 <Key className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" strokeWidth={2} fill="none" />
                 <Input
                   id="token"
+                  aria-label="Access Token"
                   type="password"
                   placeholder={t('auth.tokenPlaceholder')}
                   value={token}
                   onChange={(e) => setToken(e.target.value)}
                   className={cn('pl-10', error && 'border-red-500 focus-visible:ring-red-500')}
                   disabled={isValidating}
-                  autoFocus
+                  ref={(element) => {
+                    if (element && !tokenAutofocusedRef.current) {
+                      tokenAutofocusedRef.current = true
+                      element.focus()
+                    }
+                  }}
                   autoComplete="off"
                   aria-invalid={error ? true : undefined}
                   aria-describedby={error ? 'token-error' : undefined}
@@ -341,8 +353,8 @@ export function AuthPage() {
             {/* 帮助文本 */}
             <Dialog>
               <DialogTrigger asChild>
-                <button className="w-full text-center text-sm text-primary hover:text-primary/80 transition-colors underline-offset-4 hover:underline flex items-center justify-center gap-1">
-                  <HelpCircle className="h-4 w-4" strokeWidth={2} fill="none" />
+                <button className="flex w-full items-center justify-start gap-1 text-left text-[11px] text-primary transition-colors underline-offset-4 hover:text-primary/80 hover:underline">
+                  <HelpCircle className="h-3 w-3" strokeWidth={2} fill="none" />
                   {t('auth.helpLink')}
                 </button>
               </DialogTrigger>
@@ -352,9 +364,6 @@ export function AuthPage() {
                     <Lock className="h-5 w-5 text-primary" strokeWidth={2} fill="none" />
                     {t('auth.helpTitle')}
                   </DialogTitle>
-                  <DialogDescription>
-                    {t('auth.helpDesc')}
-                  </DialogDescription>
                 </DialogHeader>
 
                 <div className="space-y-4">
@@ -395,17 +404,11 @@ export function AuthPage() {
                   </div>
 
                   {/* 安全提示 */}
-                  <div className="rounded-lg border border-yellow-200 dark:border-yellow-900 bg-yellow-50 dark:bg-yellow-950/30 p-3">
-                    <div className="flex gap-2">
-                      <AlertCircle className="h-4 w-4 text-yellow-600 dark:text-yellow-500 flex-shrink-0 mt-0.5" strokeWidth={2} fill="none" />
-                      <div className="text-sm text-yellow-800 dark:text-yellow-300 space-y-1">
-                        <p className="font-semibold">{t('auth.securityTipTitle')}</p>
-                        <ul className="list-disc list-inside space-y-0.5 text-xs">
-                          <li>{t('auth.securityTip1')}</li>
-                          <li>{t('auth.securityTip2')}</li>
-                        </ul>
-                      </div>
-                    </div>
+                  <div className="text-xs text-muted-foreground">
+                    <ul className="list-disc list-inside space-y-1">
+                      <li>{t('auth.securityTip1')}</li>
+                      <li>{t('auth.securityTip2')}</li>
+                    </ul>
                   </div>
                 </div>
               </DialogContent>

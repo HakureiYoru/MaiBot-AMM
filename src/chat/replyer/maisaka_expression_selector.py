@@ -20,11 +20,12 @@ from src.learners.expression_style_utils import (
     normalize_expression_style_for_learning,
 )
 from src.learners.learner_utils_old import weighted_sample
-from src.maisaka.context.messages import LLMContextMessage
+from src.maisaka.context.messages import LLMContextMessage, ModelOutputContextMessage, SessionBackedMessage
 
 logger = get_logger("maisaka_expression_selector")
 
 SubAgentRunner = Callable[[str], Awaitable[str]]
+MAX_SELECTED_EXPRESSIONS = 5
 
 
 @dataclass
@@ -229,41 +230,35 @@ class MaisakaExpressionSelector:
     def _build_expression_query_text(
         reply_reason: str,
         reply_tool_args: Optional[dict[str, Any]],
-        *,
-        use_expression_intent: bool,
     ) -> str:
         """构建表达检索与精排共用的匹配依据文本。"""
 
         query_parts: List[str] = []
-        expression_intent_block = (
-            MaisakaExpressionSelector._format_expression_intent(reply_tool_args)
-            if use_expression_intent
-            else ""
-        )
+        expression_intent_block = MaisakaExpressionSelector._format_expression_intent(reply_tool_args)
         if expression_intent_block:
             query_parts.append(expression_intent_block)
 
-        normalized_reply_reason = str(reply_reason or "").strip()
-        if normalized_reply_reason:
-            query_parts.append(f"Planner 推理：\n{normalized_reply_reason}")
-        elif isinstance(reply_tool_args, dict):
-            reply_guide = str(reply_tool_args.get("reply_guide") or "").strip()
-            if reply_guide:
-                query_parts.append(f"回复指引：\n{reply_guide}")
+        reference_parts: List[str] = []
+        if isinstance(reply_tool_args, dict):
+            reply_reference = str(reply_tool_args.get("reply_reference") or "").strip()
+            if reply_reference:
+                reference_parts.append(f"回复信息参考：\n{reply_reference}")
+        if reference_parts:
+            query_parts.extend(reference_parts)
+        else:
+            normalized_reply_reason = str(reply_reason or "").strip()
+            if normalized_reply_reason:
+                query_parts.append(f"Planner 推理：\n{normalized_reply_reason}")
 
         return "\n\n".join(query_parts)
 
     @staticmethod
     def _use_vector_candidate_pool() -> bool:
-        return global_config.expression.expression_selection_mode in {"vector", "vector_intent"}
+        return global_config.expression.use_vector_expression
 
     @staticmethod
     def _has_embedding_model_configured() -> bool:
         return any(model_name.strip() for model_name in model_config.model_task_config.embedding.model_list)
-
-    @staticmethod
-    def _use_expression_intent() -> bool:
-        return global_config.expression.expression_selection_mode == "vector_intent"
 
     def _build_selector_prompt(
         self,
@@ -278,7 +273,7 @@ class MaisakaExpressionSelector:
         return (
             "你是 Maisaka 的表达方式选择子代理。\n"
             "你只负责根据下方真实聊天上下文，为这一次可见回复挑选最合适的表达方式。\n"
-            "请只从下面候选中选择 0 到 5 条最适合当前语境的表达方式。\n"
+            f"请只从下面候选中选择 0 到 {MAX_SELECTED_EXPRESSIONS} 条最适合当前语境的表达方式。\n"
             "优先考虑自然、贴合上下文、不生硬、不模板化。\n"
             "如果没有明显合适的，就返回空数组。\n"
             '严格只输出 JSON，对象格式为 {"selected_ids":[123,456]}。\n\n'
@@ -310,7 +305,7 @@ class MaisakaExpressionSelector:
             if candidate_id not in candidate_map or candidate_id in selected_ids:
                 continue
             selected_ids.append(candidate_id)
-            if len(selected_ids) >= 3:
+            if len(selected_ids) >= MAX_SELECTED_EXPRESSIONS:
                 break
         return selected_ids
 
@@ -353,11 +348,16 @@ class MaisakaExpressionSelector:
     @staticmethod
     def _serialize_context_message(message: LLMContextMessage) -> dict[str, Any]:
         timestamp = message.timestamp.isoformat() if isinstance(message.timestamp, datetime) else ""
+        # chat_history 还含表情候选快照、工具结果等没有 source_kind 字段的消息，这些消息改用基类的 source。
+        if isinstance(message, (SessionBackedMessage, ModelOutputContextMessage)):
+            source_kind = message.source_kind
+        else:
+            source_kind = message.source
         return {
             "role": message.role,
             "text": message.processed_plain_text or "",
             "timestamp": timestamp,
-            "source_kind": message.source_kind,
+            "source_kind": source_kind,
         }
 
     @staticmethod
@@ -492,16 +492,21 @@ class MaisakaExpressionSelector:
             expression_query_text = self._build_expression_query_text(
                 reply_reason,
                 reply_tool_args,
-                use_expression_intent=self._use_expression_intent(),
             )
-            vector_candidates = await expression_vector_index.select_candidates(
-                index_path=global_config.expression.expression_vector_index_path,
-                session_id=session_id,
-                query_text=expression_query_text,
-                scoped_candidates=all_candidates,
-                candidate_pool_size=global_config.expression.expression_vector_candidate_pool_size,
-                cluster_pool_size=self._VECTOR_CLUSTER_POOL_SIZE,
-            )
+            try:
+                vector_candidates = await expression_vector_index.select_candidates(
+                    index_path=global_config.expression.expression_vector_index_path,
+                    session_id=session_id,
+                    query_text=expression_query_text,
+                    scoped_candidates=all_candidates,
+                    candidate_pool_size=global_config.expression.expression_vector_candidate_pool_size,
+                    cluster_pool_size=self._VECTOR_CLUSTER_POOL_SIZE,
+                )
+            except Exception:
+                logger.exception(
+                    f"表达方式向量候选构建失败，回退随手候选: session_id={session_id}"
+                )
+                return self._sample_legacy_expression_candidates(all_candidates)
             if vector_candidates:
                 logger.debug(
                     f"表达方式向量候选池完成：session_id={session_id} "

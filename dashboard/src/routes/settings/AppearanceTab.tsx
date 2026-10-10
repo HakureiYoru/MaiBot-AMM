@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import {
   AlertTriangle,
   Download,
+  Keyboard,
   Monitor,
   Moon,
   RotateCcw,
@@ -16,6 +17,7 @@ import { useAnimation } from '@/hooks/use-animation'
 import { useTheme } from '@/components/use-theme'
 import { useToast } from '@/hooks/use-toast'
 import { cn } from '@/lib/utils'
+import { buildFutureRetroTexture } from '@/lib/theme/future-retro'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Input } from '@/components/ui/input'
@@ -30,11 +32,19 @@ import {
   defaultLightTokens,
 } from '@/lib/theme/tokens'
 import { exportThemeJSON, importThemeJSON } from '@/lib/theme/storage'
+import {
+  loadMillenniumCjkFont,
+  loadMillenniumFont,
+  saveMillenniumCjkFont,
+  saveMillenniumFont,
+} from '@/lib/theme/millennium-font'
+import type { MillenniumCjkFont, MillenniumFont } from '@/lib/theme/millennium-font'
 import type {
   BackgroundConfigMap,
   BackgroundEffects,
   DashboardStyle,
   FutureRetroStyleConfig,
+  FutureRetroTextureStyle,
   ThemeTokens,
   TypographyTokens,
 } from '@/lib/theme/tokens'
@@ -73,6 +83,80 @@ import { hslToHex } from './types'
 
 type ThemeMode = 'light' | 'dark' | 'system'
 
+const millenniumFontOptions: Array<{
+  value: MillenniumFont
+  label: string
+  description: string
+  fontFamily: string
+  sample: string
+}> = [
+  {
+    value: 'departure',
+    label: 'Departure Mono',
+    description: '默认，等宽，笔画结实',
+    fontFamily: "'Departure Mono', sans-serif",
+    sample: '0123456789 1,284 72.5%',
+  },
+  {
+    value: 'jersey',
+    label: 'Jersey 20',
+    description: '比例像素字，数字清楚、笔画粗',
+    fontFamily: "'Jersey 20', sans-serif",
+    sample: '0123456789 1,284 72.5%',
+  },
+]
+
+const millenniumCjkFontOptions: Array<{
+  value: MillenniumCjkFont
+  label: string
+  description: string
+  fontFamily: string
+  sample: string
+}> = [
+  {
+    value: 'default',
+    label: '默认字体',
+    description: '系统黑体，清晰易读',
+    fontFamily: "'Noto Sans SC', 'Microsoft YaHei UI', sans-serif",
+    sample: '麦麦控制台 运行时长',
+  },
+  {
+    value: 'ark',
+    label: 'Ark Pixel 12px',
+    description: '方舟像素，12px 点阵中文',
+    fontFamily: "'Ark Pixel 12px SC', sans-serif",
+    sample: '麦麦控制台 运行时长',
+  },
+]
+
+function MillenniumFontCard({
+  option,
+  selected,
+  onSelect,
+}: {
+  option: { label: string; description: string; fontFamily: string; sample: string }
+  selected: boolean
+  onSelect: () => void
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={selected}
+      onClick={onSelect}
+      className={cn(
+        'bg-card hover:border-primary/70 hover:bg-accent/40 rounded-lg border p-4 text-left transition-all',
+        selected && 'border-primary bg-primary/10 shadow-sm'
+      )}
+    >
+      <div className="font-semibold">{option.label}</div>
+      <div className="mt-2 text-2xl leading-tight" style={{ fontFamily: option.fontFamily }}>
+        {option.sample}
+      </div>
+      <p className="text-muted-foreground mt-1 text-sm">{option.description}</p>
+    </button>
+  )
+}
+
 const dashboardStyleOptions: Array<{
   value: DashboardStyle
   label: string
@@ -90,6 +174,12 @@ const dashboardStyleOptions: Array<{
     label: '未来复古',
     description: '使用一键包外壳同款纸面颗粒、硬朗描边和切角面板。',
     icon: ScanLine,
+  },
+  {
+    value: 'millennium',
+    label: '千禧',
+    description: '米黄塑料机壳、键帽按钮和下沉屏幕，夜间模式是关灯后的炭灰机壳。',
+    icon: Keyboard,
   },
 ]
 
@@ -119,6 +209,17 @@ const themeModeOptions: Array<{
   },
 ]
 
+const futureRetroTextureOptions: Array<{
+  value: FutureRetroTextureStyle
+  labelKey: string
+}> = [
+  { value: 'fine', labelKey: 'settings.appearance.retroTextureFine' },
+  { value: 'coarse', labelKey: 'settings.appearance.retroTextureCoarse' },
+  { value: 'dot-grid', labelKey: 'settings.appearance.retroTextureDots' },
+  { value: 'ruled', labelKey: 'settings.appearance.retroTextureRuled' },
+  { value: 'none', labelKey: 'settings.appearance.retroTextureNone' },
+]
+
 /**
  * 安全访问当前风格 token 覆盖中的子属性值
  * @param overrides - Partial<ThemeTokens>
@@ -138,7 +239,9 @@ function getTokenValue<T>(
   return (sectionTokens[key] ?? defaultValue) as T
 }
 
-function buildFontSizeTokens(basePx: number): Pick<
+function buildFontSizeTokens(
+  basePx: number
+): Pick<
   TypographyTokens,
   | 'font-size-xs'
   | 'font-size-sm'
@@ -170,6 +273,8 @@ export function AppearanceTab() {
     [dashboardStyle, themeConfig.styleBackgroundConfig]
   )
 
+  const [millenniumFont, setMillenniumFont] = useState(loadMillenniumFont)
+  const [millenniumCjkFont, setMillenniumCjkFont] = useState(loadMillenniumCjkFont)
   const [localCSS, setLocalCSS] = useState(activeCustomCSS)
   const [accentInputValue, setAccentInputValue] = useState(() => {
     if (themeConfig.accentColor) {
@@ -518,7 +623,9 @@ export function AppearanceTab() {
                   <Icon
                     className={cn(
                       'h-4 w-4 transition-colors',
-                      selected ? 'text-primary' : 'text-muted-foreground group-hover:text-foreground'
+                      selected
+                        ? 'text-primary'
+                        : 'text-muted-foreground group-hover:text-foreground'
                     )}
                     strokeWidth={2}
                   />
@@ -536,7 +643,7 @@ export function AppearanceTab() {
       {/* 界面风格 */}
       <div>
         <h3 className="mb-3 text-base font-semibold sm:mb-4 sm:text-lg">界面风格</h3>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3">
           {dashboardStyleOptions.map((option) => {
             const Icon = option.icon
             const selected = themeConfig.dashboardStyle === option.value
@@ -571,6 +678,49 @@ export function AppearanceTab() {
           })}
         </div>
       </div>
+
+      {themeConfig.dashboardStyle === 'millennium' && (
+        <div className="space-y-6">
+          <div>
+            <h3 className="mb-1 text-base font-semibold sm:text-lg">像素字体 · 英文与数字</h3>
+            <p className="text-muted-foreground mb-3 text-sm sm:mb-4">
+              千禧风格里英文和数字使用的字体，切换后立即生效。
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
+              {millenniumFontOptions.map((option) => (
+                <MillenniumFontCard
+                  key={option.value}
+                  option={option}
+                  selected={millenniumFont === option.value}
+                  onSelect={() => {
+                    setMillenniumFont(option.value)
+                    saveMillenniumFont(option.value)
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+          <div>
+            <h3 className="mb-1 text-base font-semibold sm:text-lg">像素字体 · 中文</h3>
+            <p className="text-muted-foreground mb-3 text-sm sm:mb-4">
+              千禧风格里中文使用的字体，切换后立即生效。
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
+              {millenniumCjkFontOptions.map((option) => (
+                <MillenniumFontCard
+                  key={option.value}
+                  option={option}
+                  selected={millenniumCjkFont === option.value}
+                  onSelect={() => {
+                    setMillenniumCjkFont(option.value)
+                    saveMillenniumCjkFont(option.value)
+                  }}
+                />
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {themeConfig.dashboardStyle === 'modern' && (
         <>
@@ -756,9 +906,7 @@ export function AppearanceTab() {
                     <div className="space-y-4">
                       <div className="flex justify-between">
                         <Label>{t('settings.appearance.baseFontSize')}</Label>
-                        <span className="text-muted-foreground text-sm">
-                          {baseFontSizePx}px
-                        </span>
+                        <span className="text-muted-foreground text-sm">{baseFontSizePx}px</span>
                       </div>
                       <Slider
                         defaultValue={[16]}
@@ -1154,78 +1302,168 @@ export function AppearanceTab() {
       {themeConfig.dashboardStyle === 'future-retro' && (
         <div>
           <div className="mb-3 flex items-center justify-between gap-3 sm:mb-4">
-            <h3 className="text-base font-semibold sm:text-lg">未来复古配置</h3>
+            <div>
+              <h3 className="text-base font-semibold sm:text-lg">
+                {t('settings.appearance.retroConfig')}
+              </h3>
+              <p className="text-muted-foreground mt-1 text-sm">
+                {t('settings.appearance.retroConfigDesc')}
+              </p>
+            </div>
             <Button
               variant="outline"
               size="sm"
-              onClick={() => resetTokenSection('typography')}
-              disabled={!activeTokenOverrides?.typography}
+              onClick={() => {
+                resetTokenSection('typography')
+                updateFutureRetroConfig(DEFAULT_FUTURE_RETRO_STYLE_CONFIG)
+              }}
               className="h-8"
             >
               <RotateCcw className="mr-2 h-3.5 w-3.5" />
               {t('settings.appearance.resetDefault')}
             </Button>
           </div>
-          <div className="mb-3 rounded-lg border bg-card p-3 sm:mb-4 sm:p-4">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div className="bg-card rounded-lg border p-3 sm:p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <Label>{t('settings.appearance.baseFontSize')}</Label>
+                <span className="text-muted-foreground text-sm">{baseFontSizePx}px</span>
+              </div>
+              <Slider
+                aria-label={t('settings.appearance.baseFontSize')}
+                value={[baseFontSizePx]}
+                min={12}
+                max={20}
+                step={1}
+                onValueChange={(vals) => {
+                  updateTokenSection('typography', {
+                    ...buildFontSizeTokens(vals[0]),
+                  })
+                }}
+              />
+            </div>
+
+            <div className="bg-card rounded-lg border p-3 sm:p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <div>
+                  <Label>{t('settings.appearance.retroPaperWarmth')}</Label>
+                  <p className="text-muted-foreground mt-0.5 text-xs">
+                    {t('settings.appearance.retroPaperWarmthDesc')}
+                  </p>
+                </div>
+                <span className="text-muted-foreground text-sm">
+                  {futureRetroConfig.paperWarmth}%
+                </span>
+              </div>
+              <Slider
+                aria-label={t('settings.appearance.retroPaperWarmth')}
+                value={[futureRetroConfig.paperWarmth]}
+                min={0}
+                max={100}
+                step={1}
+                onValueChange={([paperWarmth]) => updateFutureRetroConfig({ paperWarmth })}
+              />
+              <div className="text-muted-foreground mt-2 flex justify-between text-[11px]">
+                <span>{t('settings.appearance.retroPaperWhite')}</span>
+                <span>{t('settings.appearance.retroPaperWarm')}</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-card mt-3 rounded-lg border p-3 sm:p-4">
+            <div>
+              <Label>{t('settings.appearance.retroTexture')}</Label>
+              <p className="text-muted-foreground mt-0.5 text-xs">
+                {t('settings.appearance.retroTextureDesc')}
+              </p>
+            </div>
+            <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {futureRetroTextureOptions.map((option) => {
+                const selected = futureRetroConfig.textureStyle === option.value
+                return (
+                  <button
+                    key={option.value}
+                    type="button"
+                    aria-pressed={selected}
+                    data-retro-texture-option="true"
+                    data-selected={selected ? 'true' : 'false'}
+                    className={cn(
+                      'overflow-hidden rounded-md border text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none',
+                      selected
+                        ? 'border-primary ring-primary/25 ring-2'
+                        : 'border-border hover:border-primary/50'
+                    )}
+                    onClick={() => updateFutureRetroConfig({ textureStyle: option.value })}
+                  >
+                    <span
+                      aria-hidden
+                      className="block h-12 border-b"
+                      style={{
+                        backgroundColor: resolvedTheme === 'dark' ? '#110906' : '#f3e3cc',
+                        backgroundImage:
+                          option.value === 'none'
+                            ? 'none'
+                            : buildFutureRetroTexture(
+                                option.value,
+                                futureRetroConfig.textureIntensity,
+                                resolvedTheme === 'dark'
+                              ),
+                      }}
+                    />
+                    <span className="block px-2 py-1.5 text-xs font-medium">
+                      {t(option.labelKey)}
+                    </span>
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="mt-4">
+              <div className="mb-3 flex items-center justify-between">
+                <Label>{t('settings.appearance.retroTextureIntensity')}</Label>
+                <span className="text-muted-foreground text-sm">
+                  {futureRetroConfig.textureIntensity}%
+                </span>
+              </div>
+              <Slider
+                aria-label={t('settings.appearance.retroTextureIntensity')}
+                disabled={futureRetroConfig.textureStyle === 'none'}
+                value={[futureRetroConfig.textureIntensity]}
+                min={10}
+                max={100}
+                step={1}
+                onValueChange={([textureIntensity]) =>
+                  updateFutureRetroConfig({ textureIntensity })
+                }
+              />
+            </div>
+          </div>
+
+          <div className="bg-card mt-3 rounded-lg border p-3 sm:p-4">
             <div className="mb-3 flex items-center justify-between">
-              <Label>{t('settings.appearance.baseFontSize')}</Label>
-              <span className="text-muted-foreground text-sm">{baseFontSizePx}px</span>
+              <div>
+                <Label>{t('settings.appearance.retroPanelDepth')}</Label>
+                <p className="text-muted-foreground mt-0.5 text-xs">
+                  {t('settings.appearance.retroPanelDepthDesc')}
+                </p>
+              </div>
+              <span className="text-muted-foreground text-sm">
+                {futureRetroConfig.panelDepth}%
+              </span>
             </div>
             <Slider
-              defaultValue={[16]}
-              value={[baseFontSizePx]}
-              min={12}
-              max={20}
+              aria-label={t('settings.appearance.retroPanelDepth')}
+              value={[futureRetroConfig.panelDepth]}
+              min={0}
+              max={100}
               step={1}
-              onValueChange={(vals) => {
-                updateTokenSection('typography', {
-                  ...buildFontSizeTokens(vals[0]),
-                })
-              }}
+              onValueChange={([panelDepth]) => updateFutureRetroConfig({ panelDepth })}
             />
-          </div>
-          <div className="grid gap-2 sm:grid-cols-2 sm:gap-3">
-            <div className="bg-card rounded-lg border p-3 sm:p-4">
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1 space-y-0.5">
-                  <Label
-                    htmlFor="future-retro-paper-texture"
-                    className="cursor-pointer text-base font-medium"
-                  >
-                    纸面颗粒
-                  </Label>
-                  <p className="text-muted-foreground text-sm">启用纸面噪点。</p>
-                </div>
-                <Switch
-                  id="future-retro-paper-texture"
-                  checked={futureRetroConfig.paperTexture}
-                  onCheckedChange={(paperTexture) => updateFutureRetroConfig({ paperTexture })}
-                />
-              </div>
-            </div>
-            <div className="bg-card rounded-lg border p-3 sm:p-4">
-              <div className="flex items-center justify-between gap-4">
-                <div className="flex-1 space-y-0.5">
-                  <Label
-                    htmlFor="future-retro-focus-highlight"
-                    className="cursor-pointer text-base font-medium"
-                  >
-                    焦点高亮
-                  </Label>
-                  <p className="text-muted-foreground text-sm">显示键盘焦点的橙色高亮。</p>
-                </div>
-                <Switch
-                  id="future-retro-focus-highlight"
-                  checked={futureRetroConfig.focusHighlight}
-                  onCheckedChange={(focusHighlight) => updateFutureRetroConfig({ focusHighlight })}
-                />
-              </div>
-            </div>
           </div>
         </div>
       )}
 
-      {dashboardStyle !== 'future-retro' && (
+      {dashboardStyle === 'modern' && (
         <div>
           <div className="mb-3 flex items-center justify-between sm:mb-4">
             <div>
@@ -1310,7 +1548,7 @@ export function AppearanceTab() {
       </div>
 
       {/* 主题导入/导出 */}
-      {dashboardStyle !== 'future-retro' && (
+      {dashboardStyle === 'modern' && (
         <div>
           <h3 className="mb-3 text-base font-semibold sm:mb-4 sm:text-lg">
             {t('settings.appearance.importExportTheme')}
@@ -1369,9 +1607,7 @@ export function AppearanceTab() {
               className="hidden"
             />
 
-            <p className="text-muted-foreground text-xs">
-              {t('settings.appearance.exportDesc')}
-            </p>
+            <p className="text-muted-foreground text-xs">{t('settings.appearance.exportDesc')}</p>
           </div>
         </div>
       )}

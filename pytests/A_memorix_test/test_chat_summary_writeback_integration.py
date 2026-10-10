@@ -8,7 +8,6 @@ from typing import Any, Callable, Dict, List
 import asyncio
 import inspect
 import json
-import pickle
 
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session, create_engine
@@ -29,6 +28,7 @@ try:
     from src.common.database.migrations import create_database_migration_bootstrapper
     from src.common.message_repository import count_messages
     from src.config.model_configs import TaskConfig
+    from src.platform_io import DriverKind
     from src.services import memory_flow_service as memory_flow_service_module
     from src.services import memory_service as memory_service_module
     from src.services import send_service
@@ -47,6 +47,7 @@ except SystemExit as exc:
     create_database_migration_bootstrapper = None  # type: ignore[assignment]
     count_messages = None  # type: ignore[assignment]
     TaskConfig = None  # type: ignore[assignment]
+    DriverKind = None  # type: ignore[assignment]
     memory_flow_service_module = None  # type: ignore[assignment]
     memory_service_module = None  # type: ignore[assignment]
     send_service = None  # type: ignore[assignment]
@@ -87,7 +88,7 @@ class _KernelBackedRuntimeManager:
         component_name: str,
         args: Dict[str, Any] | None,
         *,
-        timeout_ms: int = 30000,
+        timeout_ms: int | None = None,
     ) -> Any:
         del timeout_ms
         payload = args or {}
@@ -120,6 +121,7 @@ class _FakePlatformIOManager:
             sent_receipts=[
                 SimpleNamespace(
                     driver_id="plugin.qq.sender",
+                    driver_kind=DriverKind.PLUGIN,
                     external_message_id="real-message-id",
                     metadata={},
                 )
@@ -279,11 +281,6 @@ async def test_text_to_stream_triggers_real_chat_summary_writeback(
     )
     monkeypatch.setattr(
         summary_importer_module.llm_api,
-        "resolve_task_name_from_model_config",
-        lambda model_config: "utils",
-    )
-    monkeypatch.setattr(
-        summary_importer_module.llm_api,
         "generate",
         _fake_generate,
     )
@@ -322,7 +319,7 @@ async def test_text_to_stream_triggers_real_chat_summary_writeback(
     monkeypatch.setattr(memory_flow_service_module, "memory_automation_service", service)
     monkeypatch.setattr(send_service, "_get_runtime_manager", lambda: _NoopRuntimeManager())
     monkeypatch.setattr(send_service, "get_platform_io_manager", lambda: fake_platform_io_manager)
-    monkeypatch.setattr(send_service, "get_bot_account", lambda platform: "bot-qq")
+    monkeypatch.setattr(send_service, "get_bot_account", lambda platform, preferred_account_id=None: "bot-qq")
     monkeypatch.setattr(
         send_service._chat_manager,
         "get_session_by_session_id",
@@ -375,19 +372,7 @@ async def test_text_to_stream_triggers_real_chat_summary_writeback(
         assert "我最近买了一条绿色围巾。" in captured_prompts[-1]
         assert "好的，我会记住你最近买了绿色围巾。" in captured_prompts[-1]
         assert any("绿色围巾" in str(item.get("content", "") or "") for item in paragraphs)
-        assert any(
-            int(
-                (
-                    pickle.loads(item.get("metadata"))
-                    if isinstance(item.get("metadata"), (bytes, bytearray))
-                    else item.get("metadata")
-                    or {}
-                ).get("trigger_message_count", 0)
-                or 0
-            )
-            == 2
-            for item in paragraphs
-        )
+        assert any(int((item.get("metadata") or {}).get("trigger_message_count", 0) or 0) == 2 for item in paragraphs)
         assert service.chat_summary_writeback._states["test-session"].last_trigger_message_count == 2
     finally:
         await service.shutdown()

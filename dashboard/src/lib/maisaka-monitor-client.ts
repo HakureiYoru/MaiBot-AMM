@@ -5,6 +5,7 @@
  */
 import type { WsEventEnvelope } from './unified-ws'
 
+import { PlannerDeltaDecoder } from './maisaka-planner-delta'
 import { unifiedWsClient } from './unified-ws'
 
 // ─── 事件数据类型 ───────────────────────────────────────────────
@@ -38,6 +39,9 @@ export interface SessionStartEvent {
 export interface StageStatusEvent {
   session_id: string
   session_name?: string
+  platform?: string
+  user_id?: string | null
+  group_id?: string | null
   stage: string
   detail: string
   round_text: string
@@ -50,11 +54,41 @@ export interface StageStatusEvent {
 export interface StageRemovedEvent {
   session_id: string
   session_name?: string
+  platform?: string
+  user_id?: string | null
+  group_id?: string | null
   timestamp: number
 }
 
 export interface StageSnapshotEvent {
   entries: StageStatusEvent[]
+  timestamp: number
+}
+
+export interface LlmRetryEvent {
+  session_id: string
+  platform?: string
+  user_id?: string | null
+  group_id?: string | null
+  task_name: string
+  request_type: string
+  model_name: string
+  attempt: number
+  max_attempts: number
+  reason: string
+  retry_interval: number
+  timestamp: number
+}
+
+export interface LlmErrorEvent {
+  session_id: string
+  platform?: string
+  user_id?: string | null
+  group_id?: string | null
+  task_name: string
+  request_type: string
+  model_name: string
+  message: string
   timestamp: number
 }
 
@@ -161,17 +195,39 @@ export interface ToolExecutionEvent {
 }
 
 export interface MaisakaRequestBlock {
-  messages: MaisakaMessage[]
+  /** 完整请求仅旧版监控载荷携带；新版通过推理详情页读取。 */
+  messages?: MaisakaMessage[]
   selected_history_count: number
   tool_count: number
+  context_sections?: MaisakaContextSection[]
+}
+
+/** 提示词分段用量：字符数与条目数，token 由前端按占比换算 */
+export interface MaisakaContextSection {
+  key: string
+  chars: number
+  count: number
+}
+
+export interface MaisakaNativeToolCall {
+  tool_type: string
+  call_id: string
+  status: string
+  action_type: string
+  details: string[]
+  source_count: number
 }
 
 export interface MaisakaPlannerBlock {
   content: string | null
+  model_name?: string | null
   tool_calls: MaisakaToolCall[]
+  native_tool_calls?: MaisakaNativeToolCall[]
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  prompt_cache_hit_tokens?: number
+  prompt_cache_miss_tokens?: number
   duration_ms: number
   prompt_html_uri?: string
 }
@@ -193,24 +249,31 @@ export interface MaisakaTimingGateBlock {
 export interface MaisakaFinalizedToolResult {
   tool_call_id: string
   tool_name: string
+  model_name?: string
+  images?: { thumbnail_url: string; label: string; error?: string }[]
   tool_args: Record<string, unknown>
   tool_call_source?: string
   tool_call_source_label?: string
   success: boolean
+  stop_after_execution?: boolean
   duration_ms: number
   summary: string
   prompt_html_uri?: string
   detail?: unknown
+  matched_tool_names?: string[]
+  newly_discovered_tool_names?: string[]
 }
 
 export interface PlannerFinalizedEvent {
   session_id: string
   cycle_id: number
+  run_id?: string
   timestamp: number
   timing_gate: MaisakaTimingGateBlock | null
   request: MaisakaRequestBlock | null
   planner: MaisakaPlannerBlock | null
   tools: MaisakaFinalizedToolResult[]
+  active_tool_call_id?: string
   interrupted?: boolean
   final_state: {
     time_records: Record<string, number>
@@ -247,6 +310,8 @@ export type MaisakaMonitorEvent =
   | { type: 'stage.status'; data: StageStatusEvent }
   | { type: 'stage.removed'; data: StageRemovedEvent }
   | { type: 'stage.snapshot'; data: StageSnapshotEvent }
+  | { type: 'llm.retry'; data: LlmRetryEvent }
+  | { type: 'llm.error'; data: LlmErrorEvent }
   | { type: 'message.ingested'; data: MessageIngestedEvent }
   | { type: 'message.sent'; data: MessageSentEvent }
   | { type: 'message.updated'; data: MessageUpdatedEvent }
@@ -254,6 +319,7 @@ export type MaisakaMonitorEvent =
   | { type: 'planner.request'; data: PlannerRequestEvent }
   | { type: 'planner.response'; data: PlannerResponseEvent }
   | { type: 'planner.finalized'; data: PlannerFinalizedEvent }
+  | { type: 'planner.progress'; data: PlannerFinalizedEvent }
   | { type: 'tool.execution'; data: ToolExecutionEvent }
   | { type: 'replier.request'; data: ReplierRequestEvent }
   | { type: 'replier.response'; data: ReplierResponseEvent }
@@ -263,9 +329,13 @@ export type MaisakaEventListener = (event: MaisakaMonitorEvent) => void
 // ─── 客户端 ───────────────────────────────────────────────────
 
 class MaisakaMonitorClient {
+  private readonly plannerDecoder = new PlannerDeltaDecoder()
   private initialized = false
+  private readonly initialReplayLimit = 1000
   private listenerIdCounter = 0
   private listeners: Map<number, MaisakaEventListener> = new Map()
+  private replayCursor = 0
+  private readonly replayLimit = 10000
   private subscriptionActive = false
   private subscriptionPromise: Promise<void> | null = null
   private deferredUnsubTimer: ReturnType<typeof setTimeout> | null = null
@@ -280,9 +350,12 @@ class MaisakaMonitorClient {
         return
       }
 
+      // 先重建快照，再交给事件去重/持久化；即使基准事件已入账，也必须更新解码基准。
+      const decoded = this.plannerDecoder.decode(message)
+      if (!decoded) return
       const event: MaisakaMonitorEvent = {
-        type: message.event as MaisakaMonitorEvent['type'],
-        data: message.data as never,
+        type: decoded.event as MaisakaMonitorEvent['type'],
+        data: decoded.data as never,
       }
 
       this.listeners.forEach((listener) => {
@@ -297,14 +370,21 @@ class MaisakaMonitorClient {
     this.initialized = true
   }
 
-  private async ensureSubscribed(): Promise<void> {
+  private getReplaySubscribeData(): Record<string, unknown> {
+    return {
+      since_event_id: this.replayCursor,
+      replay_limit: this.replayCursor > 0 ? this.replayLimit : this.initialReplayLimit,
+    }
+  }
+
+  private async ensureSubscribed(): Promise<boolean> {
     if (this.subscriptionActive) {
-      return
+      return false
     }
 
     if (this.subscriptionPromise === null) {
       this.subscriptionPromise = unifiedWsClient
-        .subscribe('maisaka_monitor', 'main')
+        .subscribe('maisaka_monitor', 'main', this.getReplaySubscribeData())
         .then(() => {
           this.subscriptionActive = true
         })
@@ -314,6 +394,26 @@ class MaisakaMonitorClient {
     }
 
     await this.subscriptionPromise
+    return true
+  }
+
+  private async replayFromCursor(): Promise<void> {
+    await unifiedWsClient.subscribe('maisaka_monitor', 'main', this.getReplaySubscribeData())
+  }
+
+  updateReplayCursor(eventId: number): void {
+    if (!Number.isFinite(eventId) || eventId <= this.replayCursor) {
+      return
+    }
+    this.replayCursor = Math.floor(eventId)
+    unifiedWsClient.updateSubscriptionData('maisaka_monitor', 'main', this.getReplaySubscribeData())
+  }
+
+  setInitialReplayCursor(eventId: number): void {
+    if (!Number.isFinite(eventId) || eventId < 0) {
+      return
+    }
+    this.replayCursor = Math.max(this.replayCursor, Math.floor(eventId))
   }
 
   async subscribe(listener: MaisakaEventListener): Promise<() => Promise<void>> {
@@ -327,7 +427,16 @@ class MaisakaMonitorClient {
       this.deferredUnsubTimer = null
     }
 
-    await this.ensureSubscribed()
+    try {
+      const createdSubscription = await this.ensureSubscribed()
+      if (!createdSubscription) {
+        await this.replayFromCursor()
+      }
+    } catch (error) {
+      // 订阅失败时调用方拿不到退订函数，必须在这里回收监听器
+      this.listeners.delete(listenerId)
+      throw error
+    }
 
     return async () => {
       this.listeners.delete(listenerId)
@@ -342,6 +451,10 @@ class MaisakaMonitorClient {
         }, 200)
       }
     }
+  }
+
+  onConnectionChange(listener: (connected: boolean) => void): () => void {
+    return unifiedWsClient.onConnectionChange(listener)
   }
 }
 

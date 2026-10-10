@@ -14,8 +14,10 @@ export const STORAGE_KEYS = {
   ACCENT_COLOR: 'accent-color',
   ENABLE_ANIMATIONS: 'maibot-animations',
   ENABLE_AVATAR_FETCH: 'maibot-enable-avatar-fetch',
-  ENABLE_FOCUS_COMPANION: 'maibot-enable-focus-companion',
-  
+
+  // 调试设置
+  ALWAYS_SHOW_UPDATE_NOTICE: 'maibot-always-show-update-notice',
+
   // 性能与存储设置
   LOG_CACHE_SIZE: 'maibot-log-cache-size',
   LOG_AUTO_SCROLL: 'maibot-log-auto-scroll',
@@ -28,12 +30,25 @@ export const STORAGE_KEYS = {
   DATA_SYNC_INTERVAL: 'maibot-data-sync-interval',
   WS_RECONNECT_INTERVAL: 'maibot-ws-reconnect-interval',
   WS_MAX_RECONNECT_ATTEMPTS: 'maibot-ws-max-reconnect-attempts',
-  
+
   // 用户数据
   COMPLETED_TOURS: 'maibot-completed-tours',
   CHAT_USER_ID: 'maibot_webui_user_id',
   CHAT_USER_NAME: 'maibot_webui_user_name',
 } as const
+
+const GUIDE_AND_NOTICE_LOCAL_STORAGE_KEYS = [
+  STORAGE_KEYS.COMPLETED_TOURS,
+  'bot-config-file-mode-notice-dismissed',
+  'bot-config-tabs-guide-dismissed',
+  'bot-config-experimental-features-notice-dismissed',
+  'model-assignment-tour-entry-dismissed',
+  'log-viewer-switch-hint-dismissed',
+  'plugins-restart-notice-dismissed',
+  'memory-quick-start-dismissed',
+] as const
+
+const GUIDE_AND_NOTICE_SESSION_STORAGE_KEYS = ['http-warning-dismissed'] as const
 
 // 默认设置值
 export const DEFAULT_SETTINGS = {
@@ -42,8 +57,10 @@ export const DEFAULT_SETTINGS = {
   accentColor: DEFAULT_ACCENT_COLOR_HSL,
   enableAnimations: true,
   enableAvatarFetch: true,
-  enableFocusCompanion: false,
-  
+
+  // 调试
+  alwaysShowUpdateNotice: false,
+
   // 性能与存储
   logCacheSize: 1000,
   logAutoScroll: true,
@@ -72,23 +89,23 @@ export type ExportableSettings = Omit<Settings, never> & {
 export function getSetting<K extends keyof Settings>(key: K): Settings[K] {
   const storageKey = getStorageKey(key)
   const stored = localStorage.getItem(storageKey)
-  
+
   if (stored === null) {
     return DEFAULT_SETTINGS[key]
   }
-  
+
   // 根据默认值类型进行转换
   const defaultValue = DEFAULT_SETTINGS[key]
-  
+
   if (typeof defaultValue === 'boolean') {
     return (stored === 'true') as Settings[K]
   }
-  
+
   if (typeof defaultValue === 'number') {
     const num = parseFloat(stored)
     return (isNaN(num) ? defaultValue : num) as Settings[K]
   }
-  
+
   return stored as Settings[K]
 }
 
@@ -98,11 +115,13 @@ export function getSetting<K extends keyof Settings>(key: K): Settings[K] {
 export function setSetting<K extends keyof Settings>(key: K, value: Settings[K]): void {
   const storageKey = getStorageKey(key)
   localStorage.setItem(storageKey, String(value))
-  
+
   // 触发自定义事件，通知其他组件设置已更新
-  window.dispatchEvent(new CustomEvent('maibot-settings-change', {
-    detail: { key, value }
-  }))
+  window.dispatchEvent(
+    new CustomEvent('maibot-settings-change', {
+      detail: { key, value },
+    })
+  )
 }
 
 /**
@@ -114,7 +133,7 @@ export function getAllSettings(): Settings {
     accentColor: getSetting('accentColor'),
     enableAnimations: getSetting('enableAnimations'),
     enableAvatarFetch: getSetting('enableAvatarFetch'),
-    enableFocusCompanion: getSetting('enableFocusCompanion'),
+    alwaysShowUpdateNotice: getSetting('alwaysShowUpdateNotice'),
     logCacheSize: getSetting('logCacheSize'),
     logAutoScroll: getSetting('logAutoScroll'),
     logLevelFilter: getSetting('logLevelFilter'),
@@ -134,11 +153,11 @@ export function getAllSettings(): Settings {
  */
 export function exportSettings(): ExportableSettings {
   const settings = getAllSettings()
-  
+
   // 添加已完成的引导
   const completedToursStr = localStorage.getItem(STORAGE_KEYS.COMPLETED_TOURS)
   const completedTours = completedToursStr ? JSON.parse(completedToursStr) : []
-  
+
   return {
     ...settings,
     completedTours,
@@ -148,10 +167,14 @@ export function exportSettings(): ExportableSettings {
 /**
  * 导入设置
  */
-export function importSettings(settings: Partial<ExportableSettings>): { success: boolean; imported: string[]; skipped: string[] } {
+export function importSettings(settings: Partial<ExportableSettings>): {
+  success: boolean
+  imported: string[]
+  skipped: string[]
+} {
   const imported: string[] = []
   const skipped: string[] = []
-  
+
   // 验证并导入每个设置
   for (const [key, value] of Object.entries(settings)) {
     if (key === 'completedTours') {
@@ -164,11 +187,11 @@ export function importSettings(settings: Partial<ExportableSettings>): { success
       }
       continue
     }
-    
+
     if (key in DEFAULT_SETTINGS) {
       const settingKey = key as keyof Settings
       const defaultValue = DEFAULT_SETTINGS[settingKey]
-      
+
       // 类型验证
       if (typeof value === typeof defaultValue) {
         // 额外验证
@@ -180,11 +203,14 @@ export function importSettings(settings: Partial<ExportableSettings>): { success
           skipped.push(key)
           continue
         }
-        if (settingKey === 'logLevelFilter' && !['all', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'].includes(value as string)) {
+        if (
+          settingKey === 'logLevelFilter' &&
+          !['all', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'].includes(value as string)
+        ) {
           skipped.push(key)
           continue
         }
-        
+
         setSetting(settingKey, value as Settings[typeof settingKey])
         imported.push(key)
       } else {
@@ -194,7 +220,7 @@ export function importSettings(settings: Partial<ExportableSettings>): { success
       skipped.push(key)
     }
   }
-  
+
   return {
     success: imported.length > 0,
     imported,
@@ -209,12 +235,37 @@ export function resetAllSettings(): void {
   for (const key of Object.keys(DEFAULT_SETTINGS) as (keyof Settings)[]) {
     setSetting(key, DEFAULT_SETTINGS[key])
   }
-  
+
   // 清除已完成的引导
   localStorage.removeItem(STORAGE_KEYS.COMPLETED_TOURS)
-  
+
   // 触发全局事件
   window.dispatchEvent(new CustomEvent('maibot-settings-reset'))
+}
+
+/**
+ * 重置 WebUI 中所有已关闭或已完成的引导与提示。
+ * 仅清理提示状态，不影响用户设置、认证信息或业务数据。
+ */
+export function resetAllGuidesAndNotices(): number {
+  let clearedCount = 0
+
+  for (const key of GUIDE_AND_NOTICE_LOCAL_STORAGE_KEYS) {
+    if (localStorage.getItem(key) !== null) {
+      localStorage.removeItem(key)
+      clearedCount += 1
+    }
+  }
+
+  for (const key of GUIDE_AND_NOTICE_SESSION_STORAGE_KEYS) {
+    if (sessionStorage.getItem(key) !== null) {
+      sessionStorage.removeItem(key)
+      clearedCount += 1
+    }
+  }
+
+  window.dispatchEvent(new CustomEvent('maibot-guides-reset'))
+  return clearedCount
 }
 
 /**
@@ -224,7 +275,7 @@ export function resetAllSettings(): void {
 export function clearLocalCache(): { clearedKeys: string[]; preservedKeys: string[] } {
   const clearedKeys: string[] = []
   const preservedKeys: string[] = []
-  
+
   // 遍历所有 localStorage 项
   const keysToRemove: string[] = []
   for (let i = 0; i < localStorage.length; i++) {
@@ -233,23 +284,27 @@ export function clearLocalCache(): { clearedKeys: string[]; preservedKeys: strin
       keysToRemove.push(key)
     }
   }
-  
+
   // 删除需要清除的 key
   for (const key of keysToRemove) {
     localStorage.removeItem(key)
     clearedKeys.push(key)
   }
-  
+
   return { clearedKeys, preservedKeys }
 }
 
 /**
  * 获取本地存储使用情况
  */
-export function getStorageUsage(): { used: number; items: number; details: { key: string; size: number }[] } {
+export function getStorageUsage(): {
+  used: number
+  items: number
+  details: { key: string; size: number }[]
+} {
   let totalSize = 0
   const details: { key: string; size: number }[] = []
-  
+
   for (let i = 0; i < localStorage.length; i++) {
     const key = localStorage.key(i)
     if (key) {
@@ -259,10 +314,10 @@ export function getStorageUsage(): { used: number; items: number; details: { key
       details.push({ key, size })
     }
   }
-  
+
   // 按大小排序
   details.sort((a, b) => b.size - a.size)
-  
+
   return {
     used: totalSize,
     items: localStorage.length,
@@ -288,7 +343,7 @@ function getStorageKey(settingKey: keyof Settings): string {
     accentColor: STORAGE_KEYS.ACCENT_COLOR,
     enableAnimations: STORAGE_KEYS.ENABLE_ANIMATIONS,
     enableAvatarFetch: STORAGE_KEYS.ENABLE_AVATAR_FETCH,
-    enableFocusCompanion: STORAGE_KEYS.ENABLE_FOCUS_COMPANION,
+    alwaysShowUpdateNotice: STORAGE_KEYS.ALWAYS_SHOW_UPDATE_NOTICE,
     logCacheSize: STORAGE_KEYS.LOG_CACHE_SIZE,
     logAutoScroll: STORAGE_KEYS.LOG_AUTO_SCROLL,
     logLevelFilter: STORAGE_KEYS.LOG_LEVEL_FILTER,

@@ -338,7 +338,7 @@ export function KnowledgeGraphPage({ embedded = false, initialParagraphHash = ''
         title: '全库检索完成',
         description: `命中 ${payload.count ?? items.length} 条结果`,
       })
-    } catch (error) {
+    } catch {
       const filtered = filterGraphData(fullGraph, nextQuery)
       setSearchResults([])
       setSearchFallbackMode(true)
@@ -996,7 +996,7 @@ export function KnowledgeGraphPage({ embedded = false, initialParagraphHash = ''
                       <p className="mt-1 text-xs text-muted-foreground">
                         命中字段：{item.matched_field} = {item.matched_value}
                         {item.type === 'entity'
-                          ? ` · appearance=${item.appearance_count ?? 0}`
+                          ? ` · 有效证据=${item.active_evidence_count ?? 0} · 累计出现=${item.appearance_count ?? 0}`
                           : ` · confidence=${Number(item.confidence ?? 0).toFixed(2)}`}
                       </p>
                     </button>

@@ -47,7 +47,7 @@ export interface UseEmbeddingWarningResult {
 }
 
 export function useEmbeddingWarning(
-  options: UseEmbeddingWarningOptions,
+  options: UseEmbeddingWarningOptions
 ): UseEmbeddingWarningResult {
   const { applyUpdate } = options
   const { toast } = useToast()
@@ -68,34 +68,40 @@ export function useEmbeddingWarning(
         previousEmbeddingModelsRef.current = [...update.value]
       }
       toast({
-        title: '嵌入模型已更新',
-        description: '建议重新生成知识库向量以确保最佳匹配精度',
+        title: '嵌入模型已选择',
+        description: '配置将在 2 秒后自动保存',
       })
     },
   })
 
-  const detectChange = useCallback((field: keyof TaskConfig, value: string[]): boolean => {
-    const previousModels = previousEmbeddingModelsRef.current
-    const newModels = value
+  const detectChange = useCallback(
+    (field: keyof TaskConfig, value: string[]): boolean => {
+      const previousModels = previousEmbeddingModelsRef.current
+      const newModels = value
 
-    const hasChanges =
-      previousModels.length !== newModels.length ||
-      previousModels.some((model) => !newModels.includes(model)) ||
-      newModels.some((model) => !previousModels.includes(model))
+      const hasChanges =
+        previousModels.length !== newModels.length ||
+        previousModels.some((model) => !newModels.includes(model)) ||
+        newModels.some((model) => !previousModels.includes(model))
 
-    if (hasChanges && previousModels.length > 0) {
-      pending.submit({ field, value })
-      return true
-    }
-    return false
-  }, [pending])
+      if (hasChanges && previousModels.length > 0) {
+        pending.submit({ field, value })
+        return true
+      }
+      return false
+    },
+    [pending]
+  )
 
-  const setOpen = useCallback((open: boolean) => {
-    // 对话框关闭即放弃待定更新（与原 setEmbeddingWarningOpen(false) 语义一致）
-    if (!open) {
-      pending.cancel()
-    }
-  }, [pending])
+  const setOpen = useCallback(
+    (open: boolean) => {
+      // 对话框关闭即放弃待定更新（与原 setEmbeddingWarningOpen(false) 语义一致）
+      if (!open) {
+        pending.cancel()
+      }
+    },
+    [pending]
+  )
 
   return {
     isOpen: pending.isWaiting,

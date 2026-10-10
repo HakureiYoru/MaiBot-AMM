@@ -4,9 +4,10 @@
 提供系统重启、状态查询等功能
 """
 
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
@@ -23,12 +24,19 @@ import time
 from src.common.database.database import engine, get_db_session
 from src.common.database.database_model import Images, ImageType
 from src.common.logger import get_logger
+from src.common.update_notice import (
+    build_debug_update_notice,
+    get_changelog_history,
+    get_pending_update_notice,
+    mark_update_notice_seen,
+)
 from src.common.utils.image_path import (
     StoredImagePathError,
     resolve_stored_image_path,
     stored_image_paths_equal,
 )
 from src.config.config import MMC_VERSION
+from src.plugin_runtime.update_compatibility_notice import collect_update_incompatible_plugins
 from src.webui.dependencies import require_auth
 
 router = APIRouter(prefix="/system", tags=["system"], dependencies=[Depends(require_auth)])
@@ -135,6 +143,53 @@ class StatusResponse(BaseModel):
     uptime: float
     version: str
     start_time: str
+
+
+class IncompatiblePluginNoticeResponse(BaseModel):
+    """主程序更新导致的不兼容插件。"""
+
+    plugin_id: str
+    name: str
+    installed_version: str
+    host_min_version: str
+    host_max_version: str
+    update_status: Literal["checking", "available", "unavailable", "not_found", "check_failed"]
+    update_version: str | None = None
+
+
+class UpdateNoticeResponse(BaseModel):
+    """更新公告响应。"""
+
+    pending: bool
+    current_version: str
+    from_version: str | None = None
+    versions: List[str] = Field(default_factory=list)
+    content: str = ""
+    incompatible_plugins: List[IncompatiblePluginNoticeResponse] = Field(default_factory=list)
+
+
+class UpdateNoticeAckResponse(BaseModel):
+    """更新公告确认响应。"""
+
+    success: bool
+    message: str
+    version: str
+
+
+class UpdateHistoryEntryResponse(BaseModel):
+    """单个历史版本的更新记录。"""
+
+    version: str
+    title: str
+    content: str
+
+
+class UpdateHistoryResponse(BaseModel):
+    """历史版本更新记录响应。"""
+
+    entries: List[UpdateHistoryEntryResponse] = Field(default_factory=list)
+    next_offset: int
+    has_more: bool
 
 
 class CacheDirectoryStats(BaseModel):
@@ -1434,7 +1489,7 @@ async def restart_maibot():
 
 
 @router.get("/status", response_model=StatusResponse)
-async def get_maibot_status():
+def get_maibot_status():
     """
     获取麦麦运行状态
 
@@ -1451,6 +1506,82 @@ async def get_maibot_status():
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"获取状态失败: {str(e)}") from e
+
+
+@router.get("/update-notice", response_model=UpdateNoticeResponse)
+async def get_update_notice(force: bool = False) -> UpdateNoticeResponse:
+    """获取当前 WebUI 是否需要弹出更新公告。"""
+
+    try:
+        notice = get_pending_update_notice("webui", current_version=MMC_VERSION)
+        if notice is None and force:
+            notice = build_debug_update_notice(MMC_VERSION)
+        if notice is None:
+            return UpdateNoticeResponse(pending=False, current_version=MMC_VERSION)
+        incompatible_plugins = await collect_update_incompatible_plugins(
+            notice.from_version,
+            notice.current_version,
+        )
+        return UpdateNoticeResponse(
+            pending=True,
+            current_version=notice.current_version,
+            from_version=notice.from_version,
+            versions=notice.versions,
+            content=notice.content,
+            incompatible_plugins=[
+                IncompatiblePluginNoticeResponse(**asdict(plugin)) for plugin in incompatible_plugins
+            ],
+        )
+    except Exception as e:
+        logger.exception(f"获取更新公告失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取更新公告失败: {str(e)}") from e
+
+
+@router.post("/update-notice/ack", response_model=UpdateNoticeAckResponse)
+def ack_update_notice() -> UpdateNoticeAckResponse:
+    """确认当前版本的 WebUI 更新公告已展示。"""
+
+    try:
+        mark_update_notice_seen("webui", current_version=MMC_VERSION)
+        return UpdateNoticeAckResponse(success=True, message="更新公告已确认", version=MMC_VERSION)
+    except Exception as e:
+        logger.exception(f"确认更新公告失败: {e}")
+        raise HTTPException(status_code=500, detail=f"确认更新公告失败: {str(e)}") from e
+
+
+@router.get("/update-history", response_model=UpdateHistoryResponse)
+def get_update_history(
+    offset: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=10)] = 3,
+    before_version: str | None = None,
+    section: Literal["webui"] | None = None,
+) -> UpdateHistoryResponse:
+    """按需读取历史版本更新记录。"""
+
+    try:
+        entries = get_changelog_history(
+            MMC_VERSION,
+            limit=limit + 1,
+            offset=offset,
+            before_version=before_version,
+            section_heading=section,
+        )
+        visible_entries = entries[:limit]
+        return UpdateHistoryResponse(
+            entries=[
+                UpdateHistoryEntryResponse(
+                    version=entry.version,
+                    title=entry.title,
+                    content=entry.markdown,
+                )
+                for entry in visible_entries
+            ],
+            next_offset=offset + len(visible_entries),
+            has_more=len(entries) > limit,
+        )
+    except Exception as e:
+        logger.exception(f"获取历史更新记录失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取历史更新记录失败: {str(e)}") from e
 
 
 @router.get("/local-cache", response_model=LocalCacheStatsResponse)
@@ -1551,7 +1682,7 @@ async def list_local_cache_images(
 
 
 @router.get("/local-cache/images/preview", response_model=None)
-async def preview_local_cache_image(
+def preview_local_cache_image(
     target: Annotated[CacheImageTarget, Query(description="缓存类型：images 或 emoji")],
     relative_path: Annotated[str, Query(description="相对于缓存目录的图片路径")],
 ) -> FileResponse:
@@ -1562,7 +1693,7 @@ async def preview_local_cache_image(
 
 
 @router.get("/maisaka-monitor/media/{media_kind}/{media_hash}", response_model=None)
-async def get_maisaka_monitor_media(media_kind: MonitorMediaKind, media_hash: str) -> FileResponse:
+def get_maisaka_monitor_media(media_kind: MonitorMediaKind, media_hash: str) -> FileResponse:
     """返回 MaiSaka 观察面板消息中的原始图片或表情文件。"""
 
     file_path = _resolve_monitor_media_file(media_kind, media_hash)
@@ -1640,7 +1771,7 @@ async def cleanup_local_cache(request: LocalCacheCleanupRequest):
 
 
 @router.post("/reload-config")
-async def reload_config():
+def reload_config():
     """
     热重载配置（不重启进程）
 

@@ -1,6 +1,6 @@
 """WebUI API 路由"""
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
 from src.common.logger import get_logger
@@ -11,22 +11,34 @@ from src.webui.core import (
     get_token_manager,
     set_auth_cookie,
 )
+from src.webui.core.security import TOKEN_SOURCE_TEMPORARY
 from src.webui.dependencies import require_auth, verify_token_optional
 from src.webui.routers.avatar import router as avatar_router
 from src.webui.routers.behavior import router as behavior_router
+from src.webui.routers.bot_accounts import router as bot_accounts_router
 from src.webui.routers.config import router as config_router
+from src.webui.routers.data_transfer import router as data_transfer_router
 from src.webui.routers.emoji import router as emoji_router
 from src.webui.routers.expression import router as expression_router
 from src.webui.routers.jargon import router as jargon_router
 from src.webui.routers.memory import router as memory_router
+from src.webui.routers.mcp import router as mcp_router
 from src.webui.routers.model import router as model_router
+from src.webui.routers.news import router as news_router
 from src.webui.routers.person import router as person_router
 from src.webui.routers.plugin import router as plugin_router
 from src.webui.routers.reasoning_process import router as reasoning_process_router
+from src.webui.routers.reply_effects import router as reply_effects_router
+from src.webui.routers.search import router as search_router
 from src.webui.routers.statistics import router as statistics_router
 from src.webui.routers.system import router as system_router
+from src.webui.routers.user_emoji import router as user_emoji_router
 from src.webui.routers.websocket.auth import router as ws_auth_router
 from src.webui.routers.websocket.unified import router as unified_ws_router
+from src.webui.version_compatibility import (
+    WebUICompatibilityStatus,
+    get_webui_version_compatibility,
+)
 
 logger = get_logger("webui.api")
 
@@ -35,6 +47,7 @@ router = APIRouter(prefix="/api/webui", tags=["WebUI"])
 
 # 注册配置管理路由
 router.include_router(config_router)
+router.include_router(mcp_router)
 # 注册统计数据路由
 router.include_router(statistics_router)
 # 注册人物信息管理路由
@@ -45,15 +58,22 @@ router.include_router(expression_router)
 router.include_router(jargon_router)
 # 注册表情包管理路由
 router.include_router(behavior_router)
+router.include_router(bot_accounts_router)
 router.include_router(emoji_router)
 router.include_router(avatar_router)
+router.include_router(user_emoji_router)
 # 注册插件管理路由
 router.include_router(plugin_router)
 # 注册系统控制路由
 router.include_router(system_router)
+router.include_router(data_transfer_router)
 router.include_router(reasoning_process_router)
+router.include_router(reply_effects_router)
+router.include_router(search_router)
 # 注册模型列表获取路由
 router.include_router(model_router)
+# 注册首页资讯路由
+router.include_router(news_router)
 # 注册长期记忆管理路由
 router.include_router(memory_router)
 # 注册 WebSocket 认证路由
@@ -74,6 +94,8 @@ class TokenVerifyResponse(BaseModel):
     valid: bool = Field(..., description="Token 是否有效")
     message: str = Field(..., description="验证结果消息")
     is_first_setup: bool = Field(False, description="是否为首次设置")
+    token_source: str = Field("temporary", description="Token 来源")
+    requires_custom_token: bool = Field(False, description="是否需要设置自定义 Token")
 
 
 class TokenUpdateRequest(BaseModel):
@@ -101,6 +123,8 @@ class FirstSetupStatusResponse(BaseModel):
     """首次配置状态响应"""
 
     is_first_setup: bool = Field(..., description="是否为首次配置")
+    token_source: str = Field(..., description="Token 来源")
+    requires_custom_token: bool = Field(..., description="是否需要设置自定义 Token")
     message: str = Field(..., description="状态消息")
 
 
@@ -118,10 +142,38 @@ class ResetSetupResponse(BaseModel):
     message: str = Field(..., description="结果消息")
 
 
+class VersionCompatibilityResponse(BaseModel):
+    """主程序与 WebUI 的版本兼容性。"""
+
+    status: WebUICompatibilityStatus
+    main_program_version: str
+    webui_version: str
+    required_webui_version: str
+
+
 @router.get("/health")
 async def health_check():
     """健康检查"""
     return {"status": "healthy", "service": "MaiBot WebUI"}
+
+
+@router.get("/version-compatibility", response_model=VersionCompatibilityResponse)
+async def get_version_compatibility(
+    webui_version: str = Query(..., min_length=1, max_length=64),
+) -> VersionCompatibilityResponse:
+    """比较当前 WebUI 版本与主程序在 pyproject.toml 中声明的版本。"""
+
+    try:
+        compatibility = get_webui_version_compatibility(webui_version)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return VersionCompatibilityResponse(
+        status=compatibility.status,
+        main_program_version=compatibility.main_program_version,
+        webui_version=compatibility.webui_version,
+        required_webui_version=compatibility.required_webui_version,
+    )
 
 
 @router.post("/auth/verify", response_model=TokenVerifyResponse)
@@ -155,7 +207,14 @@ async def verify_token(
             set_auth_cookie(response, request_body.token, request)
             # 同时返回首次配置状态，避免额外请求
             is_first_setup = token_manager.is_first_setup()
-            return TokenVerifyResponse(valid=True, message="Token 验证成功", is_first_setup=is_first_setup)
+            token_source = token_manager.get_token_source()
+            return TokenVerifyResponse(
+                valid=True,
+                message="Token 验证成功",
+                is_first_setup=is_first_setup,
+                token_source=token_source,
+                requires_custom_token=token_source == TOKEN_SOURCE_TEMPORARY,
+            )
         else:
             # 记录失败尝试
             blocked, remaining = rate_limiter.record_failed_attempt(
@@ -207,7 +266,15 @@ async def check_auth_status(
     """
     try:
         logger.debug(f"检查认证状态，结果: {authenticated}")
-        return {"authenticated": authenticated}
+        if not authenticated:
+            return {"authenticated": False}
+
+        token_source = get_token_manager().get_token_source()
+        return {
+            "authenticated": True,
+            "token_source": token_source,
+            "requires_custom_token": token_source == TOKEN_SOURCE_TEMPORARY,
+        }
     except Exception as e:
         logger.error(f"认证检查失败: {e}", exc_info=True)
         return {"authenticated": False}
@@ -289,8 +356,15 @@ async def get_setup_status():
 
         # 检查是否为首次配置
         is_first = token_manager.is_first_setup()
+        token_source = token_manager.get_token_source()
+        requires_custom_token = token_source == TOKEN_SOURCE_TEMPORARY
 
-        return FirstSetupStatusResponse(is_first_setup=is_first, message="首次配置" if is_first else "已完成配置")
+        return FirstSetupStatusResponse(
+            is_first_setup=is_first,
+            token_source=token_source,
+            requires_custom_token=requires_custom_token,
+            message="需要设置自定义 Token" if requires_custom_token else "首次配置" if is_first else "已完成配置",
+        )
     except HTTPException:
         raise
     except Exception as e:

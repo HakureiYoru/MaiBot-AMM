@@ -35,6 +35,27 @@ export interface VirtualIdentityConfig {
   groupId: string // 虚拟群 ID，用于持久化历史记录
 }
 
+// 观察聊天流在侧边栏的最新消息预览
+export interface ObservedMessagePreview {
+  // 发言者名称（群聊预览会拼成 "发言者: 内容"）
+  speakerName: string
+  // 消息文本内容，纯媒体消息时为空字符串
+  content: string
+  // 纯媒体消息的占位文案（如 [图片]），有文本内容时为空字符串
+  mediaText: string
+}
+
+export interface ChatRuntimeStatus {
+  kind: 'thinking' | 'typing' | 'acting' | 'error'
+  stage?: string
+  detail?: string
+  retry?: {
+    attempt: number
+    maxAttempts: number
+  }
+  updatedAt: number
+}
+
 // 聊天标签页
 export interface ChatTab {
   id: string
@@ -44,12 +65,16 @@ export interface ChatTab {
   messages: ChatMessage[]
   isConnected: boolean
   isTyping: boolean
+  runtimeStatus?: ChatRuntimeStatus | null
   sessionInfo: {
     session_id?: string
     user_id?: string
     user_name?: string
     bot_name?: string
     bot_qq?: string
+    group_id?: string
+    platform?: string
+    virtual_mode?: boolean
   }
 }
 
@@ -124,6 +149,7 @@ export interface ChatIncomingImage {
 export interface WsMessage {
   type: string
   content?: string
+  raw_content?: string
   message_id?: string
   timestamp?: number
   is_typing?: boolean
@@ -132,12 +158,15 @@ export interface WsMessage {
   user_name?: string
   bot_name?: string
   bot_qq?: string
+  platform?: string
+  virtual_mode?: boolean
   sender?: {
     name: string
     user_id?: string
     is_bot?: boolean
   }
   images?: ChatIncomingImage[]
+  emojis?: ChatIncomingImage[]
   // 历史消息列表（用于 type: 'history'）
   messages?: Array<{
     id?: string

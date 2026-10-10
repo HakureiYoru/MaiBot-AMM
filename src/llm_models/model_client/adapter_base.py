@@ -5,12 +5,14 @@ import asyncio
 
 from src.common.logger import get_logger
 from src.config.model_configs import ModelInfo
+from src.llm_models.payload_content.context_protocol import ContextProtocolMode, validate_context_items
 
 from .base_client import (
     APIResponse,
     AudioTranscriptionRequest,
     BaseClient,
     EmbeddingRequest,
+    ImageEmbeddingRequest,
     ResponseRequest,
     UsageRecord,
     UsageTuple,
@@ -97,6 +99,7 @@ class AdapterClient(BaseClient, ABC, Generic[RawStreamT, RawResponseT]):
         Returns:
             APIResponse: 解析完成的统一响应对象。
         """
+        validate_context_items(request.context_items, ContextProtocolMode.REQUEST_CONTEXT)
         stream_response_handler = self._resolve_stream_response_handler(request)
         response_parser = self._resolve_response_parser(request)
         response, usage_record = await self._execute_response_request(
@@ -104,7 +107,15 @@ class AdapterClient(BaseClient, ABC, Generic[RawStreamT, RawResponseT]):
             stream_response_handler,
             response_parser,
         )
-        return self._attach_usage_record(response, request.model_info, usage_record)
+        validate_context_items(response.output_items, ContextProtocolMode.MODEL_OUTPUT)
+        response.bind_logical_turn(request.logical_turn_id)
+        response = self._attach_usage_record(response, request.model_info, usage_record)
+        response.attach_generation_trace(
+            provider=self.api_provider.name,
+            endpoint=self.api_provider.base_url,
+            model=request.model_info.model_identifier,
+        )
+        return response
 
     async def get_embedding(self, request: EmbeddingRequest) -> APIResponse:
         """获取文本嵌入。
@@ -116,6 +127,12 @@ class AdapterClient(BaseClient, ABC, Generic[RawStreamT, RawResponseT]):
             APIResponse: 解析完成的统一嵌入响应。
         """
         response, usage_record = await self._execute_embedding_request(request)
+        return self._attach_usage_record(response, request.model_info, usage_record)
+
+    async def get_image_embedding(self, request: ImageEmbeddingRequest) -> APIResponse:
+        """获取图片嵌入，调用 Provider 显式实现的图片协议。"""
+
+        response, usage_record = await self._execute_image_embedding_request(request)
         return self._attach_usage_record(response, request.model_info, usage_record)
 
     async def get_audio_transcriptions(self, request: AudioTranscriptionRequest) -> APIResponse:
@@ -181,6 +198,7 @@ class AdapterClient(BaseClient, ABC, Generic[RawStreamT, RawResponseT]):
             total_tokens=usage_record[2],
             prompt_cache_hit_tokens=usage_record[3] if len(usage_record) > 3 else 0,
             prompt_cache_miss_tokens=usage_record[4] if len(usage_record) > 4 else 0,
+            prompt_cache_reported=bool(usage_record[5]) if len(usage_record) > 5 else False,
         )
 
     def _attach_usage_record(
@@ -266,6 +284,18 @@ class AdapterClient(BaseClient, ABC, Generic[RawStreamT, RawResponseT]):
             Tuple[APIResponse, UsageTuple | None]: 统一响应对象与可选使用量信息。
         """
         raise NotImplementedError
+
+    async def _execute_image_embedding_request(
+        self,
+        request: ImageEmbeddingRequest,
+    ) -> Tuple[APIResponse, UsageTuple | None]:
+        """执行图片嵌入请求；默认实现直接说明协议不受支持。"""
+
+        from src.llm_models.exceptions import ImageEmbeddingUnsupportedError
+
+        raise ImageEmbeddingUnsupportedError(
+            f"Provider 客户端 {type(self).__name__} 未实现图片嵌入协议"
+        )
 
     @abstractmethod
     async def _execute_audio_transcription_request(

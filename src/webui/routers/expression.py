@@ -15,7 +15,7 @@ from sqlalchemy import case, func
 from sqlmodel import col, delete, select
 
 from src.chat.message_receive.chat_manager import chat_manager as _chat_manager
-from src.chat.replyer.expression_vector_index import normalize_text, resolve_project_path
+from src.chat.replyer.expression_vector_index import expression_vector_index, normalize_text, resolve_project_path
 from src.common.database.database import get_db_session
 from src.common.database.database_model import ChatSession, Expression, Messages, ModifiedBy
 from src.common.logger import get_logger
@@ -26,6 +26,7 @@ from src.learners.expression_review_store import (
     get_ai_review_log,
     get_recent_ai_review_logs,
 )
+from src.services.bot_account_service import get_all_bot_account_pairs
 from src.webui.dependencies import require_auth
 
 logger = get_logger("webui.expression")
@@ -40,22 +41,9 @@ LOGGED_INVALID_EXPRESSION_SESSION_IDS: set[int] = set()
 
 
 def get_configured_platform_accounts() -> set[tuple[str, str]]:
-    """读取配置中当前启用的平台账号对。"""
+    """读取当前实例全部有效的平台账号对。"""
 
-    pairs: set[tuple[str, str]] = set()
-    base_platform = str(global_config.bot.platform or "").strip()
-    base_account = str(global_config.bot.qq_account or "").strip()
-    if base_platform and base_account:
-        pairs.add((base_platform, base_account))
-
-    for item in global_config.bot.platforms:
-        platform, separator, account_id = str(item or "").partition(":")
-        platform = platform.strip()
-        account_id = account_id.strip()
-        if separator and platform and account_id:
-            pairs.add((platform, account_id))
-
-    return pairs
+    return get_all_bot_account_pairs()
 
 
 def is_current_account_session(chat_session: Optional[ChatSession]) -> bool:
@@ -338,6 +326,7 @@ class LegacyExpressionMatchOption(BaseModel):
 
     session_id: str
     chat_name: str
+    account_id: Optional[str] = None
 
 
 class LegacyExpressionGroupPreview(BaseModel):
@@ -813,6 +802,7 @@ def resolve_legacy_group_preview(
                     LegacyExpressionMatchOption(
                         session_id=session.session_id,
                         chat_name=get_chat_name(session.session_id, db_session),
+                        account_id=session.account_id,
                     )
                     for session in matched_sessions
                 ]
@@ -889,6 +879,7 @@ class ChatInfo(BaseModel):
     chat_id: str
     chat_name: str
     platform: Optional[str] = None
+    account_id: Optional[str] = None
     is_group: bool = False
     use_expression: bool = True
     enable_learning: bool = True
@@ -902,6 +893,7 @@ def build_chat_info(chat_id: str, db_session: Any, chat_session: Optional[ChatSe
         chat_id=chat_id,
         chat_name=get_chat_name(chat_id, db_session),
         platform=chat_session.platform if chat_session else None,
+        account_id=chat_session.account_id if chat_session else None,
         is_group=bool(chat_session and chat_session.group_id),
         use_expression=use_expression,
         enable_learning=enable_learning,
@@ -977,7 +969,7 @@ class ExpressionClusterMemberListResponse(BaseModel):
 
 
 @router.get("/chats", response_model=ChatListResponse)
-async def get_chat_list(
+def get_chat_list(
     include_legacy: bool = Query(False, description="是否显示旧格式/非当前账号的表达方式聊天流"),
 ) -> ChatListResponse:
     """获取所有聊天列表。
@@ -1007,7 +999,7 @@ async def get_chat_list(
 
 
 @router.get("/chat-targets", response_model=ChatListResponse)
-async def get_chat_targets(
+def get_chat_targets(
     include_legacy: bool = Query(False, description="是否显示旧格式/非当前账号的聊天流"),
 ) -> ChatListResponse:
     """获取可作为导入目标的全部已知聊天流。"""
@@ -1041,7 +1033,7 @@ def is_global_expression_group_marker(platform: str, item_id: str) -> bool:
 
 
 @router.get("/groups", response_model=ExpressionGroupListResponse)
-async def get_expression_groups(
+def get_expression_groups(
     include_legacy: bool = Query(False, description="是否显示旧格式/非当前账号的表达方式"),
 ) -> ExpressionGroupListResponse:
     """获取已解析的表达共享组。"""
@@ -1049,6 +1041,12 @@ async def get_expression_groups(
         groups: List[ExpressionGroupInfo] = []
         with get_db_session() as session:
             all_expression_chat_ids = get_visible_expression_chat_ids(session, include_legacy)
+            chat_sessions_by_id = {
+                chat_session.session_id: chat_session
+                for chat_session in session.exec(
+                    select(ChatSession).where(col(ChatSession.session_id).in_(all_expression_chat_ids))
+                ).all()
+            }
             for index, expression_group in enumerate(global_config.expression.expression_groups):
                 chat_ids: set[str] = set()
                 is_global = False
@@ -1066,7 +1064,10 @@ async def get_expression_groups(
                     is_global = True
 
                 resolved_chat_ids = sorted(all_expression_chat_ids if is_global else chat_ids & all_expression_chat_ids)
-                members = [build_chat_info(chat_id, session) for chat_id in resolved_chat_ids]
+                members = [
+                    build_chat_info(chat_id, session, chat_sessions_by_id.get(chat_id))
+                    for chat_id in resolved_chat_ids
+                ]
                 groups.append(
                     ExpressionGroupInfo(
                         index=index,
@@ -1096,6 +1097,15 @@ def read_expression_vector_index_payload() -> tuple[Path, Optional[dict[str, Any
     if not isinstance(payload, dict):
         raise ValueError(f"表达向量索引格式异常: {index_path}")
     return index_path, payload
+
+
+@router.get("/vector-build-progress")
+def get_expression_vector_build_progress() -> dict[str, Any]:
+    """读取表达向量补建进度；同步文件和数据库扫描交由 FastAPI 线程池执行。"""
+
+    return expression_vector_index.get_history_backfill_progress(
+        index_path=global_config.expression.expression_vector_index_path,
+    )
 
 
 def expression_cluster_member_to_response(raw_member: dict[str, Any]) -> ExpressionClusterMemberResponse:
@@ -1161,7 +1171,7 @@ def find_cluster_summary(
 
 
 @router.get("/clusters", response_model=ExpressionClusterListResponse)
-async def get_expression_clusters() -> ExpressionClusterListResponse:
+def get_expression_clusters() -> ExpressionClusterListResponse:
     """获取表达向量聚类摘要。"""
 
     try:
@@ -1188,7 +1198,7 @@ async def get_expression_clusters() -> ExpressionClusterListResponse:
 
 
 @router.get("/clusters/{cluster_id}/members", response_model=ExpressionClusterMemberListResponse)
-async def get_expression_cluster_members(
+def get_expression_cluster_members(
     cluster_id: int,
     profile_marker: Optional[str] = Query(None, description="embedding profile marker"),
 ) -> ExpressionClusterMemberListResponse:
@@ -1226,7 +1236,7 @@ async def get_expression_cluster_members(
 
 
 @router.get("/list", response_model=ExpressionListResponse)
-async def get_expression_list(
+def get_expression_list(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     search: Optional[str] = Query(None, description="搜索关键词"),
@@ -1329,7 +1339,7 @@ async def get_expression_list(
 
 
 @router.post("/export", response_model=ExpressionExportResponse)
-async def export_expressions(request: ExpressionExportRequest) -> ExpressionExportResponse:
+def export_expressions(request: ExpressionExportRequest) -> ExpressionExportResponse:
     """按单个聊天流导出表达方式，导出内容不包含 session_id。"""
 
     try:
@@ -1368,7 +1378,7 @@ async def export_expressions(request: ExpressionExportRequest) -> ExpressionExpo
 
 
 @router.post("/import", response_model=ExpressionImportResponse)
-async def import_expressions(request: ExpressionImportRequest) -> ExpressionImportResponse:
+def import_expressions(request: ExpressionImportRequest) -> ExpressionImportResponse:
     """将表达方式 JSON 导入到指定聊天流。"""
 
     try:
@@ -1434,7 +1444,7 @@ async def import_expressions(request: ExpressionImportRequest) -> ExpressionImpo
 
 
 @router.post("/clear", response_model=ExpressionClearResponse)
-async def clear_expressions(request: ExpressionClearRequest) -> ExpressionClearResponse:
+def clear_expressions(request: ExpressionClearRequest) -> ExpressionClearResponse:
     """清除指定聊天流下的全部表达方式，允许清除旧的无效 session_id 数据。"""
 
     try:
@@ -1456,7 +1466,7 @@ async def clear_expressions(request: ExpressionClearRequest) -> ExpressionClearR
 
 
 @router.post("/legacy-import/preview", response_model=LegacyExpressionImportPreviewResponse)
-async def preview_legacy_expression_import(
+def preview_legacy_expression_import(
     request: LegacyExpressionImportPreviewRequest,
 ) -> LegacyExpressionImportPreviewResponse:
     """预览旧版数据库表达方式导入分组。"""
@@ -1493,7 +1503,7 @@ async def preview_legacy_expression_import_file(
 
 
 @router.post("/legacy-import/import", response_model=LegacyExpressionImportResponse)
-async def import_legacy_expressions(request: LegacyExpressionImportRequest) -> LegacyExpressionImportResponse:
+def import_legacy_expressions(request: LegacyExpressionImportRequest) -> LegacyExpressionImportResponse:
     """按预览后的映射从旧版数据库导入表达方式。"""
 
     try:
@@ -1605,7 +1615,7 @@ async def import_legacy_expressions(request: LegacyExpressionImportRequest) -> L
 
 
 @router.get("/{expression_id}", response_model=ExpressionDetailResponse)
-async def get_expression_detail(expression_id: int) -> ExpressionDetailResponse:
+def get_expression_detail(expression_id: int) -> ExpressionDetailResponse:
     """获取表达方式详细信息。
 
     Args:
@@ -1634,7 +1644,7 @@ async def get_expression_detail(expression_id: int) -> ExpressionDetailResponse:
 
 
 @router.post("/", response_model=ExpressionCreateResponse)
-async def create_expression(
+def create_expression(
     request: ExpressionCreateRequest,
 ) -> ExpressionCreateResponse:
     """创建新的表达方式。
@@ -1677,7 +1687,7 @@ async def create_expression(
 
 
 @router.patch("/{expression_id}", response_model=ExpressionUpdateResponse)
-async def update_expression(
+def update_expression(
     expression_id: int,
     request: ExpressionUpdateRequest,
 ) -> ExpressionUpdateResponse:
@@ -1731,7 +1741,7 @@ async def update_expression(
 
 
 @router.patch("/{expression_id}/review-status", response_model=ExpressionUpdateResponse)
-async def update_expression_review_status(
+def update_expression_review_status(
     expression_id: int,
     request: ExpressionReviewStatusRequest,
 ) -> ExpressionUpdateResponse:
@@ -1761,7 +1771,7 @@ async def update_expression_review_status(
 
 
 @router.delete("/{expression_id}", response_model=ExpressionDeleteResponse)
-async def delete_expression(expression_id: int) -> ExpressionDeleteResponse:
+def delete_expression(expression_id: int) -> ExpressionDeleteResponse:
     """删除表达方式。
 
     Args:
@@ -1801,7 +1811,7 @@ class BatchDeleteRequest(BaseModel):
 
 
 @router.post("/batch/delete", response_model=ExpressionDeleteResponse)
-async def batch_delete_expressions(
+def batch_delete_expressions(
     request: BatchDeleteRequest,
 ) -> ExpressionDeleteResponse:
     """批量删除表达方式。
@@ -1842,7 +1852,7 @@ async def batch_delete_expressions(
 
 
 @router.get("/stats/summary")
-async def get_expression_stats(
+def get_expression_stats(
     include_legacy: bool = Query(False, description="是否显示旧格式/非当前账号的表达方式"),
 ) -> Dict[str, Any]:
     """获取表达方式统计数据。
@@ -1927,7 +1937,7 @@ def count_expressions(session: Any, statement: Any) -> int:
 
 
 @router.get("/review/stats", response_model=ReviewStatsResponse)
-async def get_review_stats() -> ReviewStatsResponse:
+def get_review_stats() -> ReviewStatsResponse:
     """获取审核统计数据。
 
     Returns:
@@ -1979,7 +1989,7 @@ class ReviewListResponse(BaseModel):
 
 
 @router.get("/review/list", response_model=ReviewListResponse)
-async def get_review_list(
+def get_review_list(
     page: int = Query(1, ge=1, description="页码"),
     page_size: int = Query(20, ge=1, le=100, description="每页数量"),
     filter_type: str = Query("unchecked", description="筛选类型: unchecked/passed/all"),
@@ -2098,7 +2108,7 @@ class BatchReviewResponse(BaseModel):
 
 
 @router.get("/review/logs", response_model=ExpressionReviewLogListResponse)
-async def get_expression_review_logs(
+def get_expression_review_logs(
     limit: int = Query(50, ge=1, le=200, description="返回最近多少条 AI 审核记录"),
     passed: Optional[bool] = Query(None, description="按 AI 审核是否通过筛选"),
     chat_id: Optional[str] = Query(None, description="按聊天流 ID 筛选"),
@@ -2120,7 +2130,7 @@ async def get_expression_review_logs(
 
 
 @router.post("/review/logs/{review_log_id}/approve", response_model=ExpressionReviewLogApproveResponse)
-async def approve_expression_review_log(review_log_id: str) -> ExpressionReviewLogApproveResponse:
+def approve_expression_review_log(review_log_id: str) -> ExpressionReviewLogApproveResponse:
     """将 AI 审核日志中的表达方式设为人工审核通过，必要时从日志恢复记录。"""
 
     try:
@@ -2197,7 +2207,7 @@ async def approve_expression_review_log(review_log_id: str) -> ExpressionReviewL
 
 
 @router.post("/review/batch", response_model=BatchReviewResponse)
-async def batch_review_expressions(
+def batch_review_expressions(
     request: BatchReviewRequest,
 ) -> BatchReviewResponse:
     """批量审核表达方式。

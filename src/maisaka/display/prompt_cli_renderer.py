@@ -5,15 +5,34 @@ from __future__ import annotations
 from base64 import b64decode
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, Mapping, Sequence, TypeAlias
 from urllib.parse import quote
 
 import hashlib
 import json
+import os
 
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.text import Text
+
+from src.llm_models.model_client.base_client import GenerationAttempt
+from src.llm_models.payload_content.context_item import (
+    AssistantMessageItem,
+    ContextImagePart,
+    ContextItem,
+    ContextItemMeta,
+    ContextRefusalPart,
+    ContextTextPart,
+    FunctionCallItem,
+    FunctionCallOutputItem,
+    ProviderActivityItem,
+    ProviderOpaqueItem,
+    ReasoningItem,
+    SystemMessageItem,
+    UserMessageItem,
+    get_item_text,
+)
 
 from .display_utils import (
     format_token_count,
@@ -27,6 +46,8 @@ DATA_IMAGE_DIR = REPO_ROOT / "data" / "images"
 DATA_EMOJI_DIR = REPO_ROOT / "data" / "emoji"
 DATA_PROMPT_IMAGE_DIR = REPO_ROOT / "data" / "prompt_imgs"
 SUPPORTED_STRUCTURED_IMAGE_FORMATS = {"jpg", "jpeg", "png", "webp", "gif"}
+PROVIDER_RESPONSE_BASE64_OMIT_THRESHOLD_BYTES = 64 * 1024
+GenerationAttemptInput: TypeAlias = GenerationAttempt | Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -75,8 +96,10 @@ def _select_webui_local_host(hosts: Any) -> str:
 
 
 def _resolve_prompt_preview_route_target(file_path: Path) -> PromptPreviewRouteTarget | None:
+    # 预览目录与预览文件路径都已是绝对路径，这里只做字符串规范化，
+    # 不做 realpath：Windows 上 realpath 需要访问文件系统，开销远高于路径计算。
     try:
-        relative_path = file_path.resolve().relative_to(PromptPreviewLogger._BASE_DIR.resolve())
+        relative_path = Path(os.path.abspath(file_path)).relative_to(PromptPreviewLogger._BASE_DIR)
     except ValueError:
         return None
 
@@ -125,6 +148,7 @@ class PromptPreviewAccess:
     record_uri: str
     preview_web_uri: str
     reasoning_web_uri: str | None
+    payload: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -157,7 +181,66 @@ class PromptCLIVisualizer:
             except (TypeError, ValueError):
                 pass
 
+        for token_key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+            raw_token_count = metadata.get(token_key)
+            if isinstance(raw_token_count, int) and not isinstance(raw_token_count, bool):
+                normalized[token_key] = max(raw_token_count, 0)
+        if "total_tokens" not in normalized and all(
+            token_key in normalized for token_key in ("prompt_tokens", "completion_tokens")
+        ):
+            normalized["total_tokens"] = normalized["prompt_tokens"] + normalized["completion_tokens"]
+
         return normalized
+
+    @staticmethod
+    def _extract_token_metadata_from_attempts(attempts: Sequence[Mapping[str, Any]]) -> dict[str, int]:
+        """从已序列化的 Generation Attempt 中提取最近一次有效 Token 用量。"""
+
+        for attempt in reversed(attempts):
+            trace = attempt.get("trace")
+            if isinstance(trace, Mapping):
+                trace_tokens = {
+                    token_key: trace.get(token_key)
+                    for token_key in ("prompt_tokens", "completion_tokens", "total_tokens")
+                }
+                if any(isinstance(token_count, int) and token_count > 0 for token_count in trace_tokens.values()):
+                    normalized_trace_tokens = {
+                        token_key: max(token_count, 0)
+                        for token_key, token_count in trace_tokens.items()
+                        if isinstance(token_count, int) and not isinstance(token_count, bool)
+                    }
+                    if "total_tokens" not in normalized_trace_tokens and all(
+                        token_key in normalized_trace_tokens for token_key in ("prompt_tokens", "completion_tokens")
+                    ):
+                        normalized_trace_tokens["total_tokens"] = (
+                            normalized_trace_tokens["prompt_tokens"] + normalized_trace_tokens["completion_tokens"]
+                        )
+                    return normalized_trace_tokens
+
+            wire_response = attempt.get("wire_response")
+            usage = wire_response.get("usage") if isinstance(wire_response, Mapping) else None
+            if not isinstance(usage, Mapping):
+                continue
+            usage_tokens = {
+                "prompt_tokens": usage.get("prompt_tokens", usage.get("input_tokens")),
+                "completion_tokens": usage.get("completion_tokens", usage.get("output_tokens")),
+                "total_tokens": usage.get("total_tokens"),
+            }
+            if any(isinstance(token_count, int) and token_count > 0 for token_count in usage_tokens.values()):
+                normalized_usage_tokens = {
+                    token_key: max(token_count, 0)
+                    for token_key, token_count in usage_tokens.items()
+                    if isinstance(token_count, int) and not isinstance(token_count, bool)
+                }
+                if "total_tokens" not in normalized_usage_tokens and all(
+                    token_key in normalized_usage_tokens for token_key in ("prompt_tokens", "completion_tokens")
+                ):
+                    normalized_usage_tokens["total_tokens"] = (
+                        normalized_usage_tokens["prompt_tokens"] + normalized_usage_tokens["completion_tokens"]
+                    )
+                return normalized_usage_tokens
+
+        return {}
 
     @staticmethod
     def get_request_panel_style(request_kind: str) -> tuple[str, str]:
@@ -199,7 +282,6 @@ class PromptCLIVisualizer:
     @staticmethod
     def _build_image_cache_path(image_format: str, image_bytes: bytes) -> Path:
         image_format = PromptCLIVisualizer._normalize_image_format(image_format) or "bin"
-        DATA_PROMPT_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(image_bytes).hexdigest()
         return DATA_PROMPT_IMAGE_DIR / f"{digest}.{image_format}"
 
@@ -215,7 +297,7 @@ class PromptCLIVisualizer:
 
     @staticmethod
     def _build_image_file_link(image_format: str, image_base64: str) -> tuple[str, Path] | None:
-        """优先返回已有 data 图片路径；不存在时落盘到 prompt 图片缓存。"""
+        """优先返回已有 data 图片路径；不存在时登记后台落盘的 prompt 图片。"""
         normalized_format = PromptCLIVisualizer._normalize_image_format(image_format) or "bin"
         try:
             image_bytes = b64decode(image_base64)
@@ -227,11 +309,7 @@ class PromptCLIVisualizer:
             return build_file_uri(official_path), official_path
 
         path = PromptCLIVisualizer._build_image_cache_path(normalized_format, image_bytes)
-        if not path.exists():
-            try:
-                path.write_bytes(image_bytes)
-            except Exception:
-                return None
+        PromptPreviewLogger.add_image_asset(path, image_bytes)
         return build_file_uri(path), path
 
     @staticmethod
@@ -296,6 +374,88 @@ class PromptCLIVisualizer:
         return normalize_tool_call_for_display(tool_call)
 
     @classmethod
+    def _project_context_item_for_display(cls, item: ContextItem) -> dict[str, Any]:
+        """把 Context Item 投影为日志/WebUI 结构，不暴露 replay payload。"""
+
+        payload: dict[str, Any] = {
+            "item_id": item.meta.item_id,
+            "item_type": item.__class__.__name__,
+            "logical_turn_id": item.meta.logical_turn_id,
+        }
+        if isinstance(item, SystemMessageItem):
+            payload["role"] = "system"
+        elif isinstance(item, UserMessageItem):
+            payload["role"] = "user"
+        elif isinstance(item, AssistantMessageItem):
+            payload["role"] = "assistant"
+        elif isinstance(item, ReasoningItem):
+            payload.update(
+                {
+                    "content": get_item_text(item),
+                    "reasoning_representation": item.representation.value,
+                    "role": "reasoning",
+                }
+            )
+            return payload
+        elif isinstance(item, FunctionCallItem):
+            payload.update(
+                {
+                    "content": "",
+                    "role": "function_call",
+                    "tool_calls": [
+                        {
+                            "id": item.tool_call.call_id,
+                            "function": {
+                                "name": item.tool_call.func_name,
+                                "arguments": item.tool_call.materialize_args(),
+                            },
+                        }
+                    ],
+                }
+            )
+            return payload
+        elif isinstance(item, FunctionCallOutputItem):
+            payload.update(
+                {
+                    "content": item.output,
+                    "role": "tool",
+                    "tool_call_id": item.call_id,
+                    "tool_name": item.tool_name,
+                }
+            )
+            return payload
+        elif isinstance(item, ProviderActivityItem):
+            payload.update(
+                {
+                    "content": item.display_summary,
+                    "provider_type": item.provider_type,
+                    "role": "provider_activity",
+                    "status": item.status,
+                }
+            )
+            return payload
+        elif isinstance(item, ProviderOpaqueItem):
+            payload.update(
+                {
+                    "content": item.display_summary,
+                    "provider_type": item.provider_type,
+                    "role": "provider_opaque",
+                }
+            )
+            return payload
+
+        content: list[Any] = []
+        for part in item.parts:
+            if isinstance(part, ContextTextPart):
+                content.append(part.text)
+            elif isinstance(part, ContextImagePart):
+                content.append((part.image_format, part.image_base64))
+            elif isinstance(part, ContextRefusalPart):
+                content.append(part.refusal)
+        payload["content"] = content
+        return payload
+
+    @classmethod
     def _serialize_message_content_for_dump(cls, content: Any) -> str:
         if isinstance(content, str):
             return content
@@ -333,31 +493,34 @@ class PromptCLIVisualizer:
             return str(content)
 
     @classmethod
-    def build_prompt_dump_text(cls, messages: list[Any]) -> str:
+    def build_prompt_dump_text(cls, messages: Sequence[Any]) -> str:
         """构建用于结果摘要与调试展示的纯文本 Prompt。"""
 
         sections: list[str] = []
-        for index, message in enumerate(messages, start=1):
-            if isinstance(message, dict):
-                raw_role = message.get("role", "unknown")
-                content = message.get("content")
-                tool_call_id = message.get("tool_call_id")
-                tool_calls = message.get("tool_calls") or []
-            else:
-                raw_role = getattr(message, "role", "unknown")
-                content = getattr(message, "content", None)
-                tool_call_id = getattr(message, "tool_call_id", None)
-                tool_calls = getattr(message, "tool_calls", None) or []
+        for index, item in enumerate(cls._normalize_context_items(messages), start=1):
+            message = cls._project_context_item_for_display(item)
+            raw_role = message.get("role", "unknown")
+            content = message.get("content")
+            reasoning_content = message.get("reasoning_content")
+            tool_call_id = message.get("tool_call_id")
+            tool_name = message.get("tool_name")
+            tool_calls = message.get("tool_calls") or []
 
             role = raw_role.value if hasattr(raw_role, "value") else str(raw_role)
             block_lines = [f"[{index}] role={role}"]
             if tool_call_id:
                 block_lines.append(f"tool_call_id={tool_call_id}")
+            if tool_name:
+                block_lines.append(f"tool_name={tool_name}")
 
             normalized_content = cls._serialize_message_content_for_dump(content)
             if normalized_content:
                 block_lines.append("")
                 block_lines.append(normalized_content)
+            if reasoning_content:
+                block_lines.append("")
+                block_lines.append("reasoning_content:")
+                block_lines.append(str(reasoning_content))
 
             if tool_calls:
                 block_lines.append("")
@@ -421,9 +584,7 @@ class PromptCLIVisualizer:
         }
         image_reference = cls._build_structured_image_reference(image_format, image_base64)
         embedded_image_reference = {
-            key: value
-            for key, value in image_reference.items()
-            if key not in {"type", "image_format"}
+            key: value for key, value in image_reference.items() if key not in {"type", "image_format"}
         }
 
         sanitized_item.update(
@@ -456,111 +617,234 @@ class PromptCLIVisualizer:
             if image_dict_pair is not None:
                 image_format, image_base64 = image_dict_pair
                 return cls._build_structured_image_content_part(value, image_format, image_base64)
-            return {
-                key: cls._sanitize_structured_value(item, keep_base64=False)
-                for key, item in value.items()
-            }
+            return {key: cls._sanitize_structured_value(item, keep_base64=False) for key, item in value.items()}
 
         if isinstance(value, list):
             return [cls._sanitize_structured_value(item, keep_base64=False) for item in value]
 
         return value
 
-    @classmethod
-    def build_structured_message_payload(cls, messages: list[Any], *, keep_base64: bool) -> list[dict[str, Any]]:
-        """构建 WebUI 可直接解析的 Prompt 消息结构。"""
+    @staticmethod
+    def _build_omitted_binary_reference(
+        value: str | bytes,
+        *,
+        size_bytes: int,
+        media_type: str = "",
+    ) -> dict[str, Any]:
+        """为未写入 Prompt JSON 的大块 Base64 或二进制数据构建可核验占位。"""
 
-        structured_messages: list[dict[str, Any]] = []
-        for index, message in enumerate(messages, start=1):
-            if isinstance(message, dict):
-                raw_role = message.get("role", "unknown")
-                content = message.get("content")
-                tool_call_id = message.get("tool_call_id")
-                tool_calls = message.get("tool_calls") or []
-            else:
-                raw_role = getattr(message, "role", "unknown")
-                content = getattr(message, "content", None)
-                tool_call_id = getattr(message, "tool_call_id", None)
-                tool_calls = getattr(message, "tool_calls", None) or []
-
-            role = raw_role.value if hasattr(raw_role, "value") else str(raw_role)
-            structured_message: dict[str, Any] = {
-                "index": index,
-                "role": role,
-                "content": cls._sanitize_structured_value(content, keep_base64=keep_base64),
-            }
-            if tool_call_id:
-                structured_message["tool_call_id"] = str(tool_call_id)
-            if tool_calls:
-                structured_message["tool_calls"] = [
-                    cls._sanitize_structured_value(
-                        cls.format_tool_call_for_display(tool_call),
-                        keep_base64=keep_base64,
-                    )
-                    for tool_call in tool_calls
-                ]
-            structured_messages.append(structured_message)
-
-        return structured_messages
-
-    @classmethod
-    def _build_structured_output_payload(
-        cls,
-        output_content: Any | None,
-        output_title: str,
-        output_tool_calls: list[Any] | None,
-        keep_base64: bool,
-    ) -> dict[str, Any] | None:
-        normalized_tool_calls = [
-            cls._sanitize_structured_value(
-                cls.format_tool_call_for_display(tool_call),
-                keep_base64=keep_base64,
-            )
-            for tool_call in (output_tool_calls or [])
-        ]
-        if output_content in (None, "", []) and not normalized_tool_calls:
-            return None
-
-        payload: dict[str, Any] = {
-            "title": output_title,
-            "content": cls._sanitize_structured_value(output_content, keep_base64=keep_base64),
+        raw_bytes = value.encode("utf-8") if isinstance(value, str) else value
+        reference: dict[str, Any] = {
+            "type": "omitted_binary",
+            "size_bytes": size_bytes,
+            "sha256": hashlib.sha256(raw_bytes).hexdigest(),
         }
-        if normalized_tool_calls:
-            payload["tool_calls"] = normalized_tool_calls
-        return payload
+        if isinstance(value, str):
+            reference["base64_omitted"] = True
+            reference["encoded_chars"] = len(value)
+        else:
+            reference["binary_omitted"] = True
+        if media_type:
+            reference["media_type"] = media_type
+        return reference
+
+    @staticmethod
+    def _looks_like_large_base64(value: str) -> bool:
+        """识别超过阈值的普通或 URL-safe Base64 字符串。"""
+
+        normalized = value.strip()
+        if len(normalized) * 3 // 4 <= PROVIDER_RESPONSE_BASE64_OMIT_THRESHOLD_BYTES:
+            return False
+        allowed_characters = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=_-")
+        return bool(normalized) and all(character in allowed_characters for character in normalized)
+
+    @classmethod
+    def _sanitize_provider_response_value(
+        cls,
+        value: Any,
+        *,
+        keep_base64: bool,
+        key: str = "",
+    ) -> Any:
+        """保留可观测字段，并始终省略只服务于原生回放的 opaque 数据。"""
+
+        normalized_key = key.strip().lower().replace("-", "_")
+        if normalized_key in {"encrypted_content", "thought_signature"}:
+            return "[仅在内存 replay fragment 中保留]"
+        if isinstance(value, bytes):
+            if keep_base64:
+                return value
+            return cls._build_omitted_binary_reference(value, size_bytes=len(value))
+        if isinstance(value, str):
+            if keep_base64:
+                return value
+            normalized_value = value.strip()
+            if normalized_value.startswith("data:") and ";base64," in normalized_value:
+                header, base64_value = normalized_value.split(",", maxsplit=1)
+                size_bytes = max(0, len(base64_value) * 3 // 4)
+                if size_bytes > PROVIDER_RESPONSE_BASE64_OMIT_THRESHOLD_BYTES:
+                    media_type = header.removeprefix("data:").split(";", maxsplit=1)[0]
+                    return cls._build_omitted_binary_reference(
+                        base64_value,
+                        size_bytes=size_bytes,
+                        media_type=media_type,
+                    )
+                return value
+            if cls._looks_like_large_base64(normalized_value):
+                return cls._build_omitted_binary_reference(
+                    normalized_value,
+                    size_bytes=max(0, len(normalized_value) * 3 // 4),
+                )
+            return value
+        if isinstance(value, dict):
+            return {
+                str(item_key): cls._sanitize_provider_response_value(
+                    item,
+                    keep_base64=keep_base64,
+                    key=str(item_key),
+                )
+                for item_key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [cls._sanitize_provider_response_value(item, keep_base64=keep_base64) for item in value]
+        return value
+
+    @classmethod
+    def _normalize_context_items(cls, items: Sequence[Any]) -> list[ContextItem]:
+        """只接受运行时 Context Items 或已序列化 Item 快照。"""
+
+        # 延迟导入以避开 request_snapshot -> model_client -> display 的初始化环。
+        from src.llm_models.request_snapshot import deserialize_context_item_snapshot
+
+        normalized_items: list[ContextItem] = []
+        for item in items:
+            if isinstance(
+                item,
+                (
+                    SystemMessageItem,
+                    UserMessageItem,
+                    AssistantMessageItem,
+                    ReasoningItem,
+                    FunctionCallItem,
+                    FunctionCallOutputItem,
+                    ProviderActivityItem,
+                    ProviderOpaqueItem,
+                ),
+            ):
+                normalized_items.append(item)
+                continue
+
+            if isinstance(item, Mapping):
+                normalized_items.append(deserialize_context_item_snapshot(dict(item)))
+                continue
+            raise TypeError(
+                "Prompt 渲染器仅接受 ContextItem 或 Item 快照，"
+                f"实际收到 {item.__class__.__name__}"
+            )
+        return normalized_items
+
+    @classmethod
+    def build_structured_context_item_payload(
+        cls,
+        items: Sequence[Any],
+        *,
+        keep_base64: bool,
+    ) -> list[dict[str, Any]]:
+        """构建 Item-first 结构化记录；图片只在持久化边界替换为安全引用。"""
+
+        from src.llm_models.request_snapshot import serialize_context_item_snapshot
+
+        structured_items: list[dict[str, Any]] = []
+        for item in items:
+            if (
+                isinstance(item, Mapping)
+                and isinstance(item.get("item_type"), str)
+                and isinstance(item.get("meta"), Mapping)
+            ):
+                structured_items.append(
+                    cls.sanitize_structured_context_item_snapshot(item, keep_base64=keep_base64)
+                )
+                continue
+
+            structured_items.extend(
+                cls.sanitize_structured_context_item_snapshot(
+                    serialize_context_item_snapshot(normalized_item),
+                    keep_base64=keep_base64,
+                )
+                for normalized_item in cls._normalize_context_items([item])
+            )
+        return structured_items
+
+    @classmethod
+    def sanitize_structured_context_item_snapshot(
+        cls,
+        item: Mapping[str, Any],
+        *,
+        keep_base64: bool,
+    ) -> dict[str, Any]:
+        """在持久化边界安全处理一个已经序列化的 Context Item。"""
+
+        sanitized_item = cls._sanitize_structured_value(dict(item), keep_base64=keep_base64)
+        if not isinstance(sanitized_item, dict):
+            raise TypeError("Context Item 快照清理后必须保持字典结构")
+        return sanitized_item
 
     @classmethod
     def _build_structured_preview_payload(
         cls,
-        messages: list[Any],
+        request_items: list[Any],
         *,
         request_kind: str,
         selection_reason: str,
         tool_definitions: list[dict[str, Any]] | None,
-        output_content: Any | None,
         output_title: str,
-        output_tool_calls: list[Any] | None,
+        output_items: Sequence[Any],
         metadata: Mapping[str, Any] | None,
+        generation_attempts: Sequence[GenerationAttemptInput],
         keep_base64: bool,
     ) -> dict[str, Any]:
         """构建 Prompt 预览 JSON，供 WebUI 稳定解析展示。"""
 
-        return {
-            "schema_version": 3,
+        serialized_attempts = [cls._build_generation_attempt_payload(attempt) for attempt in generation_attempts]
+        normalized_metadata = cls._normalize_preview_metadata(metadata)
+        attempt_token_metadata = cls._extract_token_metadata_from_attempts(serialized_attempts)
+        for token_key, token_count in attempt_token_metadata.items():
+            normalized_metadata.setdefault(token_key, token_count)
+
+        payload = {
+            "schema_version": 6,
             "request": {
                 "kind": request_kind,
                 "selection_reason": selection_reason,
             },
-            "metadata": cls._normalize_preview_metadata(metadata),
-            "messages": cls.build_structured_message_payload(messages, keep_base64=keep_base64),
-            "output": cls._build_structured_output_payload(
-                output_content,
-                output_title,
-                output_tool_calls,
-                keep_base64,
+            "metadata": normalized_metadata,
+            "presentation": {"output_title": output_title},
+            "request_items": cls.build_structured_context_item_payload(
+                request_items,
+                keep_base64=keep_base64,
+            ),
+            "output_items": cls.build_structured_context_item_payload(
+                output_items,
+                keep_base64=keep_base64,
             ),
             "tool_definitions": tool_definitions or [],
+            "generation_attempts": serialized_attempts,
         }
+        return payload
+
+    @classmethod
+    def _build_generation_attempt_payload(cls, attempt: GenerationAttemptInput) -> dict[str, Any]:
+        """把 Attempt DTO 或已有 v6 快照规范化为 JSON-safe 结构。"""
+
+        if isinstance(attempt, Mapping):
+            sanitized_attempt = cls._sanitize_provider_response_value(dict(attempt), keep_base64=False)
+            if not isinstance(sanitized_attempt, dict):
+                raise TypeError("Generation Attempt 快照必须是字典")
+            return sanitized_attempt
+
+        from src.llm_models.request_snapshot import serialize_generation_attempt
+
+        return serialize_generation_attempt(attempt)
 
     @classmethod
     def _build_preview_access_body(
@@ -633,6 +917,7 @@ class PromptCLIVisualizer:
             record_link_text="点击打开 JSON 记录",
         )
         return PromptPreviewAccess(
+            payload=payload,
             body=body,
             record_path=record_path,
             record_uri=build_file_uri(record_path),
@@ -643,96 +928,98 @@ class PromptCLIVisualizer:
     @classmethod
     def build_prompt_preview_access(
         cls,
-        messages: list[Any],
+        request_items: list[Any],
         *,
         category: str,
         chat_id: str,
         request_kind: str,
         selection_reason: str,
         tool_definitions: list[dict[str, Any]] | None = None,
-        output_content: Any | None = None,
         output_title: str = "输出结果",
-        output_tool_calls: list[Any] | None = None,
+        output_items: Sequence[Any] = (),
         metadata: Mapping[str, Any] | None = None,
+        generation_attempts: Sequence[GenerationAttemptInput] = (),
+        keep_base64: bool | None = None,
     ) -> PromptPreviewAccess:
         """保存 Prompt 预览文件，并返回 CLI 展示入口与浏览器可打开的 URI。"""
 
-        keep_json_base64 = cls._should_keep_prompt_preview_json_base64()
-        return cls._save_structured_preview_access(
-            chat_id=chat_id,
-            category=category,
-            payload=cls._build_structured_preview_payload(
-                messages,
-                request_kind=request_kind,
-                selection_reason=selection_reason,
-                tool_definitions=tool_definitions,
-                output_content=output_content,
-                output_title=output_title,
-                output_tool_calls=output_tool_calls,
-                metadata=metadata,
-                keep_base64=keep_json_base64,
-            ),
-        )
+        with PromptPreviewLogger.collect_image_assets():
+            keep_json_base64 = cls._should_keep_prompt_preview_json_base64() if keep_base64 is None else keep_base64
+            return cls._save_structured_preview_access(
+                chat_id=chat_id,
+                category=category,
+                payload=cls._build_structured_preview_payload(
+                    request_items,
+                    request_kind=request_kind,
+                    selection_reason=selection_reason,
+                    tool_definitions=tool_definitions,
+                    output_title=output_title,
+                    output_items=output_items,
+                    metadata=metadata,
+                    generation_attempts=generation_attempts,
+                    keep_base64=keep_json_base64,
+                ),
+            )
 
     @classmethod
     def build_prompt_access_panel(
         cls,
-        messages: list[Any],
+        request_items: list[Any],
         *,
         category: str,
         chat_id: str,
         request_kind: str,
         selection_reason: str,
         tool_definitions: list[dict[str, Any]] | None = None,
-        output_content: Any | None = None,
         output_title: str = "输出结果",
-        output_tool_calls: list[Any] | None = None,
+        output_items: Sequence[Any] = (),
         metadata: Mapping[str, Any] | None = None,
+        generation_attempts: Sequence[GenerationAttemptInput] = (),
     ) -> RenderableType:
         """构建用于查看完整 prompt 的折叠入口内容。"""
 
         return cls.build_prompt_preview_access(
-            messages,
+            request_items,
             category=category,
             chat_id=chat_id,
             request_kind=request_kind,
             selection_reason=selection_reason,
             tool_definitions=tool_definitions,
-            output_content=output_content,
             output_title=output_title,
-            output_tool_calls=output_tool_calls,
+            output_items=output_items,
             metadata=metadata,
+            generation_attempts=generation_attempts,
         ).body
 
     @classmethod
     def build_prompt_section_result(
         cls,
-        messages: list[Any],
+        request_items: list[Any],
         *,
         category: str,
         chat_id: str,
         request_kind: str,
         selection_reason: str,
         tool_definitions: list[dict[str, Any]] | None = None,
-        output_content: Any | None = None,
         output_title: str = "输出结果",
-        output_tool_calls: list[Any] | None = None,
+        output_items: Sequence[Any] = (),
         metadata: Mapping[str, Any] | None = None,
+        generation_attempts: Sequence[GenerationAttemptInput] = (),
     ) -> PromptSectionResult:
         """构建默认折叠的 Prompt 面板，并返回对应的结构化预览入口。"""
 
         panel_title, panel_border_style = cls.get_request_panel_style(request_kind)
         preview_access = cls.build_prompt_preview_access(
-            messages,
+            request_items,
             category=category,
             chat_id=chat_id,
             request_kind=request_kind,
             selection_reason=selection_reason,
             tool_definitions=tool_definitions,
-            output_content=output_content,
             output_title=output_title,
-            output_tool_calls=output_tool_calls,
+            output_items=output_items,
             metadata=metadata,
+            generation_attempts=generation_attempts,
         )
 
         return PromptSectionResult(
@@ -755,10 +1042,10 @@ class PromptCLIVisualizer:
         chat_id: str,
         request_kind: str,
         subtitle: str,
-        output_content: Any | None = None,
         output_title: str = "输出结果",
-        output_tool_calls: list[Any] | None = None,
+        output_items: Sequence[Any] = (),
         metadata: Mapping[str, Any] | None = None,
+        generation_attempts: Sequence[GenerationAttemptInput] = (),
     ) -> RenderableType:
         """构建文本型 Prompt 的折叠入口内容。"""
 
@@ -768,10 +1055,10 @@ class PromptCLIVisualizer:
             chat_id=chat_id,
             request_kind=request_kind,
             subtitle=subtitle,
-            output_content=output_content,
             output_title=output_title,
-            output_tool_calls=output_tool_calls,
+            output_items=output_items,
             metadata=metadata,
+            generation_attempts=generation_attempts,
         ).body
 
     @classmethod
@@ -783,26 +1070,32 @@ class PromptCLIVisualizer:
         chat_id: str,
         request_kind: str,
         subtitle: str,
-        output_content: Any | None = None,
         output_title: str = "输出结果",
-        output_tool_calls: list[Any] | None = None,
+        output_items: Sequence[Any] = (),
         metadata: Mapping[str, Any] | None = None,
+        generation_attempts: Sequence[GenerationAttemptInput] = (),
     ) -> PromptPreviewAccess:
         """保存文本型 Prompt 预览文件，并返回对应访问入口。"""
 
-        keep_json_base64 = cls._should_keep_prompt_preview_json_base64()
-        return cls._save_structured_preview_access(
-            chat_id=chat_id,
-            category=category,
-            payload=cls._build_structured_preview_payload(
-                [{"role": "user", "content": content}],
-                request_kind=request_kind,
-                selection_reason=subtitle,
-                tool_definitions=None,
-                output_content=output_content,
-                output_title=output_title,
-                output_tool_calls=output_tool_calls,
-                metadata=metadata,
-                keep_base64=keep_json_base64,
-            ),
-        )
+        with PromptPreviewLogger.collect_image_assets():
+            keep_json_base64 = cls._should_keep_prompt_preview_json_base64()
+            return cls._save_structured_preview_access(
+                chat_id=chat_id,
+                category=category,
+                payload=cls._build_structured_preview_payload(
+                    [
+                        UserMessageItem(
+                            meta=ContextItemMeta.create(),
+                            parts=(ContextTextPart(content),),
+                        )
+                    ],
+                    request_kind=request_kind,
+                    selection_reason=subtitle,
+                    tool_definitions=None,
+                    output_title=output_title,
+                    output_items=output_items,
+                    metadata=metadata,
+                    generation_attempts=generation_attempts,
+                    keep_base64=keep_json_base64,
+                ),
+            )

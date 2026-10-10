@@ -1,4 +1,4 @@
-import { AlertCircle, CheckCircle2, Download, Loader2, RefreshCw, ThumbsUp, Trash2 } from 'lucide-react'
+import { AlertCircle, CheckCircle2, Download, Info, Loader2, RefreshCw, ThumbsUp, Trash2 } from 'lucide-react'
 
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -15,6 +15,7 @@ interface PluginCardProps {
   maimaiVersion: MaimaiVersion | null
   pluginStats: Record<string, PluginStatsData>
   loadProgress: PluginLoadProgress | null
+  isAnyPluginInstalling?: boolean
   likingPluginIds: Set<string>
   onInstall: (plugin: PluginInfo) => void
   onLike: (plugin: PluginInfo) => void
@@ -33,6 +34,7 @@ export function PluginCard({
   maimaiVersion,
   pluginStats,
   loadProgress,
+  isAnyPluginInstalling = false,
   likingPluginIds,
   onInstall,
   onLike,
@@ -48,58 +50,94 @@ export function PluginCard({
     .map(id => id ? pluginStats[id] : undefined)
     .find(Boolean)
   const likeCount = stats?.likes ?? 0
+  const downloadCount = stats?.downloads ?? plugin.downloads ?? 0
+  const ratingValue = stats?.rating ?? plugin.rating ?? 0
+  const reviewCount = stats?.comment_count ?? plugin.review_count ?? 0
   const isLiked = stats?.liked === true
   const isLiking = likingPluginIds.has(plugin.manifest?.id || plugin.id)
   const isInstalling = loadProgress?.operation === 'install'
     && loadProgress.stage === 'loading'
     && loadProgress?.plugin_id === plugin.id
-  const isAnyPluginInstalling = loadProgress?.operation === 'install' && loadProgress.stage === 'loading'
+  const isPluginOperating = loadProgress?.stage === 'loading'
+    && loadProgress.operation !== 'fetch'
   const progressDetail = loadProgress ? getPluginProgressDetail(loadProgress) : null
 
   return (
     <Card
       key={plugin.id}
-      className="flex h-full flex-col transition-shadow hover:shadow-md"
+      data-plugin-market-card="true"
+      className="flex h-full flex-col"
     >
       <CardHeader className="p-4 pb-2.5">
         <div className="flex items-start justify-between gap-2">
-          <div className="flex min-w-0 items-start gap-2.5">
-            <PluginIcon
-              pluginId={plugin.id}
-              manifest={plugin.manifest}
-              installed={plugin.installed}
-              marketplaceIconUrl={plugin.assets?.icon_64}
-              className="h-9 w-9 rounded-md"
-              iconClassName="h-4 w-4"
-            />
-            <CardTitle className="min-w-0 text-base leading-snug">{plugin.manifest?.name || plugin.id}</CardTitle>
+          <div className="flex min-w-0 flex-1 items-start gap-2.5">
+            <div className="flex h-[4.125rem] w-12 shrink-0 flex-col items-center gap-1.5">
+              <PluginIcon
+                pluginId={plugin.id}
+                manifest={plugin.manifest}
+                installed={plugin.installed}
+                marketplaceIconUrl={plugin.assets?.icon_64}
+                className="h-12 w-12 rounded-md"
+                iconClassName="h-5 w-5"
+              />
+              <span
+                data-plugin-type-label="true"
+                className="text-primary whitespace-nowrap text-center text-xs font-semibold leading-none"
+              >
+                {getPluginTypeLabel(plugin)}
+              </span>
+            </div>
+            <CardTitle className="h-[4.125rem] min-w-0 flex-1 text-lg leading-[1.2]">
+              <span className="line-clamp-2 break-words">
+                {plugin.manifest?.name || plugin.id}
+              </span>
+            </CardTitle>
           </div>
-          <div className="flex shrink-0 flex-col items-end gap-1">
-            <Badge variant="secondary" className="whitespace-nowrap px-1.5 py-0 text-[11px]">
-              {getPluginTypeLabel(plugin)}
-            </Badge>
-            {getStatusBadge(plugin)}
-          </div>
+          {getStatusBadge(plugin)}
         </div>
-        <CardDescription className="line-clamp-2 min-h-[2.0625rem] text-xs leading-snug">
+        <CardDescription className="line-clamp-3 min-h-[3.09375rem] text-xs leading-snug">
           {plugin.manifest?.description || '无描述'}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex-1 px-4 pb-2.5">
         <div className="space-y-2">
           {/* 统计信息 */}
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
             <div className="flex items-center gap-1">
               <span>下载</span>
-              <span>{(stats?.downloads ?? plugin.downloads ?? 0).toLocaleString()}</span>
+              <span
+                data-plugin-stat-value="downloads"
+                className={downloadCount !== 0 ? 'text-primary' : undefined}
+              >
+                {downloadCount.toLocaleString()}
+              </span>
             </div>
             <div className="flex items-center gap-1">
               <span>评分</span>
-              <span>{(stats?.rating ?? plugin.rating ?? 0).toFixed(1)}</span>
+              <span
+                data-plugin-stat-value="rating"
+                className={ratingValue !== 0 ? 'text-primary' : undefined}
+              >
+                {ratingValue.toFixed(1)}
+              </span>
             </div>
             <div className="flex items-center gap-1">
               <span>点赞</span>
-              <span>{likeCount.toLocaleString()}</span>
+              <span
+                data-plugin-stat-value="likes"
+                className={likeCount !== 0 ? 'text-primary' : undefined}
+              >
+                {likeCount.toLocaleString()}
+              </span>
+            </div>
+            <div className="flex items-center gap-1">
+              <span>评论</span>
+              <span
+                data-plugin-stat-value="reviews"
+                className={reviewCount !== 0 ? 'text-primary' : undefined}
+              >
+                {reviewCount.toLocaleString()}
+              </span>
             </div>
           </div>
           {/* 标签 */}
@@ -115,27 +153,31 @@ export function PluginCard({
               </Badge>
             )}
           </div>
-          {/* 版本和作者 */}
-          <div className="space-y-1 border-t pt-2 text-xs text-muted-foreground">
-            <div>v{plugin.manifest?.version || 'unknown'} · {plugin.manifest?.author?.name || 'Unknown'}</div>
-            {/* 支持版本 */}
+        </div>
+      </CardContent>
+      <CardFooter className="mt-auto px-4 pb-4 pt-0">
+        <div className="flex w-full flex-col gap-2 border-t pt-2.5 sm:flex-row sm:items-end sm:justify-between">
+          {/* 版本、作者和支持版本 */}
+          <div
+            data-plugin-version-info="true"
+            className="text-muted-foreground min-w-0 space-y-0.5 text-[11px] leading-tight"
+          >
+            <div className="truncate">
+              v{plugin.manifest?.version || 'unknown'} · {plugin.manifest?.author?.name || 'Unknown'}
+            </div>
             {plugin.manifest?.host_application && (
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 whitespace-nowrap">
                 <span>支持:</span>
                 <span className="font-medium">
                   {plugin.manifest.host_application.min_version}
-                  {plugin.manifest.host_application.max_version 
+                  {plugin.manifest.host_application.max_version
                     ? ` - ${plugin.manifest.host_application.max_version}`
-                    : ' - 最新版本'
-                  }
+                    : ' - 最新版本'}
                 </span>
               </div>
             )}
           </div>
-        </div>
-      </CardContent>
-      <CardFooter className="mt-auto px-4 pb-4 pt-1.5">
-        <div className="grid w-full grid-cols-3 gap-2 sm:flex sm:items-center sm:justify-end">
+          <div className="grid shrink-0 grid-cols-3 gap-2 sm:flex sm:items-center sm:justify-end">
           <Button
             variant={isLiked ? 'secondary' : 'outline'}
             size="sm"
@@ -155,40 +197,58 @@ export function PluginCard({
           <Button 
             variant="outline"
             size="sm"
-            className="w-full sm:w-auto"
+            className="w-full px-0 sm:w-8"
+            title="查看详情"
+            aria-label="查看详情"
             onClick={() => onDetail(plugin)}
           >
-            查看详情
+            <Info className="h-4 w-4" />
           </Button>
           {plugin.installed ? (
             needsUpdate(plugin) ? (
               <Button 
                 size="sm"
                 className="w-full sm:w-auto"
-                disabled={!gitStatus?.installed || (maimaiVersion !== null && !checkPluginCompatibility(plugin))}
+                disabled={
+                  !gitStatus?.installed
+                  || isPluginOperating
+                  || (maimaiVersion !== null && !checkPluginCompatibility(plugin))
+                }
                 title={
                   !gitStatus?.installed
                     ? 'Git 未安装'
+                    : isPluginOperating
+                      ? '插件操作进行中'
                     : (maimaiVersion !== null && !checkPluginCompatibility(plugin))
                       ? (getIncompatibleReason(plugin) ?? '插件与当前麦麦版本不兼容')
                       : undefined
                 }
                 onClick={() => onUpdate(plugin)}
               >
-                <RefreshCw className="h-4 w-4 mr-1" />
-                更新
+                {isPluginOperating ? (
+                  <Loader2 className="mr-1 h-4 w-4 animate-spin" />
+                ) : (
+                  <RefreshCw className="mr-1 h-4 w-4" />
+                )}
+                {isPluginOperating ? '更新中' : '更新'}
               </Button>
             ) : (
               <Button 
                 variant="destructive" 
                 size="sm"
-                className="w-full sm:w-auto"
-                disabled={!gitStatus?.installed}
-                title={!gitStatus?.installed ? 'Git 未安装' : undefined}
+                className="w-full px-0 sm:w-8"
+                disabled={!gitStatus?.installed || isPluginOperating}
+                title={
+                  !gitStatus?.installed
+                    ? 'Git 未安装'
+                    : isPluginOperating
+                      ? '插件操作进行中'
+                      : '卸载'
+                }
+                aria-label="卸载"
                 onClick={() => onUninstall(plugin)}
               >
-                <Trash2 className="h-4 w-4 mr-1" />
-                卸载
+                <Trash2 className="h-4 w-4" />
               </Button>
             )
           ) : (
@@ -213,6 +273,7 @@ export function PluginCard({
               {isInstalling ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
             </Button>
           )}
+          </div>
         </div>
       </CardFooter>
       {/* 安装/卸载/更新进度显示 - 在卡片下方 */}

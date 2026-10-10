@@ -10,6 +10,7 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Optional, Tuple, cast
 
 from src.common.logger import get_logger
+from src.core.local_operator import is_local_operator
 from src.core.tooling import (
     ToolContentItem,
     ToolAvailabilityContext,
@@ -207,6 +208,7 @@ class ComponentQueryService:
             description=str(metadata.get("description", "") or ""),
             enabled=bool(entry.enabled),
             plugin_name=entry.plugin_id,
+            permission=str(metadata.get("permission", "public") or "public"),
         )
 
     @staticmethod
@@ -507,12 +509,19 @@ class ComponentQueryService:
             message_info = getattr(message, "message_info", None)
             group_info = getattr(message_info, "group_info", None)
             user_info = getattr(message_info, "user_info", None)
+            message_is_local_operator = False
+            if message is not None:
+                message_is_local_operator = is_local_operator(
+                    message.platform,
+                    message.message_info.additional_config,
+                )
             invoke_args: Dict[str, Any] = {
                 "text": str(getattr(message, "processed_plain_text", "") or ""),
                 "stream_id": str(getattr(message, "session_id", "") or ""),
                 "group_id": str(getattr(group_info, "group_id", "") or ""),
                 "platform": str(getattr(message, "platform", "") or ""),
                 "user_id": str(getattr(user_info, "user_id", "") or ""),
+                "is_local_operator": message_is_local_operator,
                 "matched_groups": matched_groups if isinstance(matched_groups, dict) else {},
             }
             if message is not None:
@@ -838,6 +847,16 @@ class ComponentQueryService:
         """
 
         if isinstance(result, dict):
+            stop_after_execution = result.get("stop_after_execution", False)
+            if not isinstance(stop_after_execution, bool):
+                return ToolExecutionResult(
+                    tool_name=entry.name,
+                    success=False,
+                    error_message="插件工具返回字段 `stop_after_execution` 必须为布尔值。",
+                    structured_content=result,
+                    metadata={"plugin_id": entry.plugin_id},
+                )
+
             success = bool(result.get("success", True))
             content = str(result.get("content", result.get("message", "")) or "").strip()
             content_items = ComponentQueryService._parse_tool_content_items(result.get("content_items"))
@@ -852,6 +871,7 @@ class ComponentQueryService:
                 structured_content=result,
                 content_items=content_items,
                 metadata={"plugin_id": entry.plugin_id},
+                stop_after_execution=stop_after_execution,
             )
 
         if isinstance(result, (list, tuple)) and result:

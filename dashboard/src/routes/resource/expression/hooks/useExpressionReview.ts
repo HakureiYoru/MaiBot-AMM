@@ -67,9 +67,7 @@ export function useExpressionReview({
       try {
         // 用 allSettled 而非 all：单条失败不应中断其余项，仍需汇总成功/失败数
         const results = await Promise.allSettled(
-          expressionIds.map((expressionId) =>
-            updateExpressionReviewStatus(expressionId, approved)
-          )
+          expressionIds.map((expressionId) => updateExpressionReviewStatus(expressionId, approved))
         )
         const updatedCount = results.filter((result) => result.status === 'fulfilled').length
         const failedCount = results.length - updatedCount
@@ -79,7 +77,7 @@ export function useExpressionReview({
         }
 
         toast({
-          title: approved ? '批量设为通过完成' : '批量设为不通过完成',
+          title: approved ? '批量精选完成' : '取消精选完成',
           description:
             failedCount > 0
               ? `成功 ${updatedCount} 个，失败 ${failedCount} 个`

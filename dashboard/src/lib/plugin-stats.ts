@@ -10,7 +10,8 @@ const STATS_API_BASE_URL = '/api/webui/plugins/stats-proxy'
 const PLUGIN_STATS_SUMMARY_CACHE_TTL = 5 * 60 * 1000
 const PLUGIN_STATS_SUMMARY_STORAGE_KEY = 'maibot-plugin-stats-summary-cache'
 
-let pluginStatsSummaryCache: { timestamp: number; data: Record<string, PluginStatsData> } | null = null
+let pluginStatsSummaryCache: { timestamp: number; data: Record<string, PluginStatsData> } | null =
+  null
 let pluginStatsSummaryRequest: Promise<Record<string, PluginStatsData>> | null = null
 
 export interface PluginStatsData {
@@ -22,8 +23,11 @@ export interface PluginStatsData {
   downloads: number
   rating: number
   rating_count: number
+  comment_count: number
   recent_ratings?: Array<{
     user_id: string
+    username?: string | null
+    anonymous?: boolean
     rating?: number | null
     comment?: string
     created_at: string
@@ -50,6 +54,7 @@ export interface RatingStatsResponse extends StatsResponse {
   comment?: string | null
   rating?: number
   rating_count?: number
+  comment_count?: number
 }
 
 export interface DownloadStatsResponse extends StatsResponse {
@@ -62,6 +67,25 @@ export interface PluginUserState {
   disliked: boolean
   rating: number | null
   comment: string
+  username?: string | null
+  anonymous?: boolean
+}
+
+export interface PluginReviewIdentity {
+  username: string
+  anonymous: boolean
+}
+
+/** 获取本地 bot 昵称；此请求不会发往插件统计服务。 */
+export async function getPluginReviewIdentity(): Promise<{ username: string }> {
+  return backendApi.get<{ username: string }>(`${STATS_API_BASE_URL}/identity`, {
+    errorMessage: '获取默认评论用户名失败',
+  })
+}
+
+export interface PluginVoteState {
+  liked: boolean
+  disliked: boolean
 }
 
 interface PluginStatsSummaryResponse {
@@ -83,6 +107,7 @@ function createEmptyStats(pluginId: string): PluginStatsData {
     downloads: 0,
     rating: 0,
     rating_count: 0,
+    comment_count: 0,
   }
 }
 
@@ -105,6 +130,7 @@ function normalizePluginStatsResponse(data: unknown, pluginId: string): PluginSt
     downloads: Number(stats.downloads ?? 0),
     rating: Number(stats.rating ?? 0),
     rating_count: Number(stats.rating_count ?? 0),
+    comment_count: Number(stats.comment_count ?? 0),
     recent_ratings: Array.isArray(stats.recent_ratings) ? stats.recent_ratings : undefined,
   }
 }
@@ -186,14 +212,15 @@ function updateCachedPluginStats(pluginId: string, partialStats: Partial<PluginS
   const currentStats = currentCache.data[pluginId] ?? createEmptyStats(pluginId)
   const nextData = {
     ...currentCache.data,
-    [pluginId]: normalizePluginStatsResponse(
-      {
-        ...currentStats,
-        ...partialStats,
-        plugin_id: pluginId,
-      },
-      pluginId
-    ) ?? currentStats,
+    [pluginId]:
+      normalizePluginStatsResponse(
+        {
+          ...currentStats,
+          ...partialStats,
+          plugin_id: pluginId,
+        },
+        pluginId
+      ) ?? currentStats,
   }
 
   pluginStatsSummaryCache = { timestamp: Date.now(), data: nextData }
@@ -233,7 +260,9 @@ export async function getPluginStats(pluginId: string): Promise<PluginStatsData 
  * 閼惧嘲褰囬幓鎺嶆鐢倸婧€閻ㄥ嫯浜ら柌蹇曠埠鐠佲剝鎲崇憰渚婄礄娑撳秴瀵橀崥顐ョ槑鐠佺尨绱氶妴? */
 async function fetchPluginStatsSummaryUncached(): Promise<Record<string, PluginStatsData>> {
   try {
-    const data = await backendApi.get<PluginStatsSummaryResponse>(`${STATS_API_BASE_URL}/stats/summary`)
+    const data = await backendApi.get<PluginStatsSummaryResponse>(
+      `${STATS_API_BASE_URL}/stats/summary`
+    )
     if (!data.success || !data.stats || typeof data.stats !== 'object') {
       return {}
     }
@@ -270,6 +299,8 @@ export async function getPluginUserState(
       disliked: data.disliked === true,
       rating: data.rating == null ? null : Number(data.rating),
       comment: typeof data.comment === 'string' ? data.comment : '',
+      ...(data.username !== undefined ? { username: data.username } : {}),
+      ...(data.anonymous !== undefined ? { anonymous: data.anonymous } : {}),
     }
   } catch (error) {
     console.error('Error fetching plugin user state:', error)
@@ -277,13 +308,42 @@ export async function getPluginUserState(
   }
 }
 
+/**
+ * 批量获取当前用户对所有插件的点赞/点踩状态，键为插件 ID
+ */
+export async function getPluginUserStates(
+  userId: string = getUserId()
+): Promise<Record<string, PluginVoteState>> {
+  try {
+    const data = await backendApi.get<{
+      success?: boolean
+      states?: Record<string, Partial<PluginVoteState>>
+    }>(`${STATS_API_BASE_URL}/stats/user-states`, {
+      query: { user_id: userId },
+    })
+    if (!data.success || !data.states || typeof data.states !== 'object') {
+      return {}
+    }
+
+    return Object.fromEntries(
+      Object.entries(data.states).map(([pluginId, state]) => [
+        pluginId,
+        { liked: state.liked === true, disliked: state.disliked === true },
+      ])
+    )
+  } catch (error) {
+    console.error('Error fetching plugin user states:', error)
+    return {}
+  }
+}
+
 export async function getPluginStatsSummary(
   options: { forceRefresh?: boolean } = {}
 ): Promise<Record<string, PluginStatsData>> {
   if (
-    !options.forceRefresh
-    && pluginStatsSummaryCache
-    && Date.now() - pluginStatsSummaryCache.timestamp < PLUGIN_STATS_SUMMARY_CACHE_TTL
+    !options.forceRefresh &&
+    pluginStatsSummaryCache &&
+    Date.now() - pluginStatsSummaryCache.timestamp < PLUGIN_STATS_SUMMARY_CACHE_TTL
   ) {
     return pluginStatsSummaryCache.data
   }
@@ -311,7 +371,6 @@ export async function getPluginStatsSummary(
   return pluginStatsSummaryRequest
 }
 
-
 /**
  * 閻愮绂愰幓鎺嶆
  */
@@ -319,9 +378,12 @@ export async function likePlugin(pluginId: string, userId?: string): Promise<Vot
   try {
     const finalUserId = userId || getUserId()
 
-    const data = await backendApi.post<Omit<VoteStatsResponse, 'success'>>(`${STATS_API_BASE_URL}/stats/like`, {
-      body: { plugin_id: pluginId, user_id: finalUserId },
-    })
+    const data = await backendApi.post<Omit<VoteStatsResponse, 'success'>>(
+      `${STATS_API_BASE_URL}/stats/like`,
+      {
+        body: { plugin_id: pluginId, user_id: finalUserId },
+      }
+    )
 
     const result: VoteStatsResponse = { success: true, ...data }
     updateCachedPluginStats(pluginId, {
@@ -350,9 +412,12 @@ export async function dislikePlugin(pluginId: string, userId?: string): Promise<
   try {
     const finalUserId = userId || getUserId()
 
-    const data = await backendApi.post<Omit<VoteStatsResponse, 'success'>>(`${STATS_API_BASE_URL}/stats/dislike`, {
-      body: { plugin_id: pluginId, user_id: finalUserId },
-    })
+    const data = await backendApi.post<Omit<VoteStatsResponse, 'success'>>(
+      `${STATS_API_BASE_URL}/stats/dislike`,
+      {
+        body: { plugin_id: pluginId, user_id: finalUserId },
+      }
+    )
 
     const result: VoteStatsResponse = { success: true, ...data }
     updateCachedPluginStats(pluginId, {
@@ -375,13 +440,14 @@ export async function dislikePlugin(pluginId: string, userId?: string): Promise<
 }
 
 /**
- * 鐠囧嫬鍨庨幓鎺嶆
+ * 提交插件评分或评论
  */
 export async function ratePlugin(
   pluginId: string,
   rating?: number | null,
   comment?: string | null,
-  userId?: string
+  userId?: string,
+  identity?: PluginReviewIdentity
 ): Promise<RatingStatsResponse> {
   const hasRating = rating !== undefined && rating !== null
   const hasComment = comment !== undefined
@@ -401,6 +467,8 @@ export async function ratePlugin(
       user_id: string
       rating?: number
       comment?: string | null
+      username?: string
+      anonymous?: boolean
     } = { plugin_id: pluginId, user_id: finalUserId }
 
     if (hasRating) {
@@ -409,10 +477,23 @@ export async function ratePlugin(
     if (hasComment) {
       payload.comment = comment
     }
+    if (identity) {
+      payload.anonymous = identity.anonymous
+      if (!identity.anonymous) {
+        const username = identity.username.trim()
+        if (!username || username.length > 100) {
+          return { success: false, error: '用户名需要填写 1-100 个字符' }
+        }
+        payload.username = username
+      }
+    }
 
-    const data = await backendApi.post<Omit<RatingStatsResponse, 'success'>>(`${STATS_API_BASE_URL}/stats/rate`, {
-      body: payload,
-    })
+    const data = await backendApi.post<Omit<RatingStatsResponse, 'success'>>(
+      `${STATS_API_BASE_URL}/stats/rate`,
+      {
+        body: payload,
+      }
+    )
 
     const result: RatingStatsResponse = { success: true, ...data }
     const updatedStats: Partial<PluginStatsData> = {}
@@ -422,6 +503,9 @@ export async function ratePlugin(
     if (result.rating_count !== undefined) {
       updatedStats.rating_count = Number(result.rating_count)
     }
+    if (result.comment_count !== undefined) {
+      updatedStats.comment_count = Number(result.comment_count)
+    }
     updateCachedPluginStats(pluginId, updatedStats)
     return result
   } catch (error) {
@@ -430,24 +514,27 @@ export async function ratePlugin(
         return { success: false, error: '每天最多评分 3 次' }
       }
       if (error.status !== undefined) {
-        return { success: false, error: getDetailError(error) || '鐠囧嫬鍨庢径杈Е' }
+        return { success: false, error: getDetailError(error) || '评分失败' }
       }
     }
     console.error('Error rating plugin:', error)
-    return { success: false, error: '缂冩垹绮堕柨娆掝嚖' }
+    return { success: false, error: '网络请求失败' }
   }
 }
 
 /**
- * 鐠佹澘缍嶉幓鎺嶆娑撳娴?
+ * 记录插件下载
  */
 export async function recordPluginDownload(pluginId: string): Promise<DownloadStatsResponse> {
   try {
     const userId = getUserId()
     const fingerprint = generateUserFingerprint()
-    const data = await backendApi.post<Omit<DownloadStatsResponse, 'success'>>(`${STATS_API_BASE_URL}/stats/download`, {
-      body: { plugin_id: pluginId, user_id: userId, fingerprint },
-    })
+    const data = await backendApi.post<Omit<DownloadStatsResponse, 'success'>>(
+      `${STATS_API_BASE_URL}/stats/download`,
+      {
+        body: { plugin_id: pluginId, user_id: userId, fingerprint },
+      }
+    )
 
     const result: DownloadStatsResponse = { success: true, ...data }
     if (typeof result.downloads === 'number') {
@@ -457,7 +544,7 @@ export async function recordPluginDownload(pluginId: string): Promise<DownloadSt
   } catch (error) {
     if (error instanceof ApiError) {
       if (error.status === 429) {
-        // 娑撳娴囩紒鐔活吀鐞氼偊妾哄ù浣规闂堟瑩绮径杈Е閿涘奔绗夎ぐ鍗炴惙閻劍鍩涙担鎾荤崣
+        // 下载计数受限不影响实际下载流程
         console.warn('Download recording rate limited')
         return { success: true }
       }
@@ -468,7 +555,7 @@ export async function recordPluginDownload(pluginId: string): Promise<DownloadSt
       }
     }
     console.error('Error recording download:', error)
-    return { success: false, error: '缂冩垹绮堕柨娆掝嚖' }
+    return { success: false, error: '网络请求失败' }
   }
 }
 
@@ -493,15 +580,15 @@ export function generateUserFingerprint(): string {
     navigator.maxTouchPoints || 0,
     nav.deviceMemory || 0,
   ].join('|')
-  
+
   // 缁犫偓閸楁洖鎼辩敮灞藉毐閺?
   let hash = 0
   for (let i = 0; i < features.length; i++) {
     const char = features.charCodeAt(i)
-    hash = ((hash << 5) - hash) + char
+    hash = (hash << 5) - hash + char
     hash = hash & hash // Convert to 32bit integer
   }
-  
+
   return `fp_${Math.abs(hash).toString(36)}`
 }
 
@@ -511,21 +598,21 @@ export function generateUserFingerprint(): string {
  */
 export function getUserId(): string {
   const STORAGE_KEY = 'maibot_user_id'
-  
+
   // 鐏忔繆鐦禒?localStorage 閼惧嘲褰?
   let userId = localStorage.getItem(STORAGE_KEY)
-  
+
   if (!userId) {
     // 閻㈢喐鍨氶弬鎵畱 UUID
     const fingerprint = generateUserFingerprint()
     const timestamp = Date.now().toString(36)
     const random = Math.random().toString(36).substring(2, 15)
-    
+
     userId = `${fingerprint}_${timestamp}_${random}`
-    
+
     // 鐎涙ê鍋嶉崚?localStorage
     localStorage.setItem(STORAGE_KEY, userId)
   }
-  
+
   return userId
 }

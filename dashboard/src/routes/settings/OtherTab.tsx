@@ -10,7 +10,7 @@ import { Label } from '@/components/ui/label'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import { useToast } from '@/hooks/use-toast'
-import { clearLocalCache, DEFAULT_SETTINGS, exportSettings, formatBytes, getSetting, getStorageUsage, importSettings, resetAllSettings, setSetting } from '@/lib/settings-manager'
+import { clearLocalCache, DEFAULT_SETTINGS, exportSettings, formatBytes, getSetting, getStorageUsage, importSettings, resetAllGuidesAndNotices, resetAllSettings, setSetting } from '@/lib/settings-manager'
 import { logWebSocket } from '@/lib/log-websocket'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from '@/components/ui/alert-dialog'
 
@@ -28,7 +28,7 @@ export function OtherTab() {
   const [wsMaxReconnectAttempts, setWsMaxReconnectAttempts] = useState(() => getSetting('wsMaxReconnectAttempts'))
   const [dataSyncInterval, setDataSyncInterval] = useState(() => getSetting('dataSyncInterval'))
   const [enableAvatarFetch, setEnableAvatarFetch] = useState(() => getSetting('enableAvatarFetch'))
-  const [enableFocusCompanion, setEnableFocusCompanion] = useState(() => getSetting('enableFocusCompanion'))
+  const [alwaysShowUpdateNotice, setAlwaysShowUpdateNotice] = useState(() => getSetting('alwaysShowUpdateNotice'))
   const [storageUsage, setStorageUsage] = useState(() => getStorageUsage())
   
   // 导入/导出状态
@@ -79,9 +79,9 @@ export function OtherTab() {
     setSetting('enableAvatarFetch', checked)
   }
 
-  const handleFocusCompanionChange = (checked: boolean) => {
-    setEnableFocusCompanion(checked)
-    setSetting('enableFocusCompanion', checked)
+  const handleAlwaysShowUpdateNoticeChange = (checked: boolean) => {
+    setAlwaysShowUpdateNotice(checked)
+    setSetting('alwaysShowUpdateNotice', checked)
   }
 
   // 清除日志缓存
@@ -154,7 +154,7 @@ export function OtherTab() {
           setWsMaxReconnectAttempts(getSetting('wsMaxReconnectAttempts'))
           setDataSyncInterval(getSetting('dataSyncInterval'))
           setEnableAvatarFetch(getSetting('enableAvatarFetch'))
-          setEnableFocusCompanion(getSetting('enableFocusCompanion'))
+          setAlwaysShowUpdateNotice(getSetting('alwaysShowUpdateNotice'))
           refreshStorageUsage()
           
           toast({
@@ -203,11 +203,20 @@ export function OtherTab() {
     setWsMaxReconnectAttempts(DEFAULT_SETTINGS.wsMaxReconnectAttempts)
     setDataSyncInterval(DEFAULT_SETTINGS.dataSyncInterval)
     setEnableAvatarFetch(DEFAULT_SETTINGS.enableAvatarFetch)
-    setEnableFocusCompanion(DEFAULT_SETTINGS.enableFocusCompanion)
+    setAlwaysShowUpdateNotice(DEFAULT_SETTINGS.alwaysShowUpdateNotice)
     refreshStorageUsage()
     toast({
       title: t('settings.other.resetDone'),
       description: t('settings.other.resetDoneDesc'),
+    })
+  }
+
+  const handleResetGuidesAndNotices = () => {
+    const clearedCount = resetAllGuidesAndNotices()
+    refreshStorageUsage()
+    toast({
+      title: t('settings.other.guidesResetDone'),
+      description: t('settings.other.guidesResetDoneDesc', { count: clearedCount }),
     })
   }
 
@@ -277,21 +286,22 @@ export function OtherTab() {
             aria-label={t('settings.other.enableAvatarFetch')}
           />
         </div>
-        <div className="mt-3 flex items-start justify-between gap-4 rounded-lg bg-muted/50 p-3 sm:p-4">
-          <div className="min-w-0 space-y-1">
-            <Label htmlFor="enable-focus-companion" className="text-sm font-medium">
-              专注陪伴入口
-            </Label>
-            <p className="text-xs text-muted-foreground">
-              开启后在顶栏显示沉浸式番茄钟陪伴入口；默认隐藏。
-            </p>
-          </div>
-          <Switch
-            id="enable-focus-companion"
-            checked={enableFocusCompanion}
-            onCheckedChange={handleFocusCompanionChange}
-            aria-label="专注陪伴入口"
-          />
+      </div>
+
+      {/* 引导与提示 */}
+      <div className="rounded-lg border bg-card p-4 sm:p-6">
+        <h3 className="mb-3 flex items-center gap-2 text-base font-semibold sm:mb-4 sm:text-lg">
+          <RotateCcw className="h-5 w-5" />
+          {t('settings.other.guidesAndNotices')}
+        </h3>
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-xs text-muted-foreground sm:text-sm">
+            {t('settings.other.guidesAndNoticesDesc')}
+          </p>
+          <Button variant="outline" onClick={handleResetGuidesAndNotices} className="shrink-0 gap-2">
+            <RotateCcw className="h-4 w-4" />
+            {t('settings.other.resetGuidesAndNotices')}
+          </Button>
         </div>
       </div>
 
@@ -538,6 +548,22 @@ export function OtherTab() {
             <p className="text-xs sm:text-sm text-muted-foreground">
               {t('settings.other.devToolsDesc')}
             </p>
+          </div>
+          <div className="flex items-start justify-between gap-4 rounded-lg bg-muted/50 p-3 sm:p-4">
+            <div className="min-w-0 space-y-1">
+              <Label htmlFor="always-show-update-notice" className="text-sm font-medium">
+                {t('settings.other.alwaysShowUpdateNotice')}
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                {t('settings.other.alwaysShowUpdateNoticeDesc')}
+              </p>
+            </div>
+            <Switch
+              id="always-show-update-notice"
+              checked={alwaysShowUpdateNotice}
+              onCheckedChange={handleAlwaysShowUpdateNoticeChange}
+              aria-label={t('settings.other.alwaysShowUpdateNotice')}
+            />
           </div>
           <AlertDialog>
             <AlertDialogTrigger asChild>

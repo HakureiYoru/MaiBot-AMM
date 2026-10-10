@@ -6,7 +6,6 @@ import {
   Outlet,
   redirect,
 } from '@tanstack/react-router'
-import { TanStackRouterDevtools } from '@tanstack/router-devtools'
 import { NotFoundPage } from './routes/404'
 import { Layout } from './components/layout'
 import { RoutePendingFallback } from './components/route-pending-fallback'
@@ -15,17 +14,19 @@ import { RouteErrorBoundary } from './components/error-boundary'
 
 // Root 路由
 const rootRoute = createRootRoute({
-  component: () => (
-    <>
-      <Outlet />
-      {import.meta.env.DEV && <TanStackRouterDevtools />}
-    </>
-  ),
-  beforeLoad: () => {
-    // 如果访问根路径且未认证，重定向到认证页面
-    if (window.location.pathname === '/' && !checkAuth()) {
-      throw redirect({ to: '/auth' })
+  component: Outlet,
+  beforeLoad: ({ location }) => {
+    // 只在目标路由确实是首页时异步鉴权。使用 window.location 会读到导航前的旧路径，
+    // 并让离开首页的工作区切换无故进入 pending 状态。
+    if (location.pathname !== '/') {
+      return
     }
+
+    return checkAuth().then((authenticated) => {
+      if (!authenticated) {
+        throw redirect({ to: '/auth' })
+      }
+    })
   },
 })
 
@@ -55,6 +56,20 @@ const protectedRoute = createRoute({
   errorComponent: ({ error }) => <RouteErrorBoundary error={error} />,
 })
 
+const pluginWebUIRoute = createRoute({
+  getParentRoute: () => protectedRoute,
+  path: '/extensions/$pluginId/$pageId',
+  component: lazyRouteComponent(() => import('./routes/plugin-webui'), 'PluginWebUIPage'),
+})
+
+const pluginWebUIManagerRoute = createRoute({
+  getParentRoute: () => protectedRoute,
+  path: '/extensions',
+  beforeLoad: () => {
+    throw redirect({ to: '/plugin-config', hash: 'webui-extensions', replace: true })
+  },
+})
+
 // 首页路由
 const indexRoute = createRoute({
   getParentRoute: () => protectedRoute,
@@ -62,17 +77,32 @@ const indexRoute = createRoute({
   component: lazyRouteComponent(() => import('./routes/index'), 'IndexPage'),
 })
 
-// 沉浸专注陪伴路由
-const focusCompanionRoute = createRoute({
+// 详细统计路由
+const statisticsRoute = createRoute({
   getParentRoute: () => protectedRoute,
-  path: '/focus',
-  component: lazyRouteComponent(() => import('./routes/focus'), 'FocusCompanionPage'),
+  path: '/statistics',
+  component: lazyRouteComponent(() => import('./routes/logs'), 'StatisticsLogViewerPage'),
+})
+
+const replyEffectsRoute = createRoute({
+  getParentRoute: () => protectedRoute,
+  path: '/reply-effects',
+  component: lazyRouteComponent(() => import('./routes/reply-effects'), 'ReplyEffectsPage'),
 })
 
 // 配置路由 - 麦麦主程序配置
 const botConfigRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/config/bot',
+  beforeLoad: ({ location }) => {
+    const params = new URLSearchParams(location.searchStr)
+    if (params.get('mode') !== 'webui') return
+    params.delete('mode')
+    const search = params.size ? `?${params.toString()}` : ''
+    // 兼容此前内嵌 WebUI 设置的链接，保留页签参数和 hash。
+    const hash = location.hash ? `#${location.hash.replace(/^#/, '')}` : ''
+    throw redirect({ href: `/settings${search}${hash}`, replace: true })
+  },
   component: lazyRouteComponent(() => import('./routes/config/bot'), 'BotConfigPage'),
 })
 
@@ -88,13 +118,6 @@ const promptManagementRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/config/prompts',
   component: lazyRouteComponent(() => import('./routes/config/prompts'), 'PromptManagementPage'),
-})
-
-// 配置路由 - 人设生成器（测试功能）
-const promptGeneratorRoute = createRoute({
-  getParentRoute: () => protectedRoute,
-  path: '/config/prompt-generator',
-  component: lazyRouteComponent(() => import('./routes/prompt-generator'), 'PromptGeneratorPage'),
 })
 
 // 资源管理路由 - 表情包管理
@@ -204,17 +227,13 @@ const chatEmbedRoute = createRoute({
   component: lazyRouteComponent(() => import('./routes/chat/embed'), 'ChatEmbedPage'),
 })
 
-// 外部程序嵌入用专注陪伴路由，不挂载 dashboard 顶栏和侧边栏
-const focusCompanionEmbedRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/focus/embed',
-  component: lazyRouteComponent(() => import('./routes/focus'), 'FocusCompanionPage'),
-})
-
 // 外部程序嵌入用插件市场路由，不挂载 dashboard 顶栏和侧边栏
 const pluginsEmbedRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/plugins/embed',
+  validateSearch: (search: Record<string, unknown>): { pluginId?: string } => ({
+    pluginId: typeof search.pluginId === 'string' ? search.pluginId.trim() || undefined : undefined,
+  }),
   component: lazyRouteComponent(
     () => import('./routes/plugins/embed'),
     'PluginMarketplaceEmbedPage'
@@ -225,6 +244,9 @@ const pluginsEmbedRoute = createRoute({
 const pluginsRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/plugins',
+  validateSearch: (search: Record<string, unknown>): { pluginId?: string } => ({
+    pluginId: typeof search.pluginId === 'string' ? search.pluginId.trim() || undefined : undefined,
+  }),
   component: lazyRouteComponent(
     () => import('./routes/plugins/PluginMarketplacePage'),
     'PluginMarketplacePage'
@@ -242,6 +264,13 @@ const modelPresetsRoute = createRoute({
 const pluginConfigRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/plugin-config',
+  component: lazyRouteComponent(() => import('./routes/plugin-config'), 'PluginConfigPage'),
+})
+
+// 适配器管理路由：复用插件配置页，仅展示 adapter 类型插件
+const adapterManagementRoute = createRoute({
+  getParentRoute: () => protectedRoute,
+  path: '/adapter-management',
   component: lazyRouteComponent(() => import('./routes/plugin-config'), 'PluginConfigPage'),
 })
 
@@ -272,11 +301,20 @@ const pluginMirrorsRoute = createRoute({
   component: lazyRouteComponent(() => import('./routes/plugin-mirrors'), 'PluginMirrorsPage'),
 })
 
-// 设置页路由
+// 旧 MCP 地址统一进入插件扩展。
 const mcpSettingsRoute = createRoute({
   getParentRoute: () => protectedRoute,
   path: '/mcp-settings',
-  component: lazyRouteComponent(() => import('./routes/mcp-settings'), 'MCPSettingsPage'),
+  beforeLoad: () => {
+    throw redirect({ to: '/plugin-config' })
+  },
+})
+
+// 数据迁移与备份路由
+const dataTransferRoute = createRoute({
+  getParentRoute: () => protectedRoute,
+  path: '/data-transfer',
+  component: lazyRouteComponent(() => import('./routes/data-transfer'), 'DataTransferPage'),
 })
 
 const settingsRoute = createRoute({
@@ -331,17 +369,18 @@ const routeTree = rootRoute.addChildren([
   authRoute,
   setupRoute,
   chatEmbedRoute,
-  focusCompanionEmbedRoute,
   pluginsEmbedRoute,
   pluginConfigEmbedRoute,
   pluginMirrorsEmbedRoute,
   protectedRoute.addChildren([
+    pluginWebUIRoute,
+    pluginWebUIManagerRoute,
     indexRoute,
-    focusCompanionRoute,
+    statisticsRoute,
+    replyEffectsRoute,
     botConfigRoute,
     modelConfigRoute,
     promptManagementRoute,
-    promptGeneratorRoute,
     emojiManagementRoute,
     expressionManagementRoute,
     jargonManagementRoute,
@@ -352,8 +391,10 @@ const routeTree = rootRoute.addChildren([
     pluginsRoute,
     modelPresetsRoute,
     pluginConfigRoute,
+    adapterManagementRoute,
     pluginMirrorsRoute,
     mcpSettingsRoute,
+    dataTransferRoute,
     logsRoute,
     reasoningProcessRoute,
     plannerMonitorRoute,

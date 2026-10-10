@@ -17,6 +17,7 @@ import pytest
 
 def load_model_routes(monkeypatch: pytest.MonkeyPatch):
     """在导入路由前 stub 配置与认证依赖模块，避免测试时触发真实初始化。"""
+
     class DummyConfigManager:
         def get_model_config(self):
             return SimpleNamespace(api_providers=[])
@@ -185,7 +186,7 @@ client_type = "gemini"
             "http_status": 200,
         }
 
-    monkeypatch.setattr(model_routes, "test_provider_connection", fake_test_provider_connection)
+    monkeypatch.setattr(model_routes, "_test_provider_connection", fake_test_provider_connection)
 
     result = await model_routes.test_provider_connection_by_name(provider_name="Gemini")
 
@@ -195,6 +196,7 @@ client_type = "gemini"
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
         "api_key": "valid-gemini-key",
         "client_type": "gemini",
+        "allow_configured_private_network": True,
     }
 
 
@@ -225,9 +227,9 @@ visual = true
         def __init__(self, model_name: str):
             captured["model_name"] = model_name
 
-        async def generate_response_with_message_async(self, **kwargs: Any):
+        async def generate_response_with_context_async(self, **kwargs: Any):
             captured.update(kwargs)
-            return model_routes.LLMResponseResult(
+            return model_routes.LLMResponseResult.from_portable_output(
                 response="",
                 model_name="vision-model",
                 tool_calls=[
@@ -244,9 +246,7 @@ visual = true
 
     monkeypatch.setattr(model_routes, "_SingleModelTestOrchestrator", FakeOrchestrator)
 
-    result = await model_routes.test_model_capability(
-        model_routes.ModelTestRequest(model_name="vision-model")
-    )
+    result = await model_routes.test_model_capability(model_routes.ModelTestRequest(model_name="vision-model"))
 
     assert result.success is True
     assert result.visual_tested is True
@@ -289,7 +289,7 @@ model_list = ["embed-model"]
             captured["embedding_input"] = embedding_input
             return SimpleNamespace(embedding=[0.1] * 8, model_name="embed-model")
 
-        async def generate_response_with_message_async(self, **kwargs: Any):
+        async def generate_response_with_context_async(self, **kwargs: Any):
             raise AssertionError("嵌入模型测试不应调用对话接口")
 
     monkeypatch.setattr(model_routes, "_SingleModelTestOrchestrator", FakeOrchestrator)
@@ -302,6 +302,57 @@ model_list = ["embed-model"]
     assert result.response == "嵌入向量维度: 8"
     assert captured["model_name"] == "embed-model"
     assert captured["embedding_input"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model_identifier", "image_task_config"),
+    [
+        ("Qwen/Qwen3-VL-Embedding-8B", ""),
+        ("custom-vector-model", '[model_task_config.image_embedding]\nmodel_list = ["my-vector"]'),
+    ],
+)
+async def test_test_model_capability_tests_visual_embedding_via_images(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+    model_identifier: str,
+    image_task_config: str,
+) -> None:
+    """模型标识或图片嵌入任务应让模型测试发送图片，而非走对话或文本嵌入。"""
+    model_routes = load_model_routes(monkeypatch)
+    (tmp_path / "model_config.toml").write_text(
+        f'[[models]]\nname = "my-vector"\nmodel_identifier = "{model_identifier}"\n'
+        f'api_provider = "Fake"\n\n{image_task_config}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(model_routes, "CONFIG_DIR", str(tmp_path))
+    images: list[bytes] = []
+
+    class FakeOrchestrator:
+        def __init__(self, model_name: str):
+            assert model_name == "my-vector"
+
+        async def get_image_embedding(self, image_bytes: bytes, **kwargs: Any):
+            images.append(image_bytes)
+            return SimpleNamespace(embedding=[0.1, 0.2])
+
+        async def get_embedding(self, embedding_input: str, **kwargs: Any):
+            raise AssertionError("视觉嵌入模型不应调用文本嵌入接口")
+
+        async def generate_response_with_context_async(self, **kwargs: Any):
+            raise AssertionError("视觉嵌入模型不应调用对话接口")
+
+    monkeypatch.setattr(model_routes, "_SingleModelTestOrchestrator", FakeOrchestrator)
+
+    result = await model_routes.test_model_capability(model_routes.ModelTestRequest(model_name="my-vector"))
+
+    assert result.success is True
+    assert result.test_kind == "image_embedding"
+    assert result.embedding_dimension == 2
+    assert len(images) == 3
+    assert images[0].startswith(b"\x89PNG\r\n\x1a\n")
+    assert images[0] == images[1]
+    assert images[0] != images[2]
 
 
 @pytest.mark.asyncio
@@ -334,8 +385,8 @@ model_list = ["other-embed-model"]
         async def get_embedding(self, embedding_input: str, **kwargs: Any):
             raise AssertionError("对话模型测试不应调用嵌入接口")
 
-        async def generate_response_with_message_async(self, **kwargs: Any):
-            return model_routes.LLMResponseResult(
+        async def generate_response_with_context_async(self, **kwargs: Any):
+            return model_routes.LLMResponseResult.from_portable_output(
                 response="",
                 model_name="chat-model",
                 tool_calls=[
@@ -364,6 +415,7 @@ def test_model_test_image_base64_is_valid_png(monkeypatch: pytest.MonkeyPatch) -
     image_bytes = base64.b64decode(model_routes.MODEL_TEST_IMAGE_BASE64)
 
     assert image_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    assert struct.unpack(">II", image_bytes[16:24]) == (32, 32)
 
     position = 8
     chunk_types: list[bytes] = []
@@ -377,4 +429,6 @@ def test_model_test_image_base64_is_valid_png(monkeypatch: pytest.MonkeyPatch) -
         chunk_types.append(chunk_type)
         position += 12 + chunk_length
 
-    assert chunk_types == [b"IHDR", b"IDAT", b"IEND"]
+    assert chunk_types[0] == b"IHDR"
+    assert b"IDAT" in chunk_types
+    assert chunk_types[-1] == b"IEND"

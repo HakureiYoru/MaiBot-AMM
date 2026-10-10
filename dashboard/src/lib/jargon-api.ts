@@ -11,6 +11,9 @@ import type {
   JargonCreateResponse,
   JargonDeleteResponse,
   JargonDetailResponse,
+  JargonExportResponse,
+  JargonImportRequest,
+  JargonImportResponse,
   JargonListResponse,
   JargonStatsResponse,
   JargonUpdateRequest,
@@ -22,7 +25,9 @@ const API_BASE = '/api/webui/jargon'
 /**
  * 获取聊天列表（有黑话记录的聊天）
  */
-export async function getJargonChatList(params: { include_empty?: boolean } = {}): Promise<JargonChatListResponse> {
+export async function getJargonChatList(
+  params: { include_empty?: boolean } = {}
+): Promise<JargonChatListResponse> {
   return backendApi.get<JargonChatListResponse>(`${API_BASE}/chats`, {
     query: { include_empty: params.include_empty },
     errorMessage: '获取聊天列表失败',
@@ -67,11 +72,35 @@ export async function getJargonDetail(jargonId: number): Promise<JargonDetailRes
 }
 
 /**
+ * 导出黑话
+ */
+export async function exportJargons(params: {
+  ids?: number[]
+  include_chat_info?: boolean
+}): Promise<JargonExportResponse> {
+  return backendApi.post<JargonExportResponse>(`${API_BASE}/export`, {
+    body: {
+      ids: params.ids,
+      include_chat_info: params.include_chat_info ?? false,
+    },
+    errorMessage: '导出黑话失败',
+  })
+}
+
+/**
+ * 导入黑话
+ */
+export async function importJargons(data: JargonImportRequest): Promise<JargonImportResponse> {
+  return backendApi.post<JargonImportResponse>(`${API_BASE}/import`, {
+    body: data,
+    errorMessage: '导入黑话失败',
+  })
+}
+
+/**
  * 创建黑话
  */
-export async function createJargon(
-  data: JargonCreateRequest
-): Promise<JargonCreateResponse> {
+export async function createJargon(data: JargonCreateRequest): Promise<JargonCreateResponse> {
   return backendApi.post<JargonCreateResponse>(`${API_BASE}/`, {
     body: data,
     errorMessage: '创建黑话失败',

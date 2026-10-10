@@ -9,6 +9,8 @@ import type {
 import {
   IMPORT_STATUS_TEXT,
   IMPORT_STEP_TEXT,
+  IMPORT_TASK_KIND_TEXT,
+  MEMORY_SOURCE_KIND_TEXT,
   QUEUED_IMPORT_STATUS,
   RUNNING_IMPORT_STATUS,
 } from './constants'
@@ -85,7 +87,17 @@ export function getImportStepLabel(step: string): string {
   return IMPORT_STEP_TEXT[normalized] ?? normalized
 }
 
-export function getImportStatusVariant(status: string): 'default' | 'secondary' | 'destructive' | 'outline' {
+export function getImportTaskKindLabel(kind: string): string {
+  const normalized = String(kind ?? '').trim()
+  if (!normalized) {
+    return '-'
+  }
+  return IMPORT_TASK_KIND_TEXT[normalized] ?? normalized
+}
+
+export function getImportStatusVariant(
+  status: string
+): 'default' | 'secondary' | 'destructive' | 'outline' {
   if (status === 'failed') {
     return 'destructive'
   }
@@ -137,14 +149,38 @@ export function formatDeleteOperationMode(mode: string): string {
   }
 }
 
-export function formatDeleteOperationStatus(status: string): string {
-  switch (status) {
+/**
+ * 删除操作状态分组。
+ * 后端状态包含 executed / completed / pending_cleanup / restore_pending / restored；
+ * 展示、筛选与按钮可用性统一按分组判断，避免把 completed 与 executed 显示成两种用户可见状态。
+ */
+export function getDeleteOperationStatusGroup(
+  status: string
+): 'applied' | 'restoring' | 'restored' | '' {
+  switch (String(status ?? '').trim()) {
     case 'executed':
+    case 'completed':
+    case 'pending_cleanup':
+      return 'applied'
+    case 'restore_pending':
+      return 'restoring'
+    case 'restored':
+      return 'restored'
+    default:
+      return ''
+  }
+}
+
+export function formatDeleteOperationStatus(status: string): string {
+  switch (getDeleteOperationStatusGroup(status)) {
+    case 'applied':
       return '已执行'
+    case 'restoring':
+      return '恢复中'
     case 'restored':
       return '已恢复'
     default:
-      return status || '未知'
+      return String(status ?? '').trim() || '未知'
   }
 }
 
@@ -168,7 +204,9 @@ export function formatDeleteOperationTime(timestamp?: number | null): string {
 }
 
 export function trimDeleteItemText(value: string, maxLength: number = 140): string {
-  const normalized = String(value ?? '').trim().replace(/\s+/g, ' ')
+  const normalized = String(value ?? '')
+    .trim()
+    .replace(/\s+/g, ' ')
   if (!normalized) {
     return ''
   }
@@ -178,7 +216,11 @@ export function trimDeleteItemText(value: string, maxLength: number = 140): stri
   return `${normalized.slice(0, maxLength)}...`
 }
 
-export function formatDeleteRelationText(subject: string, predicate: string, object: string): string {
+export function formatDeleteRelationText(
+  subject: string,
+  predicate: string,
+  object: string
+): string {
   const left = String(subject ?? '').trim()
   const middle = String(predicate ?? '').trim()
   const right = String(object ?? '').trim()
@@ -197,7 +239,7 @@ export function getDeleteOperationItemLabel(item: DeleteOperationItem): string {
       formatDeleteRelationText(
         String(relation.subject ?? ''),
         String(relation.predicate ?? ''),
-        String(relation.object ?? ''),
+        String(relation.object ?? '')
       ) || String(item.item_key ?? item.item_hash ?? '未命名关系')
     )
   }
@@ -245,6 +287,85 @@ export function getDeleteOperationItemSource(item: DeleteOperationItem): string 
     return String(paragraph.source ?? '').trim()
   }
   return String(payload.source ?? '').trim()
+}
+
+/** 删除范围摘要里每类对象最多列出的数量 */
+const DELETE_SELECTOR_LISTED_LIMIT = 8
+
+export function getMemorySourceKindLabel(sourceKind: string): string {
+  const normalized = String(sourceKind ?? '').trim()
+  return MEMORY_SOURCE_KIND_TEXT[normalized] ?? ''
+}
+
+export interface MemorySourceDisplay {
+  /** 来源类型标签；识别不出时为空串 */
+  kindLabel: string
+  /** 主标题：聊天流名称或人物姓名优先，其次是原始 source */
+  title: string
+  /** 副标题：原始 source；与主标题相同时为空串 */
+  raw: string
+}
+
+/**
+ * 组装来源的展示信息：优先显示聊天流名称或人物姓名，裸 source 降级为副标题。
+ * 操作记录里的来源只剩裸字符串，此时用名称映射补齐聊天流名称。
+ */
+export function describeMemorySource(
+  source: string,
+  hints: { sourceKind?: string; chatName?: string; personName?: string } = {}
+): MemorySourceDisplay {
+  const raw = String(source ?? '').trim()
+  // 人物事实来源的前缀后是不可读的 person_id，优先用后端解析出的姓名
+  const readableName = String(hints.chatName ?? '').trim() || String(hints.personName ?? '').trim()
+  const title = readableName || raw
+  return {
+    kindLabel: getMemorySourceKindLabel(String(hints.sourceKind ?? '')),
+    title,
+    raw: title === raw ? '' : raw,
+  }
+}
+
+/**
+ * 把删除选择器翻译成可读条目，避免用户直接读原始 JSON。
+ * 返回空数组表示选择器没有可读内容（例如已清空）。
+ */
+export function summarizeDeleteSelector(selector: unknown): string[] {
+  if (!selector || typeof selector !== 'object') {
+    return []
+  }
+  const record = selector as Record<string, unknown>
+  const lines: string[] = []
+  const readList = (value: unknown): string[] =>
+    (Array.isArray(value) ? value : []).map((item) => String(item ?? '').trim()).filter(Boolean)
+  // 生命周期归档类选择器可能带上百个 hash，这里只列前若干个，避免整段刷屏
+  const formatList = (tokens: string[]): string => {
+    if (tokens.length <= DELETE_SELECTOR_LISTED_LIMIT) {
+      return `${tokens.length} 个：${tokens.join('、')}`
+    }
+    return `${tokens.length} 个（仅列前 ${DELETE_SELECTOR_LISTED_LIMIT} 个）：${tokens
+      .slice(0, DELETE_SELECTOR_LISTED_LIMIT)
+      .join('、')}`
+  }
+
+  const sources = readList(record.sources)
+  if (sources.length > 0) {
+    lines.push(`来源 ${formatList(sources)}`)
+  }
+
+  const hashGroups: Array<[string, string]> = [
+    ['entity_hashes', '实体'],
+    ['relation_hashes', '关系'],
+    ['paragraph_hashes', '段落'],
+    ['hashes', '对象'],
+  ]
+  hashGroups.forEach(([key, label]) => {
+    const tokens = readList(record[key])
+    if (tokens.length > 0) {
+      lines.push(`${label} ${formatList(tokens)}`)
+    }
+  })
+
+  return lines
 }
 
 export function formatFeedbackDecision(decision: string): string {
@@ -297,7 +418,7 @@ export function formatFeedbackRollbackStatus(status: string): string {
 }
 
 export function getFeedbackStatusVariant(
-  status: string,
+  status: string
 ): 'default' | 'secondary' | 'destructive' | 'outline' {
   if (status === 'applied' || status === 'rolled_back') {
     return 'default'
@@ -353,12 +474,12 @@ export function formatFeedbackRelationTriplet(value: unknown): string {
   return formatDeleteRelationText(
     String(triplet.subject ?? ''),
     String(triplet.predicate ?? ''),
-    String(triplet.object ?? ''),
+    String(triplet.object ?? '')
   )
 }
 
 export function getFeedbackCorrectionPreview(
-  task: MemoryFeedbackCorrectionDetailTaskPayload | MemoryFeedbackCorrectionSummaryPayload | null,
+  task: MemoryFeedbackCorrectionDetailTaskPayload | MemoryFeedbackCorrectionSummaryPayload | null
 ): {
   headline: string
   oldRelation: string
@@ -377,10 +498,13 @@ export function getFeedbackCorrectionPreview(
   const forgottenRelations = Array.isArray(rollbackPlanSummary.forgotten_relations)
     ? rollbackPlanSummary.forgotten_relations
     : []
-  const correctedWrite = rollbackPlanSummary.corrected_write && typeof rollbackPlanSummary.corrected_write === 'object'
-    ? rollbackPlanSummary.corrected_write
-    : {}
-  const correctedRelations = Array.isArray((correctedWrite as Record<string, unknown>).corrected_relations)
+  const correctedWrite =
+    rollbackPlanSummary.corrected_write && typeof rollbackPlanSummary.corrected_write === 'object'
+      ? rollbackPlanSummary.corrected_write
+      : {}
+  const correctedRelations = Array.isArray(
+    (correctedWrite as Record<string, unknown>).corrected_relations
+  )
     ? ((correctedWrite as Record<string, unknown>).corrected_relations as unknown[])
     : []
 
@@ -416,7 +540,7 @@ export function getFeedbackCorrectionPreview(
 }
 
 export function buildFeedbackImpactSummary(
-  task: MemoryFeedbackCorrectionDetailTaskPayload | MemoryFeedbackCorrectionSummaryPayload | null,
+  task: MemoryFeedbackCorrectionDetailTaskPayload | MemoryFeedbackCorrectionSummaryPayload | null
 ): string[] {
   if (!task) {
     return []

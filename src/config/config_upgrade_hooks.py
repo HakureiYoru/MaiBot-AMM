@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Dict, List, Optional
 
 from .official_configs import ChatConfig
 
@@ -401,6 +401,163 @@ def _first_existing_bool(item: dict[str, Any], keys: tuple[str, ...], default: b
     return default
 
 
+def _copy_personality_to_behavior_style(data: dict[str, Any]) -> list[str]:
+    """8.14.29: 首次拆分 Planner 行为风格时，沿用用户原有的人格配置。"""
+
+    personality = _as_dict(data.get("personality"))
+    if personality is None or "behavior_style" in personality:
+        return []
+
+    original_personality = personality.get("personality")
+    if not isinstance(original_personality, str):
+        return []
+
+    personality["behavior_style"] = original_personality
+    return ["personality.behavior_style"]
+
+
+def _migrate_removed_expression_selection_mode(data: dict[str, Any]) -> list[str]:
+    """8.14.40: 将已移除的 vector 表达选取模式迁移为 vector_intent。"""
+
+    expression = _as_dict(data.get("expression"))
+    if expression is None or expression.get("expression_selection_mode") != "vector":
+        return []
+
+    expression["expression_selection_mode"] = "vector_intent"
+    return ["expression.expression_selection_mode"]
+
+
+def _reset_expression_defaults(data: Dict[str, Any]) -> List[str]:
+    """8.14.58: 重置精选限制，移除旧表达模式并默认启用向量表达。"""
+
+    reasons: List[str] = []
+    if set_nested_config_value(data, ("expression", "expression_checked_only"), False):
+        reasons.append("expression.expression_checked_only")
+    if set_nested_config_value(data, ("expression", "use_vector_expression"), True, force=False):
+        reasons.append("expression.use_vector_expression")
+    expression = data["expression"]
+    if "expression_selection_mode" in expression:
+        del expression["expression_selection_mode"]
+        reasons.append("expression.expression_selection_mode")
+    return reasons
+
+
+def _migrate_removed_reply_necessity_trigger_mode(data: dict[str, Any]) -> list[str]:
+    """8.14.54: 将已移除的 reply_necessity 回复触发模式迁移为 dynamic。"""
+
+    chat = _as_dict(data.get("chat"))
+    reply_timing = _as_dict(chat.get("reply_timing")) if chat is not None else None
+    if reply_timing is None or reply_timing.get("reply_trigger_mode") != "reply_necessity":
+        return []
+
+    reply_timing["reply_trigger_mode"] = "dynamic"
+    return ["chat.reply_timing.reply_trigger_mode"]
+
+
+def _learning_default_item(source: Optional[Dict[str, Any]], rule_type: str) -> Dict[str, Any]:
+    """生成指定聊天类型的全局默认规则；没有来源规则时沿用「未命中即开启」的旧行为。"""
+
+    item: Dict[str, Any] = dict(source) if source is not None else {"use": True, "learn": True}
+    item["platform"] = ""
+    item["item_id"] = ""
+    item["type"] = rule_type
+    return item
+
+
+def _merge_wildcard_learning_rules(section: Dict[str, Any], list_key: str) -> bool:
+    learning_list = _as_list(section.get(list_key))
+    if learning_list is None:
+        return False
+
+    items: List[Dict[str, Any]] = []
+    for raw_item in learning_list:
+        item = _as_dict(raw_item)
+        if item is None:
+            return False
+        items.append(item)
+
+    # 每条规则归一化后的 (platform, item_id, type)，以及它原本是否是会生效的通配规则
+    targets: List[tuple[str, str, str]] = []
+    was_wildcard: List[bool] = []
+    was_dead: List[bool] = []
+    for item in items:
+        raw_platform = str(item.get("platform") or "").strip()
+        raw_item_id = str(item.get("item_id") or "").strip()
+        platform = "" if raw_platform == "*" else raw_platform
+        item_id = "" if raw_item_id == "*" else raw_item_id
+        targets.append((platform, item_id, str(item.get("type") or "group").strip()))
+        # 旧逻辑里通配要求 platform 和 item_id 都非空，半边留空的通配从不命中
+        was_wildcard.append(bool(raw_platform and raw_item_id) and "*" in (raw_platform, raw_item_id))
+        was_dead.append((raw_platform == "*") != (raw_item_id == "*") and not platform and not item_id)
+
+    # 非全局层：同目标同类型只留原本生效的那条（通配优先，其次靠前）
+    winners: Dict[tuple[str, str, str], int] = {}
+    for index, target in enumerate(targets):
+        if not target[0] and not target[1]:
+            continue
+        current = winners.get(target)
+        if current is None or (was_wildcard[index] and not was_wildcard[current]):
+            winners[target] = index
+
+    # 全局层：旧逻辑是 *:* 按聊天类型命中，留空默认不分类型兜底且只有第一条生效
+    global_indexes = [
+        index for index, target in enumerate(targets) if not target[0] and not target[1] and not was_dead[index]
+    ]
+    wildcard_by_type: Dict[str, Dict[str, Any]] = {}
+    first_default: Optional[Dict[str, Any]] = None
+    for index in global_indexes:
+        if was_wildcard[index]:
+            wildcard_by_type.setdefault(targets[index][2], items[index])
+        elif first_default is None:
+            first_default = items[index]
+
+    if wildcard_by_type:
+        global_items = [
+            _learning_default_item(wildcard_by_type.get(rule_type, first_default), rule_type)
+            for rule_type in ("group", "private")
+        ]
+    elif first_default is not None:
+        global_items = [_learning_default_item(first_default, str(first_default.get("type") or "group").strip())]
+    else:
+        global_items = []
+
+    merged: List[Dict[str, Any]] = []
+    global_inserted = False
+    for index, target in enumerate(targets):
+        if not target[0] and not target[1]:
+            if not global_inserted and index in global_indexes:
+                merged.extend(global_items)
+                global_inserted = True
+            continue
+        if winners[target] != index:
+            continue
+        item = dict(items[index])
+        item["platform"], item["item_id"] = target[0], target[1]
+        merged.append(item)
+
+    if merged == learning_list:
+        return False
+
+    section[list_key] = merged
+    return True
+
+
+def _merge_wildcard_learning_rules_into_defaults(data: Dict[str, Any]) -> List[str]:
+    """8.14.60: learning_list 的 * 与留空等价，把通配规则合并为对应层级的默认规则并去重。"""
+
+    reasons: List[str] = []
+    for section_name, list_key in (
+        ("expression", "learning_list"),
+        ("jargon", "learning_list"),
+        ("experimental", "behavior_learning_list"),
+    ):
+        section = _as_dict(data.get(section_name))
+        if section is not None and _merge_wildcard_learning_rules(section, list_key):
+            reasons.append(f"{section_name}.{list_key}")
+
+    return reasons
+
+
 BOT_CONFIG_UPGRADE_HOOKS: tuple[ConfigUpgradeHook, ...] = (
     ConfigUpgradeHook(
         target_version="8.10.11",
@@ -436,6 +593,31 @@ BOT_CONFIG_UPGRADE_HOOKS: tuple[ConfigUpgradeHook, ...] = (
         target_version="8.14.19",
         config_names=("bot_config.toml",),
         migrate=_split_chat_config_sections,
+    ),
+    ConfigUpgradeHook(
+        target_version="8.14.29",
+        config_names=("bot_config.toml",),
+        migrate=_copy_personality_to_behavior_style,
+    ),
+    ConfigUpgradeHook(
+        target_version="8.14.40",
+        config_names=("bot_config.toml",),
+        migrate=_migrate_removed_expression_selection_mode,
+    ),
+    ConfigUpgradeHook(
+        target_version="8.14.54",
+        config_names=("bot_config.toml",),
+        migrate=_migrate_removed_reply_necessity_trigger_mode,
+    ),
+    ConfigUpgradeHook(
+        target_version="8.14.58",
+        config_names=("bot_config.toml",),
+        migrate=_reset_expression_defaults,
+    ),
+    ConfigUpgradeHook(
+        target_version="8.14.60",
+        config_names=("bot_config.toml",),
+        migrate=_merge_wildcard_learning_rules_into_defaults,
     ),
 )
 MODEL_CONFIG_UPGRADE_HOOKS: tuple[ConfigUpgradeHook, ...] = ()

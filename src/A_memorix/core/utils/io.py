@@ -40,12 +40,12 @@ def _replace_file(src: Path, dst: Path) -> None:
 def atomic_write(file_path: Union[str, Path], mode: str = "w", encoding: str = None, **kwargs):
     """
     原子文件写入上下文管理器
-    
+
     原理：
     1. 写入 .tmp 临时文件
     2. 写入成功后，使用 os.replace 原子替换目标文件
     3. 如果失败，自动删除临时文件
-    
+
     Args:
         file_path: 目标文件路径
         mode: 打开模式 ('w', 'wb' 等)
@@ -55,30 +55,31 @@ def atomic_write(file_path: Union[str, Path], mode: str = "w", encoding: str = N
     path = Path(file_path)
     # 确保父目录存在
     path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # 临时文件路径
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    
+
     try:
         with open(tmp_path, mode, encoding=encoding, **kwargs) as f:
             yield f
-            
+
             # 确保写入磁盘
             f.flush()
             os.fsync(f.fileno())
-            
+
         # 原子替换 (Windows下可能需要先删除目标文件，但 os.replace 在 Py3.3+ 尽可能原子)
         # 注意: Windows 上如果有其他进程占用文件，os.replace 可能会失败
         os.replace(tmp_path, path)
-        
-    except Exception as e:
+
+    except Exception:
         # 清理临时文件
         if tmp_path.exists():
             try:
                 os.remove(tmp_path)
-            except:
+            except OSError:
                 pass
-        raise e
+        raise
+
 
 @contextlib.contextmanager
 def atomic_save_path(file_path: Union[str, Path]):
@@ -87,10 +88,10 @@ def atomic_save_path(file_path: Union[str, Path]):
 
     若目标路径含非 ASCII 字符（常见于 Windows 中文目录），临时文件会写到
     系统 ASCII 临时目录，再搬回目标路径，避免 FAISS C API 打不开文件。
-    
+
     Args:
         file_path: 最终目标路径
-        
+
     Yields:
         tmp_path: 临时文件路径 (str)
     """
@@ -103,20 +104,20 @@ def atomic_save_path(file_path: Union[str, Path]):
         tmp_path = Path(bridge_dir) / f"{path.name}.tmp"
     else:
         tmp_path = path.with_suffix(path.suffix + ".tmp")
-    
+
     try:
         yield str(tmp_path)
-        
+
         if Path(tmp_path).exists():
             _replace_file(Path(tmp_path), path)
-            
-    except Exception as e:
+
+    except Exception:
         if Path(tmp_path).exists():
             try:
                 os.remove(tmp_path)
-            except:
+            except OSError:
                 pass
-        raise e
+        raise
     finally:
         if bridge_dir is not None:
             shutil.rmtree(bridge_dir, ignore_errors=True)

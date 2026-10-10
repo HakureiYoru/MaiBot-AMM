@@ -1,11 +1,14 @@
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import asyncio
+import json
 import numpy as np
 import pytest
 
 from src.A_memorix.core.strategies.base import ChunkContext, KnowledgeType, ProcessedChunk, SourceInfo
+from src.A_memorix.core.strategies.chat_log import ChatLogStrategy
 from src.A_memorix.core.strategies.factual import FactualStrategy
 from src.A_memorix.core.strategies.narrative import NarrativeStrategy
 from src.A_memorix.core.storage.knowledge_types import ImportStrategy
@@ -15,6 +18,7 @@ from src.A_memorix.core.utils.web_import_manager import (
     ImportTaskManager,
     ImportTaskRecord,
 )
+from src.A_memorix.core.utils.relation_write_service import RelationWriteService
 
 
 class _DummyMetadataStore:
@@ -34,10 +38,25 @@ class _DummyMetadataStore:
         self.entities.append(name)
         return f"entity-{name}"
 
+    def add_entities_batch(
+        self,
+        names: list[str],
+        source_paragraph: str = "",
+        **kwargs,
+    ) -> list[str]:
+        del kwargs
+        return [self.add_entity(name=name, source_paragraph=source_paragraph) for name in names]
+
     def add_relation(self, *, subject: str, predicate: str, obj: str, **kwargs) -> str:
         del kwargs
         self.relations.append((subject, predicate, obj))
         return f"relation-{len(self.relations)}"
+
+    def add_relations_batch(self, relations: list[tuple[str, str, str]], **kwargs) -> list[str]:
+        return [
+            self.add_relation(subject=subject, predicate=predicate, obj=obj, **kwargs)
+            for subject, predicate, obj in relations
+        ]
 
     def set_relation_vector_state(
         self,
@@ -48,6 +67,10 @@ class _DummyMetadataStore:
     ) -> None:
         self.relation_vector_states.append((rel_hash, state, error, bump_retry))
 
+    @staticmethod
+    def get_relation_status_batch(relation_hashes: list[str]) -> dict[str, dict[str, bool]]:
+        return {relation_hash: {"is_inactive": False} for relation_hash in relation_hashes}
+
     def enqueue_paragraph_vector_backfill(self, paragraph_hash: str, *, error: str = "") -> None:
         self.paragraph_backfills.append((paragraph_hash, error))
 
@@ -57,6 +80,11 @@ class _DummyMetadataStore:
             for paragraph in self.paragraphs
             if paragraph.get("source") == source and not paragraph.get("is_deleted")
         ]
+
+    @staticmethod
+    def transaction(*, immediate: bool = False):
+        del immediate
+        return nullcontext()
 
 
 class _DummyGraphStore:
@@ -71,21 +99,29 @@ class _DummyGraphStore:
         del relation_hashes
         self.edges.append(list(edges))
 
+    @staticmethod
+    def batch_update():
+        return nullcontext()
+
 
 class _DummyVectorStore:
     def __init__(self) -> None:
         self.dimension = 4
         self.ids: list[str] = []
+        self._deleted_ids: set[str] = set()
         self.add_count = 0
         self.save_count = 0
         self.load_count = 0
 
     def __contains__(self, item: str) -> bool:
-        return item in self.ids
+        return item in self.ids and item not in self._deleted_ids
 
     def add(self, vectors, ids):
         if vectors.shape[1] != self.dimension:
             raise ValueError(f"Dimension mismatch: {vectors.shape[1]} vs {self.dimension}")
+        tombstoned = [item for item in ids if item in self._deleted_ids]
+        if tombstoned:
+            raise ValueError("向量 ID 已被删除，请先调用 restore() 恢复")
         added = 0
         for item in ids:
             if item in self.ids:
@@ -94,6 +130,22 @@ class _DummyVectorStore:
             added += 1
         self.add_count += added
         return added
+
+    def delete(self, ids) -> int:
+        deleted = 0
+        for item in ids:
+            if item in self.ids and item not in self._deleted_ids:
+                self._deleted_ids.add(item)
+                deleted += 1
+        return deleted
+
+    def restore(self, ids) -> int:
+        restored = 0
+        for item in dict.fromkeys(ids):
+            if item in self.ids and item in self._deleted_ids:
+                self._deleted_ids.remove(item)
+                restored += 1
+        return restored
 
     def save(self) -> None:
         self.save_count += 1
@@ -106,13 +158,24 @@ class _DummyVectorStore:
 
 
 class _DummyEmbeddingManager:
-    def __init__(self, *, delay: float = 0.0, fail_for: str = "", dimension: int = 4) -> None:
+    def __init__(
+        self,
+        *,
+        delay: float = 0.0,
+        fail_for: str = "",
+        dimension: int = 4,
+        batch_size: int = 32,
+        max_concurrent: int = 5,
+    ) -> None:
         self.delay = delay
         self.fail_for = fail_for
         self.dimension = dimension
+        self.batch_size = batch_size
+        self.max_concurrent = max_concurrent
         self.inflight = 0
         self.max_inflight = 0
         self.calls: list[str] = []
+        self.batch_calls: list[list[str]] = []
 
     async def encode(self, text: str) -> np.ndarray:
         self.calls.append(text)
@@ -127,12 +190,18 @@ class _DummyEmbeddingManager:
             self.inflight -= 1
         return np.ones(self.dimension, dtype=np.float32)
 
+    async def encode_batch(self, texts: list[str]) -> np.ndarray:
+        self.batch_calls.append(list(texts))
+        vectors = await asyncio.gather(*(self.encode(text) for text in texts))
+        return np.asarray(vectors, dtype=np.float32)
+
 
 def _build_manager(
     *,
     embedding_manager: _DummyEmbeddingManager | None = None,
     relation_vectorization_enabled: bool = False,
     vector_pool_mode: str = "single",
+    data_dir: Path | None = None,
 ) -> tuple[ImportTaskManager, _DummyMetadataStore]:
     metadata_store = _DummyMetadataStore()
     config = {
@@ -142,10 +211,17 @@ def _build_manager(
         },
         "retrieval.vector_pools.mode": vector_pool_mode,
     }
+    if data_dir is not None:
+        config["storage.data_dir"] = str(data_dir)
     graph_store = _DummyGraphStore()
     legacy_vector_store = _DummyVectorStore()
     paragraph_vector_store = _DummyVectorStore()
     graph_vector_store = _DummyVectorStore()
+    profile_refreshes: list[tuple[list[str], str]] = []
+
+    def record_person_evidence_written(person_ids: list[str], *, reason: str) -> None:
+        profile_refreshes.append((list(person_ids), reason))
+
     plugin = SimpleNamespace(
         metadata_store=metadata_store,
         graph_store=graph_store,
@@ -157,9 +233,25 @@ def _build_manager(
         get_config=lambda key, default=None: config.get(key, default),
         _is_embedding_degraded=lambda: False,
         _allow_metadata_only_write=lambda: True,
+        profile_refreshes=profile_refreshes,
+        record_person_evidence_written=record_person_evidence_written,
     )
     manager = ImportTaskManager(plugin)
     return manager, metadata_store
+
+
+def test_runtime_store_persistence_uses_fingerprint_entrypoint() -> None:
+    manager, _ = _build_manager()
+    persisted: list[object] = []
+    graph_saves: list[bool] = []
+    manager.plugin.persist_vector_store = lambda store: persisted.append(store)
+    manager.plugin.graph_store.save = lambda: graph_saves.append(True)
+    expected_stores = manager._vector_stores_for_persistence()
+
+    manager._save_runtime_stores_locked()
+
+    assert persisted == expected_stores
+    assert graph_saves == [True]
 
 
 def _build_progress_task(task_id: str, total_chunks: int = 2) -> ImportTaskRecord:
@@ -193,6 +285,150 @@ def _test_manifest_path(name: str) -> Path:
     return path
 
 
+def _test_directory(name: str) -> Path:
+    path = Path("temp") / "web_import_manager_tests" / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_import_state_uses_data_dir_imports_and_migrates_legacy_state(tmp_path: Path) -> None:
+    data_dir = tmp_path / "a-memorix"
+    legacy_manifest = data_dir / "import_manifest.json"
+    legacy_reports = data_dir / "web_import_reports"
+    legacy_tasks = data_dir / "web_import_tmp"
+    legacy_reports.mkdir(parents=True)
+    legacy_tasks.mkdir(parents=True)
+    legacy_manifest.write_text('{"source": {"status": "completed"}}', encoding="utf-8")
+    (legacy_reports / "report.json").write_text("{}", encoding="utf-8")
+    (legacy_tasks / "stale.txt").write_text("stale", encoding="utf-8")
+    plugin = SimpleNamespace(
+        get_config=lambda key, default=None: str(data_dir) if key == "storage.data_dir" else default,
+    )
+
+    manager = ImportTaskManager(plugin)
+
+    assert manager._temp_root == data_dir / "imports" / "tasks"
+    assert manager._reports_root == data_dir / "imports" / "reports"
+    assert manager._manifest_path == data_dir / "imports" / "manifest.json"
+    assert manager._load_manifest() == {"source": {"status": "completed"}}
+    assert (manager._reports_root / "report.json").is_file()
+    assert not legacy_manifest.exists()
+    assert not legacy_reports.exists()
+    assert (legacy_tasks / "stale.txt").is_file()
+
+
+def test_import_aliases_are_fixed_under_data_dir(tmp_path: Path) -> None:
+    data_dir = tmp_path / "a-memorix"
+    external_dir = tmp_path / "external"
+    config = {
+        "storage.data_dir": str(data_dir),
+        "web.import.path_aliases": {"raw": str(external_dir), "outside": str(external_dir)},
+    }
+    plugin = SimpleNamespace(get_config=lambda key, default=None: config.get(key, default))
+
+    manager = ImportTaskManager(plugin)
+
+    assert manager.get_path_aliases() == {
+        "raw": str((data_dir / "imports" / "source" / "raw").resolve()),
+        "lpmm": str((data_dir / "imports" / "source" / "lpmm").resolve()),
+        "maibot": str((data_dir / "imports" / "source" / "maibot").resolve()),
+        "converted": str((data_dir / "imports" / "converted").resolve()),
+    }
+    assert all(Path(path).is_dir() for path in manager.get_path_aliases().values())
+    with pytest.raises(ValueError, match="未知路径别名"):
+        manager.resolve_path_alias("outside")
+
+
+def test_import_task_kinds_use_their_fixed_aliases(tmp_path: Path) -> None:
+    data_dir = tmp_path / "a-memorix"
+    plugin = SimpleNamespace(
+        get_config=lambda key, default=None: str(data_dir) if key == "storage.data_dir" else default,
+    )
+    manager = ImportTaskManager(plugin)
+
+    with pytest.raises(ValueError, match="raw 导入目录"):
+        manager._normalize_raw_scan_params({"alias": "lpmm"})
+    with pytest.raises(ValueError, match="lpmm 导入目录"):
+        manager._normalize_lpmm_openie_params({"alias": "raw"})
+    with pytest.raises(ValueError, match="lpmm 导入目录"):
+        manager._normalize_lpmm_convert_params({"alias": "raw"})
+    with pytest.raises(ValueError, match="converted 导入目录"):
+        manager._normalize_lpmm_convert_params({"target_alias": "raw"})
+
+    legacy_target = manager._normalize_lpmm_convert_params({"target_alias": "plugin_data"})
+    assert legacy_target["target_alias"] == "converted"
+
+
+@pytest.mark.asyncio
+async def test_staged_upload_must_stay_under_import_root(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "a-memorix"
+    manager, _ = _build_manager(data_dir=data_dir)
+    staged_file = data_dir / "imports" / "staging" / "request" / "demo.txt"
+    staged_file.parent.mkdir(parents=True)
+    staged_file.write_text("demo", encoding="utf-8")
+
+    async def skip_worker() -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_ensure_worker", skip_worker)
+    summary = await manager.create_upload_task(
+        [{"staged_path": str(staged_file), "filename": "demo.txt"}],
+        {"strategy_override": "factual"},
+    )
+
+    task = manager._tasks[summary["task_id"]]
+    assert Path(task.files[0].temp_path).is_relative_to(data_dir / "imports" / "tasks")
+    outside_file = tmp_path / "outside.txt"
+    outside_file.write_text("outside", encoding="utf-8")
+    with pytest.raises(ValueError, match="必须位于导入目录"):
+        await manager.create_upload_task(
+            [{"staged_path": str(outside_file), "filename": "outside.txt"}],
+            {"strategy_override": "factual"},
+        )
+
+
+def test_maibot_migration_allows_live_db_or_import_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "a-memorix"
+    plugin = SimpleNamespace(
+        get_config=lambda key, default=None: str(data_dir) if key == "storage.data_dir" else default,
+    )
+    manager = ImportTaskManager(plugin)
+    import_db = data_dir / "imports" / "source" / "maibot" / "history.db"
+
+    default_params = manager._normalize_migration_params({})
+    relative_params = manager._normalize_migration_params({"source_db": "history.db"})
+    absolute_params = manager._normalize_migration_params({"source_db": str(import_db)})
+
+    assert Path(default_params["source_db"]) == manager._default_maibot_source_db().resolve()
+    assert Path(relative_params["source_db"]) == import_db.resolve()
+    assert Path(absolute_params["source_db"]) == import_db.resolve()
+    with pytest.raises(ValueError, match="必须位于导入目录"):
+        manager._normalize_migration_params({"source_db": str(tmp_path / "outside.db")})
+
+
+@pytest.mark.asyncio
+async def test_temporal_backfill_always_targets_active_store(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "a-memorix"
+    (data_dir / "metadata").mkdir(parents=True)
+    plugin = SimpleNamespace(
+        get_config=lambda key, default=None: str(data_dir) if key == "storage.data_dir" else default,
+    )
+    manager = ImportTaskManager(plugin)
+
+    async def skip_worker() -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_ensure_worker", skip_worker)
+    summary = await manager.create_temporal_backfill_task(
+        {"alias": "plugin_data", "relative_path": "ignored", "dry_run": True}
+    )
+
+    task = manager._tasks[summary["task_id"]]
+    assert task.files[0].source_path == str(data_dir.resolve())
+    assert "alias" not in task.params
+    assert "relative_path" not in task.params
+
+
 def test_import_params_include_configurable_chunk_windows() -> None:
     manager, _ = _build_manager()
 
@@ -215,6 +451,34 @@ def test_import_params_include_configurable_chunk_windows() -> None:
     assert customized["narrative_overlap"] == 600
     assert customized["factual_target_size"] == 1400
 
+def test_import_scope_is_explicit_and_legacy_payloads_remain_compatible() -> None:
+    manager, _ = _build_manager()
+
+    explicit_global = manager._normalize_common_import_params(
+        {"scope_type": "global"},
+        default_dedupe="content_hash",
+    )
+    explicit_chat = manager._normalize_common_import_params(
+        {"scope_type": "chat", "chat_id": "session-1"},
+        default_dedupe="content_hash",
+    )
+    legacy_chat = manager._normalize_common_import_params(
+        {"chat_id": "session-legacy"},
+        default_dedupe="content_hash",
+    )
+
+    assert manager._chat_metadata_from_params(explicit_global) == {"scope_type": "global"}
+    assert manager._chat_metadata_from_params(explicit_chat) == {
+        "scope_type": "chat",
+        "chat_id": "session-1",
+    }
+    assert legacy_chat["scope_type"] == "chat"
+
+    with pytest.raises(ValueError, match="不能同时提供 chat_id"):
+        manager._normalize_common_import_params(
+            {"scope_type": "global", "chat_id": "session-1"},
+            default_dedupe="content_hash",
+        )
 
 def test_import_strategy_uses_configurable_chunk_windows() -> None:
     manager, _ = _build_manager()
@@ -246,13 +510,7 @@ def test_narrative_split_progresses_with_high_overlap_and_newline_backoff() -> N
     )
     assert isinstance(narrative, NarrativeStrategy)
 
-    text = (
-        "第一段内容" * 30
-        + "\n"
-        + "第二段内容" * 30
-        + "\n"
-        + "第三段内容" * 30
-    )
+    text = "第一段内容" * 30 + "\n" + "第二段内容" * 30 + "\n" + "第三段内容" * 30
 
     chunks = narrative.split(text)
     offsets = [chunk.source.offset_start for chunk in chunks]
@@ -261,6 +519,156 @@ def test_narrative_split_progresses_with_high_overlap_and_newline_backoff() -> N
     assert len(chunks) < len(text)
     assert offsets == sorted(offsets)
     assert len(set(offsets)) == len(offsets)
+
+
+def test_chat_log_split_keeps_message_boundaries_and_multiline_content() -> None:
+    manager, _ = _build_manager()
+    strategy = manager._determine_strategy(
+        "chat.txt",
+        "",
+        "narrative",
+        chat_log=True,
+        import_params={
+            "chat_log": True,
+            "narrative_window_size": 200,
+            "narrative_overlap": 50,
+        },
+    )
+    assert isinstance(strategy, ChatLogStrategy)
+
+    messages = [
+        f"[2026-08-21 10:{index:02d}] 用户{index}：第{index}条消息" + "内容" * 25
+        for index in range(6)
+    ]
+    messages[2] += "\n这是同一条消息的第二行"
+    chunks = strategy.split("\n".join(messages))
+
+    assert len(chunks) > 1
+    assert all(chunk.chunk.text.startswith("[2026-08-21") for chunk in chunks)
+    assert all("这是同一条消息的第二行" not in chunk.chunk.text or "用户2" in chunk.chunk.text for chunk in chunks)
+    assert [chunk.source.offset_start for chunk in chunks] == sorted(
+        chunk.source.offset_start for chunk in chunks
+    )
+    assert strategy.split_warning == ""
+
+
+def test_chat_log_split_warns_when_message_headers_are_not_recognized() -> None:
+    strategy = ChatLogStrategy("chat.txt", window_size=200, overlap=50)
+
+    chunks = strategy.split("用户甲说了一段没有时间消息头的聊天内容。" * 30)
+
+    assert chunks
+    assert "未识别" in strategy.split_warning
+
+
+@pytest.mark.asyncio
+async def test_json_paragraph_person_ids_are_stored_and_refresh_profiles() -> None:
+    manager, metadata_store = _build_manager()
+    task = _build_progress_task("task-person-ids", total_chunks=0)
+    task.files[0].input_mode = "json"
+    manager._tasks[task.task_id] = task
+    units, warnings = manager._build_json_units(
+        {
+            "paragraphs": [
+                {
+                    "content": "用户甲喜欢观星",
+                    "person_ids": ["person-a", "person-a", "person-b"],
+                }
+            ]
+        },
+        task.files[0].file_id,
+        task.files[0].name,
+        "script_json",
+    )
+    await manager._register_json_units(task.task_id, task.files[0].file_id, units)
+
+    await manager._process_json_unit(
+        task.task_id,
+        task.files[0],
+        units[0],
+        asyncio.Semaphore(1),
+        paragraph_metadata={"scope_type": "global"},
+    )
+
+    assert warnings == []
+    assert units[0]["person_ids"] == ["person-a", "person-b"]
+    assert metadata_store.paragraphs[0]["metadata"] == {
+        "scope_type": "global",
+        "person_ids": ["person-a", "person-b"],
+    }
+    assert manager.plugin.profile_refreshes == [
+        (["person-a", "person-b"], "web_import_json")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_json_paragraph_profile_refresh_failure_is_reported_without_failing_write() -> None:
+    manager, metadata_store = _build_manager()
+    task = _build_progress_task("task-profile-refresh-failure", total_chunks=0)
+    task.files[0].input_mode = "json"
+    manager._tasks[task.task_id] = task
+    units, warnings = manager._build_json_units(
+        {
+            "paragraphs": [
+                {
+                    "content": "用户甲喜欢观星",
+                    "person_ids": ["person-a"],
+                }
+            ]
+        },
+        task.files[0].file_id,
+        task.files[0].name,
+        "script_json",
+    )
+    await manager._register_json_units(task.task_id, task.files[0].file_id, units)
+
+    def fail_profile_refresh(person_ids: list[str], *, reason: str) -> None:
+        del person_ids, reason
+        raise RuntimeError("queue unavailable")
+
+    manager.plugin.record_person_evidence_written = fail_profile_refresh
+
+    await manager._process_json_unit(
+        task.task_id,
+        task.files[0],
+        units[0],
+        asyncio.Semaphore(1),
+        paragraph_metadata={"scope_type": "global"},
+    )
+
+    assert warnings == []
+    assert len(metadata_store.paragraphs) == 1
+    assert task.files[0].chunks[0].status == "completed"
+    assert task.files[0].warning_count == 1
+    assert "人物画像刷新入队失败" in task.files[0].warnings[0]
+
+
+def test_json_paragraph_rejects_non_array_person_ids() -> None:
+    manager, _ = _build_manager()
+
+    units, warnings = manager._build_json_units(
+        {"paragraphs": [{"content": "用户甲喜欢观星", "person_ids": "person-a"}]},
+        "file-1",
+        "demo.json",
+        "script_json",
+    )
+
+    assert units == []
+    assert any("paragraph_person_ids_invalid" in warning for warning in warnings)
+
+
+def test_json_paragraph_rejects_non_string_person_id_items() -> None:
+    manager, _ = _build_manager()
+
+    units, warnings = manager._build_json_units(
+        {"paragraphs": [{"content": "用户甲喜欢观星", "person_ids": ["person-a", 42]}]},
+        "file-1",
+        "demo.json",
+        "script_json",
+    )
+
+    assert units == []
+    assert any("paragraph_person_ids_invalid" in warning for warning in warnings)
 
 
 def test_manifest_hit_requires_existing_live_source() -> None:
@@ -406,6 +814,30 @@ async def test_persist_processed_chunk_skips_invalid_nested_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_persist_processed_chunk_accepts_hash_shaped_business_names() -> None:
+    manager, metadata_store = _build_manager()
+    file_record = SimpleNamespace(source_path="", source_kind="paste", name="demo.txt")
+    subject = "a" * 64
+    obj = "b" * 32
+
+    await manager._persist_processed_chunk(
+        file_record,
+        _build_chunk(
+            {
+                "entities": [subject],
+                "relations": [
+                    {"subject": subject, "predicate": "映射到", "object": obj},
+                ],
+            }
+        ),
+    )
+
+    assert len(metadata_store.paragraphs) == 1
+    assert set(metadata_store.entities) >= {subject, obj}
+    assert metadata_store.relations == [(subject, "映射到", obj)]
+
+
+@pytest.mark.asyncio
 async def test_persist_processed_chunk_writes_chat_id_metadata() -> None:
     manager, metadata_store = _build_manager()
     file_record = SimpleNamespace(source_path="", source_kind="paste", name="demo.txt")
@@ -418,6 +850,31 @@ async def test_persist_processed_chunk_writes_chat_id_metadata() -> None:
 
     assert metadata_store.paragraphs[0]["metadata"] == {"chat_id": "session-1"}
     assert metadata_store.paragraphs[0]["source"] == "web_import:demo.txt"
+
+
+@pytest.mark.asyncio
+async def test_persist_processed_chunk_keeps_events_in_metadata_instead_of_entities() -> None:
+    manager, metadata_store = _build_manager()
+    file_record = SimpleNamespace(source_path="", source_kind="paste", name="chat.txt")
+
+    await manager._persist_processed_chunk(
+        file_record,
+        _build_chunk(
+            {
+                "events": ["用户甲发送了一张图片"],
+                "entities": ["用户甲"],
+                "relations": [{"subject": "用户甲", "predicate": "认识", "object": "用户乙"}],
+            }
+        ),
+        metadata={"chat_id": "session-1"},
+    )
+
+    assert metadata_store.paragraphs[0]["metadata"] == {
+        "chat_id": "session-1",
+        "extracted_events": ["用户甲发送了一张图片"],
+    }
+    assert set(metadata_store.entities) == {"用户甲", "用户乙"}
+    assert "用户甲发送了一张图片" not in metadata_store.entities
 
 
 @pytest.mark.asyncio
@@ -471,7 +928,11 @@ async def test_paragraph_vector_write_is_idempotent_after_concurrent_encode() ->
 
     assert manager.plugin.vector_store.ids == ["paragraph-same"]
     assert manager.plugin.vector_store.add_count == 1
-    assert {result["detail"] for result in results} <= {"", "vector_already_exists_after_encode", "vector_already_exists"}
+    assert {result["detail"] for result in results} <= {
+        "",
+        "vector_already_exists_after_encode",
+        "vector_already_exists",
+    }
 
 
 @pytest.mark.asyncio
@@ -556,6 +1017,98 @@ async def test_dual_pool_import_writes_graph_vectors_to_graph_store() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dual_pool_import_batches_entity_and_relation_embeddings() -> None:
+    embedding_manager = _DummyEmbeddingManager()
+    manager, metadata_store = _build_manager(
+        embedding_manager=embedding_manager,
+        relation_vectorization_enabled=True,
+        vector_pool_mode="dual",
+    )
+    manager.plugin.relation_write_service = RelationWriteService(
+        metadata_store=metadata_store,
+        graph_store=manager.plugin.graph_store,
+        vector_store=manager.plugin.vector_store,
+        embedding_manager=embedding_manager,
+        graph_vector_store=manager.plugin.graph_vector_store,
+        use_typed_relation_ids=True,
+    )
+    file_record = SimpleNamespace(source_path="", source_kind="paste", name="demo.txt")
+
+    await manager._persist_processed_chunk(
+        file_record,
+        ProcessedChunk(
+            type=KnowledgeType.FACTUAL,
+            source=SourceInfo(file="demo.txt", offset_start=0, offset_end=8),
+            chunk=ChunkContext(chunk_id="chunk-1", index=0, text="Alice持有地图，Bob居住于广州"),
+            data={
+                "triples": [
+                    {"subject": "Alice", "predicate": "持有", "object": "地图"},
+                    {"subject": "Bob", "predicate": "居住于", "object": "广州"},
+                ],
+                "entities": ["线索"],
+            },
+        ),
+    )
+
+    assert [len(batch) for batch in embedding_manager.batch_calls] == [5, 2]
+    assert set(manager.plugin.graph_vector_store.ids) == {
+        "entity:entity-Alice",
+        "entity:entity-地图",
+        "entity:entity-Bob",
+        "entity:entity-广州",
+        "entity:entity-线索",
+        "relation:relation-1",
+        "relation:relation-2",
+    }
+    assert metadata_store.relation_vector_states[-2:] == [
+        ("relation-1", "ready", None, False),
+        ("relation-2", "ready", None, False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_relation_batch_failure_is_limited_to_failed_write_batch() -> None:
+    embedding_manager = _DummyEmbeddingManager(
+        fail_for="Bob和广州的关系是居住于",
+        batch_size=1,
+        max_concurrent=1,
+    )
+    manager, metadata_store = _build_manager(
+        embedding_manager=embedding_manager,
+        relation_vectorization_enabled=True,
+        vector_pool_mode="dual",
+    )
+    service = RelationWriteService(
+        metadata_store=metadata_store,
+        graph_store=manager.plugin.graph_store,
+        vector_store=manager.plugin.vector_store,
+        embedding_manager=embedding_manager,
+        graph_vector_store=manager.plugin.graph_vector_store,
+        use_typed_relation_ids=True,
+    )
+
+    results = await service.upsert_relations_with_vectors(
+        [
+            ("Alice", "持有", "地图"),
+            ("Bob", "居住于", "广州"),
+            ("Carol", "维护", "项目"),
+        ],
+        source_paragraph="paragraph-1",
+    )
+
+    assert [result.vector_state for result in results] == ["ready", "failed", "ready"]
+    assert set(manager.plugin.graph_vector_store.ids) == {
+        "relation:relation-1",
+        "relation:relation-3",
+    }
+    assert metadata_store.relation_vector_states[-3:] == [
+        ("relation-1", "ready", None, False),
+        ("relation-2", "failed", "embedding failed", True),
+        ("relation-3", "ready", None, False),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_high_concurrency_persist_processed_chunks_keep_all_writes_consistent() -> None:
     chunk_count = 60
     relations_per_chunk = 2
@@ -604,3 +1157,209 @@ async def test_high_concurrency_persist_processed_chunks_keep_all_writes_consist
     assert failed_states == []
     assert metadata_store.paragraph_backfills == []
     assert embedding_manager.max_inflight > 1
+
+
+@pytest.mark.asyncio
+async def test_cancel_queued_task_records_user_origin_and_writes_report() -> None:
+    manager, _ = _build_manager()
+    manager._reports_root = _test_directory("cancel_user_reports")
+    task = _build_progress_task("task-user-cancel")
+    manager._tasks[task.task_id] = task
+    manager._queue.append(task.task_id)
+
+    summary = await manager.cancel_task(task.task_id)
+    await manager._run_task(task.task_id)
+
+    assert summary is not None
+    assert summary["status"] == "cancelled"
+    assert summary["cancel_origin"] == "user_request"
+    assert summary["cancel_requested_at"] is not None
+    report = json.loads((manager._reports_root / f"{task.task_id}_summary.json").read_text(encoding="utf-8"))
+    assert report["status"] == "cancelled"
+    assert report["cancel_origin"] == "user_request"
+
+
+@pytest.mark.asyncio
+async def test_worker_parent_cancellation_is_reported_and_propagated(monkeypatch) -> None:
+    manager, _ = _build_manager()
+    manager._reports_root = _test_directory("cancel_parent_reports")
+    manager._temp_root = _test_directory("cancel_parent_temp")
+    task = _build_progress_task("task-parent-cancel")
+    manager._tasks[task.task_id] = task
+    manager._queue.append(task.task_id)
+    started = asyncio.Event()
+
+    async def blocked_run(task_id: str) -> None:
+        manager._tasks[task_id].status = "running"
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(manager, "_run_task", blocked_run)
+    worker = asyncio.create_task(manager._worker_loop())
+    await started.wait()
+    worker.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    assert task.status == "cancelled"
+    assert task.cancel_origin == "parent_cancel"
+    report = json.loads((manager._reports_root / f"{task.task_id}_summary.json").read_text(encoding="utf-8"))
+    assert report["cancel_origin"] == "parent_cancel"
+
+
+@pytest.mark.asyncio
+async def test_cancel_running_task_interrupts_active_run_and_keeps_worker_alive(monkeypatch) -> None:
+    manager, _ = _build_manager()
+    manager._reports_root = _test_directory("cancel_running_reports")
+    manager._temp_root = _test_directory("cancel_running_temp")
+    first_task = _build_progress_task("task-running-cancel")
+    second_task = _build_progress_task("task-after-cancel")
+    manager._tasks[first_task.task_id] = first_task
+    manager._tasks[second_task.task_id] = second_task
+    manager._queue.extend([first_task.task_id, second_task.task_id])
+    first_started = asyncio.Event()
+    second_completed = asyncio.Event()
+
+    async def controlled_run(task_id: str) -> None:
+        manager._tasks[task_id].status = "running"
+        if task_id == first_task.task_id:
+            first_started.set()
+            await asyncio.Future()
+        manager._tasks[task_id].status = "completed"
+        second_completed.set()
+
+    monkeypatch.setattr(manager, "_run_task", controlled_run)
+    worker = asyncio.create_task(manager._worker_loop())
+    manager._worker_task = worker
+    await first_started.wait()
+
+    summary = await manager.cancel_task(first_task.task_id)
+    await asyncio.wait_for(second_completed.wait(), timeout=1)
+
+    assert summary is not None
+    assert summary["status"] == "cancel_requested"
+    assert first_task.status == "cancelled"
+    assert first_task.cancel_origin == "user_request"
+    assert second_task.status == "completed"
+    assert not worker.done()
+
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_import_process_is_terminated_when_active_run_is_cancelled(monkeypatch) -> None:
+    manager, _ = _build_manager()
+    process_started = asyncio.Event()
+    process_terminated = asyncio.Event()
+
+    class BlockingProcess:
+        returncode: int | None = None
+
+        async def wait(self) -> int:
+            process_started.set()
+            await asyncio.Future()
+            return 0
+
+    process = BlockingProcess()
+
+    async def not_cancel_requested(task_id: str) -> bool:
+        assert task_id == "task-process-cancel"
+        return False
+
+    async def terminate_process(target) -> None:
+        assert target is process
+        process.returncode = -15
+        process_terminated.set()
+
+    monkeypatch.setattr(manager, "_is_cancel_requested", not_cancel_requested)
+    monkeypatch.setattr(manager, "_terminate_process", terminate_process)
+
+    run_task = asyncio.create_task(
+        manager._wait_for_import_process(process, task_id="task-process-cancel")
+    )
+    await process_started.wait()
+    run_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_task
+
+    assert process_terminated.is_set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_records_runtime_cancellation(monkeypatch) -> None:
+    manager, _ = _build_manager()
+    manager._reports_root = _test_directory("cancel_runtime_reports")
+    manager._temp_root = _test_directory("cancel_runtime_temp")
+    task = _build_progress_task("task-runtime-cancel")
+    manager._tasks[task.task_id] = task
+    manager._queue.append(task.task_id)
+    started = asyncio.Event()
+
+    async def blocked_run(task_id: str) -> None:
+        manager._tasks[task_id].status = "running"
+        started.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(manager, "_run_task", blocked_run)
+    worker = asyncio.create_task(manager._worker_loop())
+    manager._worker_task = worker
+    await started.wait()
+
+    await manager.shutdown()
+
+    assert task.status == "cancelled"
+    assert task.cancel_origin == "runtime_shutdown"
+    report = json.loads((manager._reports_root / f"{task.task_id}_summary.json").read_text(encoding="utf-8"))
+    assert report["cancel_origin"] == "runtime_shutdown"
+
+
+@pytest.mark.asyncio
+async def test_run_task_assigns_unhandled_file_error_to_file(monkeypatch) -> None:
+    manager, _ = _build_manager()
+    manager._reports_root = _test_directory("file_error_reports")
+    task = _build_progress_task("task-file-error")
+    task.params.update({"file_concurrency": 1, "chunk_concurrency": 1})
+    manager._tasks[task.task_id] = task
+
+    async def failed_file(*args, **kwargs) -> None:
+        del args, kwargs
+        raise RuntimeError("unexpected file failure")
+
+    monkeypatch.setattr(manager, "_process_file", failed_file)
+    await manager._run_task(task.task_id)
+
+    assert task.files[0].status == "failed"
+    assert task.status == "completed_with_errors"
+    assert "unexpected file failure" in task.files[0].error
+
+
+@pytest.mark.asyncio
+async def test_late_user_cancellation_keeps_completed_result() -> None:
+    manager, _ = _build_manager()
+    task = _build_progress_task("task-late-cancel")
+    task.status = "completed"
+    manager._tasks[task.task_id] = task
+
+    summary = await manager.cancel_task(task.task_id)
+
+    assert summary is not None
+    assert summary["status"] == "completed"
+    assert summary["cancel_origin"] == ""
+    assert summary["cancel_requested_at"] is None
+
+
+def test_metadata_only_import_ready_check_does_not_require_vector_stores() -> None:
+    manager, _ = _build_manager()
+    manager.plugin.vector_store = None
+    manager.plugin.paragraph_vector_store = None
+    manager.plugin.graph_vector_store = None
+
+    manager._ensure_ready()
+
+    manager.plugin.get_config = lambda key, default=None: (
+        False if key == "embedding.fallback.allow_metadata_only_write" else default
+    )
+    with pytest.raises(ValueError, match="paragraph_vector_store, graph_vector_store"):
+        manager._ensure_ready()

@@ -1,17 +1,24 @@
+from contextlib import contextmanager
 from datetime import datetime
+from functools import wraps
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from threading import Lock
+from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, ParamSpec, TypeVar
 
+import asyncio
 import json
 import shutil
 
 from fastapi import APIRouter, Cookie, HTTPException
 import tomlkit
 
+from src.common.runtime_loop import run_on_main_loop
 from src.common.logger import get_logger
 from src.webui.services.git_mirror_service import get_git_mirror_service
 
 from .progress import update_progress
+from .release_install import install_release, read_release_receipt
+from .releases import resolve_release
 from .schemas import InstallPluginRequest, UninstallPluginRequest, UpdatePluginRequest
 from .support import (
     find_plugin_path_by_id,
@@ -33,6 +40,104 @@ from .support import (
 logger = get_logger("webui.plugin_routes")
 
 router = APIRouter()
+
+PluginOperationRequest = InstallPluginRequest | UninstallPluginRequest | UpdatePluginRequest
+_PluginOperationParams = ParamSpec("_PluginOperationParams")
+_PluginOperationResult = TypeVar("_PluginOperationResult")
+_PLUGIN_OPERATION_MUTEX = Lock()
+_ACTIVE_PLUGIN_OPERATIONS: Dict[str, object] = {}
+_PLUGIN_OPERATION_LABELS = {
+    "install": "安装",
+    "uninstall": "卸载",
+    "update": "更新",
+}
+
+
+def _get_plugin_operation_keys(plugin_id: str) -> set[str]:
+    """生成插件操作资源键，使清单 ID、目录名和新旧目录格式指向同一把锁。"""
+
+    keys = {f"id:{plugin_id.casefold()}"}
+    target_path, old_format_path = get_plugin_candidate_paths(plugin_id)
+    keys.update(
+        {
+            f"path:{str(target_path.resolve()).casefold()}",
+            f"path:{str(old_format_path.resolve()).casefold()}",
+        }
+    )
+    installed_path = resolve_installed_plugin_path(plugin_id)
+    if installed_path is not None:
+        keys.add(f"path:{str(installed_path.resolve()).casefold()}")
+    return keys
+
+
+@contextmanager
+def _reserve_plugin_operation(plugin_id: str, operation: str) -> Iterator[None]:
+    """为单个插件保留操作权；冲突操作立即返回 409，不等待也不覆盖原进度。"""
+
+    operation_keys = _get_plugin_operation_keys(plugin_id)
+    with _PLUGIN_OPERATION_MUTEX:
+        conflicting_operation = next(
+            (
+                _ACTIVE_PLUGIN_OPERATIONS[key]
+                for key in operation_keys
+                if key in _ACTIVE_PLUGIN_OPERATIONS
+            ),
+            None,
+        )
+        if conflicting_operation is not None:
+            active_operation = str(conflicting_operation)
+            active_label = _PLUGIN_OPERATION_LABELS.get(active_operation, active_operation)
+            raise HTTPException(
+                status_code=409,
+                detail=f"插件 {plugin_id} 正在执行{active_label}操作，请等待完成后重试",
+            )
+        for key in operation_keys:
+            _ACTIVE_PLUGIN_OPERATIONS[key] = operation
+
+    try:
+        yield
+    finally:
+        with _PLUGIN_OPERATION_MUTEX:
+            for key in operation_keys:
+                if _ACTIVE_PLUGIN_OPERATIONS.get(key) == operation:
+                    _ACTIVE_PLUGIN_OPERATIONS.pop(key, None)
+
+
+def _exclusive_plugin_operation(
+    operation: str,
+) -> Callable[
+    [Callable[_PluginOperationParams, Awaitable[_PluginOperationResult]]],
+    Callable[_PluginOperationParams, Awaitable[_PluginOperationResult]],
+]:
+    """为插件变更接口增加统一的按插件互斥保护。"""
+
+    def decorator(
+        func: Callable[_PluginOperationParams, Awaitable[_PluginOperationResult]],
+    ) -> Callable[_PluginOperationParams, Awaitable[_PluginOperationResult]]:
+        @wraps(func)
+        async def wrapper(
+            *args: _PluginOperationParams.args,
+            **kwargs: _PluginOperationParams.kwargs,
+        ) -> _PluginOperationResult:
+            request = kwargs.get("request")
+            if request is None and args:
+                request = args[0]
+            if not isinstance(request, (InstallPluginRequest, UninstallPluginRequest, UpdatePluginRequest)):
+                raise RuntimeError("插件操作接口缺少有效请求参数")
+
+            plugin_id = validate_plugin_id(request.plugin_id)
+            if isinstance(request, (InstallPluginRequest, UpdatePluginRequest)) and request.version is not None:
+                # 登记 ID 和 manifest ID 必须共用同一把锁，防止别名请求并发替换同一目录。
+                token = kwargs.get("maibot_session") if "maibot_session" in kwargs else args[1] if len(args) > 1 else None
+                require_plugin_token(token)
+                entry, _ = await resolve_release(plugin_id, request.version)
+                plugin_id = validate_plugin_id(entry.manifest_id or entry.id)
+            with _reserve_plugin_operation(plugin_id, operation):
+                return await func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def _read_manifest_plugin_id(manifest: Dict[str, Any]) -> str:
@@ -60,71 +165,12 @@ def _read_plugin_enabled(plugin_id: str, plugin_path: Path) -> bool:
         with open(config_path, "r", encoding="utf-8") as file_obj:
             config = tomlkit.load(file_obj).unwrap()
     except Exception as exc:
-        logger.warning(f"读取插件 {plugin_id} 启用状态失败，将按启用处理: {exc}")
-        return True
+        raise ValueError(f"读取插件 {plugin_id} 启用配置失败：{exc}") from exc
 
     plugin_config = config.get("plugin") if isinstance(config, dict) else None
     if not isinstance(plugin_config, dict):
         return True
     return _coerce_enabled_value(plugin_config.get("enabled", True))
-
-
-def _get_runtime_plugin_load_statuses() -> Dict[str, str]:
-    try:
-        from src.plugin_runtime.integration import get_plugin_runtime_manager
-
-        return get_plugin_runtime_manager().get_plugin_load_statuses()
-    except Exception as exc:
-        logger.warning(f"获取插件运行时加载状态失败: {exc}")
-        return {}
-
-
-def _get_runtime_plugin_load_failure_reasons() -> Dict[str, str]:
-    try:
-        from src.plugin_runtime.integration import get_plugin_runtime_manager
-
-        return get_plugin_runtime_manager().get_plugin_load_failure_reasons()
-    except Exception as exc:
-        logger.warning(f"获取插件运行时加载失败原因失败: {exc}")
-        return {}
-
-
-def _lookup_runtime_plugin_value(values: Dict[str, str], aliases: List[str], default: str = "") -> str:
-    """按插件 ID 查找运行时上报值。"""
-
-    normalized_aliases = [str(alias or "").strip() for alias in aliases if str(alias or "").strip()]
-    for alias in normalized_aliases:
-        value = values.get(alias)
-        if value is not None:
-            return value
-
-    casefold_values = {key.casefold(): value for key, value in values.items()}
-    for alias in normalized_aliases:
-        value = casefold_values.get(alias.casefold())
-        if value is not None:
-            return value
-
-    return default
-
-
-def _get_runtime_plugin_circuit_statuses() -> Dict[str, Dict[str, Any]]:
-    try:
-        from src.plugin_runtime.integration import get_plugin_runtime_manager
-
-        return get_plugin_runtime_manager().get_plugin_circuit_statuses()
-    except Exception as exc:
-        logger.warning(f"获取插件熔断状态失败: {exc}")
-        return {}
-
-
-def _is_runtime_loading() -> bool:
-    try:
-        from src.plugin_runtime.integration import get_plugin_runtime_manager
-
-        return bool(get_plugin_runtime_manager().is_loading)
-    except Exception as exc:
-        logger.warning(f"获取插件运行时加载中状态失败: {exc}")
-        return False
 
 
 def _build_update_work_path(plugin_path: Path, plugin_id: str, directory_name: str) -> Path:
@@ -305,6 +351,7 @@ async def _release_plugin_runtime_before_delete(plugin_id: str, plugin_path: Pat
 
 
 @router.post("/install")
+@_exclusive_plugin_operation("install")
 async def install_plugin(request: InstallPluginRequest, maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
     require_plugin_token(maibot_session)
     logger.info(f"收到安装插件请求: {request.plugin_id}")
@@ -312,6 +359,14 @@ async def install_plugin(request: InstallPluginRequest, maibot_session: Optional
 
     try:
         plugin_id = validate_plugin_id(request.plugin_id)
+        if request.version is not None:
+            entry, release = await resolve_release(plugin_id, request.version)
+            if release is not None:
+                return await install_release(
+                    plugin_id, entry, release, updating=False, automatic=request.version == "latest",
+                    mirror_id=request.mirror_id,
+                )
+            request = request.model_copy(update={"repository_url": entry.repositoryUrl})
         await update_progress(
             stage="loading", progress=5, message=f"开始安装插件: {plugin_id}", operation="install", plugin_id=plugin_id
         )
@@ -444,6 +499,7 @@ async def install_plugin(request: InstallPluginRequest, maibot_session: Optional
 
 
 @router.post("/uninstall")
+@_exclusive_plugin_operation("uninstall")
 async def uninstall_plugin(
     request: UninstallPluginRequest, maibot_session: Optional[str] = Cookie(None)
 ) -> Dict[str, Any]:
@@ -529,6 +585,7 @@ async def uninstall_plugin(
 
 
 @router.post("/update")
+@_exclusive_plugin_operation("update")
 async def update_plugin(request: UpdatePluginRequest, maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
     require_plugin_token(maibot_session)
     logger.info(f"收到更新插件请求: {request.plugin_id}")
@@ -536,6 +593,14 @@ async def update_plugin(request: UpdatePluginRequest, maibot_session: Optional[s
 
     try:
         plugin_id = validate_plugin_id(request.plugin_id)
+        if request.version is not None:
+            entry, release = await resolve_release(plugin_id, request.version)
+            if release is not None:
+                return await install_release(
+                    plugin_id, entry, release, updating=True, automatic=request.version == "latest",
+                    mirror_id=request.mirror_id,
+                )
+            request = request.model_copy(update={"repository_url": entry.repositoryUrl})
         await update_progress(
             stage="loading", progress=5, message=f"开始更新插件: {plugin_id}", operation="update", plugin_id=plugin_id
         )
@@ -552,6 +617,8 @@ async def update_plugin(request: UpdatePluginRequest, maibot_session: Optional[s
             raise HTTPException(status_code=404, detail="插件未安装")
 
         manifest = _read_required_manifest(plugin_path)
+        if read_release_receipt(plugin_path) is not None:
+            raise HTTPException(status_code=409, detail="该插件按发布版本安装，请通过版本选择更新，不能使用分支拉取")
         old_version = str(manifest.get("version", "unknown"))
         old_manifest_id = _require_manifest_plugin_id(manifest)
         await update_progress(
@@ -664,14 +731,21 @@ async def update_plugin(request: UpdatePluginRequest, maibot_session: Optional[s
 @router.get("/installed")
 async def get_installed_plugins(maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
     require_plugin_token(maibot_session)
+    from src.plugin_runtime.integration import get_plugin_runtime_manager
+
+    snapshot = await run_on_main_loop(get_plugin_runtime_manager().get_plugin_state_snapshot())
+    return await asyncio.to_thread(_collect_installed_plugins, snapshot)
+
+
+def _collect_installed_plugins(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """在线程池读取磁盘元数据；运行状态只使用管理器提供的同一份快照。"""
     logger.info("收到获取已安装插件列表请求")
 
     try:
         installed_plugins: List[Dict[str, Any]] = []
-        runtime_statuses = _get_runtime_plugin_load_statuses()
-        runtime_failure_reasons = _get_runtime_plugin_load_failure_reasons()
-        circuit_statuses = _get_runtime_plugin_circuit_statuses()
-        runtime_loading = _is_runtime_loading()
+        runtime_statuses = snapshot["statuses"]
+        runtime_failure_reasons = snapshot["failure_reasons"]
+        circuit_statuses = snapshot["circuit_statuses"]
         for plugin_path in iter_plugin_directories():
             folder_name = plugin_path.name
             if folder_name.startswith(".") or folder_name.startswith("__"):
@@ -694,13 +768,24 @@ async def get_installed_plugins(maibot_session: Optional[str] = Cookie(None)) ->
                 if not plugin_id:
                     logger.warning(f"插件文件夹 {folder_name} 的 _manifest.json 缺少 id，跳过")
                     continue
-                enabled = _read_plugin_enabled(plugin_id, plugin_path)
-                runtime_aliases = [plugin_id, str(manifest.get("id", ""))]
-                load_status = _lookup_runtime_plugin_value(runtime_statuses, runtime_aliases, "unknown")
-                if enabled and load_status == "unknown" and runtime_loading:
-                    load_status = "loading"
+                config_error = ""
+                try:
+                    enabled = _read_plugin_enabled(plugin_id, plugin_path)
+                except ValueError as exc:
+                    enabled = None
+                    config_error = str(exc)
+                load_status = runtime_statuses.get(plugin_id, "not_loaded" if snapshot["running"] else "stopped")
                 circuit_status = circuit_statuses.get(plugin_id)
-                load_error = _lookup_runtime_plugin_value(runtime_failure_reasons, runtime_aliases, "")
+                load_error = runtime_failure_reasons.get(plugin_id, "")
+                if config_error:
+                    load_status = "failed"
+                    load_error = config_error
+                # 扫描阶段的兼容性/依赖检查失败不代表禁用插件启动失败；
+                # 仅保留实际运行或正在启停的状态，避免掩盖尚未完成的禁用操作。
+                effective_load_status = (
+                    "disabled" if enabled is False and load_status not in {"success", "loading", "stopping"}
+                    else load_status
+                )
                 changelog = read_plugin_changelog(plugin_path)
                 installed_plugins.append(
                     {
@@ -708,12 +793,13 @@ async def get_installed_plugins(maibot_session: Optional[str] = Cookie(None)) ->
                         "manifest": manifest,
                         "path": str(plugin_path.absolute()),
                         "enabled": enabled,
-                        "disabled": not enabled,
-                        "loaded": load_status == "success",
-                        "load_status": "disabled" if not enabled else load_status,
-                        "load_error": "" if not enabled or load_status != "failed" else load_error,
+                        "disabled": enabled is False,
+                        "loaded": effective_load_status == "success",
+                        "load_status": effective_load_status,
+                        "load_error": load_error if effective_load_status == "failed" else "",
                         "circuit_status": circuit_status,
                         "changelog": changelog,
+                        "release": read_release_receipt(plugin_path),
                     }
                 )
             except json.JSONDecodeError as e:
@@ -745,7 +831,7 @@ async def get_installed_plugins(maibot_session: Optional[str] = Cookie(None)) ->
 
 
 @router.get("/local-readme/{plugin_id}")
-async def get_local_plugin_readme(plugin_id: str, maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
+def get_local_plugin_readme(plugin_id: str, maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
     require_plugin_token(maibot_session)
     logger.info(f"获取本地插件 README: {plugin_id}")
 
@@ -765,7 +851,7 @@ async def get_local_plugin_readme(plugin_id: str, maibot_session: Optional[str] 
 
 
 @router.get("/local-changelog/{plugin_id}")
-async def get_local_plugin_changelog(plugin_id: str, maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
+def get_local_plugin_changelog(plugin_id: str, maibot_session: Optional[str] = Cookie(None)) -> Dict[str, Any]:
     require_plugin_token(maibot_session)
     logger.info(f"获取本地插件更新日志: {plugin_id}")
 

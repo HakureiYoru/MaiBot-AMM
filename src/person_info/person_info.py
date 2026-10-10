@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 from sqlmodel import col, select
 
@@ -514,6 +514,7 @@ async def store_person_memory_from_answer(
     person_id: str = "",
     evidence_source: str = "user_supported",
     evidence_message_ids: Optional[List[str]] = None,
+    fact_claim: Optional[Dict[str, Any]] = None,
 ) -> None:
     """将人物事实写入长期记忆系统。
 
@@ -559,9 +560,7 @@ async def store_person_memory_from_answer(
             logger.warning(f"用户 {clean_person_name or person_id} (person_id: {person_id}) 尚未认识，跳过写回")
             return
 
-        participant_name = str(getattr(person, "person_name", "") or getattr(person, "nickname", "") or "").strip()
-        if not participant_name:
-            participant_name = clean_person_name or person_id
+        participant_name = str(person.person_name or person.nickname or clean_person_name or "").strip()
 
         payload_fingerprint = hashlib.md5(f"{person_id}|{clean_chat_id}|{clean_content}".encode()).hexdigest()
         external_id = f"person_fact:{person_id}:{payload_fingerprint}"
@@ -572,7 +571,7 @@ async def store_person_memory_from_answer(
             text=clean_content,
             chat_id=clean_chat_id,
             person_ids=[person_id],
-            participants=[participant_name],
+            participants=[participant_name] if participant_name else [],
             tags=["person_fact"],
             metadata={
                 "person_id": person_id,
@@ -580,6 +579,7 @@ async def store_person_memory_from_answer(
                 "writeback_source": "memory_flow_service",
                 "evidence_source": str(evidence_source or "user_supported"),
                 "evidence_message_ids": evidence_message_ids or [],
+                **({"fact_claim": fact_claim} if fact_claim is not None else {}),
             },
             respect_filter=True,
             user_id=session_user_id,

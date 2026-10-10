@@ -1,7 +1,8 @@
 // 设置向导API调用函数
 
-import { backendApi } from '@/lib/http'
+import { authApi, backendApi } from '@/lib/http'
 import { PROVIDER_TEMPLATES } from '@/routes/config/providerTemplates'
+import type { ModelPricePeriod } from '@/routes/config/model/types'
 
 import type {
   ApiProviderSetupConfig,
@@ -15,8 +16,8 @@ interface ModelInfo {
   name: string
   api_provider: string
   price_in?: number
-  cache?: boolean
   cache_price_in?: number
+  price_periods?: ModelPricePeriod[]
   price_out?: number
   force_stream_mode?: boolean
   visual?: boolean
@@ -37,7 +38,6 @@ interface TaskConfig {
   model_list?: string[]
   max_tokens?: number
   temperature?: number
-  slow_threshold?: number
   selection_strategy?: string
 }
 
@@ -45,6 +45,18 @@ interface ModelConfig {
   models?: ModelInfo[]
   api_providers?: ApiProviderConfig[]
   model_task_config?: Record<string, TaskConfig>
+}
+
+export interface SetupStatus {
+  is_first_setup: boolean
+  token_source: string
+  requires_custom_token: boolean
+  message?: string
+}
+
+export interface TokenUpdateResult {
+  success: boolean
+  message: string
 }
 
 const DEFAULT_API_PROVIDER_TEMPLATE = PROVIDER_TEMPLATES.find(
@@ -87,12 +99,17 @@ function buildThinkingExtraParams(
 
 // ===== 读取配置 =====
 
+export async function loadSetupStatus(): Promise<SetupStatus> {
+  return authApi.get<SetupStatus>('/api/webui/setup/status', {
+    errorMessage: '读取设置状态失败',
+  })
+}
+
 // 读取Bot基础配置
 export async function loadBotBasicConfig(): Promise<BotBasicConfig> {
-  const data = await backendApi.get<{ config: { bot?: BotBasicConfig } }>(
-    '/api/webui/config/bot',
-    { errorMessage: '读取 Bot 配置失败' }
-  )
+  const data = await backendApi.get<{ config: { bot?: BotBasicConfig } }>('/api/webui/config/bot', {
+    errorMessage: '读取 Bot 配置失败',
+  })
   const botConfig = (data.config.bot || {}) as Partial<BotBasicConfig>
   const qqAccount = String(botConfig.qq_account ?? '').trim()
 
@@ -128,25 +145,11 @@ async function loadModelConfig(): Promise<ModelConfig> {
   return data.config || {}
 }
 
-// 读取 API 提供商配置
+// API 提供商在向导中始终从内置预设开始，避免回显历史自定义服务商配置。
 export async function loadApiProviderSetupConfig(): Promise<ApiProviderSetupConfig> {
-  const modelConfig = await loadModelConfig()
-  const models = modelConfig.models || []
-  const taskConfig = modelConfig.model_task_config || {}
-  const plannerName = taskConfig.planner?.model_list?.[0] || ''
-  const replyerName = taskConfig.replyer?.model_list?.[0] || ''
-  const plannerModel = models.find((model) => model.name === plannerName)
-  const replyerModel = models.find((model) => model.name === replyerName)
-  const providerName =
-    plannerModel?.api_provider ||
-    replyerModel?.api_provider ||
-    modelConfig.api_providers?.[0]?.name ||
-    ''
-  const provider = modelConfig.api_providers?.find((item) => item.name === providerName)
-
   return {
-    provider_name: providerName || DEFAULT_API_PROVIDER_TEMPLATE?.name || '',
-    base_url: provider?.base_url || DEFAULT_API_PROVIDER_TEMPLATE?.base_url || '',
+    provider_name: DEFAULT_API_PROVIDER_TEMPLATE?.name || '',
+    base_url: DEFAULT_API_PROVIDER_TEMPLATE?.base_url || '',
     api_key: '',
   }
 }
@@ -201,7 +204,6 @@ function createBasicModel(
 ): ModelInfo {
   return {
     price_in: 0,
-    cache: false,
     cache_price_in: 0,
     price_out: 0,
     force_stream_mode: false,
@@ -260,10 +262,7 @@ export async function saveApiProviderSetupConfig(config: ApiProviderSetupConfig)
 }
 
 // 保存基础模型配置
-export async function saveModelSetupConfig(
-  config: ModelSetupConfig,
-  providerName: string
-) {
+export async function saveModelSetupConfig(config: ModelSetupConfig, providerName: string) {
   const modelConfig = await loadModelConfig()
   const trimmedProviderName = providerName.trim()
   const plannerModelIdentifier = config.planner_model_identifier.trim()
@@ -332,5 +331,12 @@ export async function saveModelSetupConfig(
 export async function completeSetup() {
   return backendApi.post('/api/webui/setup/complete', {
     errorMessage: '标记设置完成失败',
+  })
+}
+
+export async function updateAccessToken(newToken: string): Promise<TokenUpdateResult> {
+  return authApi.post<TokenUpdateResult>('/api/webui/auth/update', {
+    body: { new_token: newToken },
+    errorMessage: '更新 Token 失败',
   })
 }

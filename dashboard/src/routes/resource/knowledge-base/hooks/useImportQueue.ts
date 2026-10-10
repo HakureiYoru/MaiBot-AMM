@@ -3,8 +3,8 @@
  *
  * 收编导入任务队列相关的服务端状态与交互：
  * - 任务列表（tasks）与导入设置（settings）走 useQuery，仅在导入面板激活时拉取（enabled: active）；
- * - 轮询 + WebSocket 融合：WS 推送优先（订阅 import_progress → invalidate），WS 未连接时由轮询兜底
- *   （refetchInterval = active && !wsConnected ? importPollInterval : false）；
+ * - 轮询 + WebSocket 融合：轮询负责最终一致性，WS 推送负责即时刷新
+ *   （refetchInterval = active ? importPollInterval : false）；
  * - 选中任务详情与分块分页仍以本地 state + 命令式加载维持（依赖用户选择，不适合纯查询缓存）；
  * - 队列读失败用 importErrorText 局部呈现，取消/重试写失败仍走全局 toast。
  *
@@ -16,7 +16,6 @@ import { useQuery } from '@tanstack/react-query'
 
 import { useToast } from '@/hooks/use-toast'
 import { memoryProgressClient, type MemoryProgressEvent } from '@/lib/memory-progress-client'
-import { unifiedWsClient } from '@/lib/unified-ws'
 import {
   cancelMemoryImportTask,
   getMemoryImportSettings,
@@ -48,8 +47,6 @@ export interface UseImportQueueResult {
   recentImportTasks: MemoryImportTaskPayload[]
   selectedImportTaskId: string
   selectImportTask: (taskId: string) => Promise<void>
-  importAutoPolling: boolean
-  setImportAutoPolling: React.Dispatch<React.SetStateAction<boolean>>
   importPollInterval: number
   importErrorText: string
   cancelSelectedImportTask: () => Promise<void>
@@ -74,17 +71,11 @@ export interface UseImportQueueResult {
   invalidate: () => void
 }
 
-export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOptions): UseImportQueueResult {
+export function useImportQueue({
+  active,
+  buildRetryOverrides,
+}: UseImportQueueOptions): UseImportQueueResult {
   const { toast } = useToast()
-
-  // WS 连接状态：连接时关闭轮询，断开时由轮询兜底
-  const [wsConnected, setWsConnected] = useState(false)
-  useEffect(() => {
-    const unsubscribe = unifiedWsClient.onConnectionChange((connected) => {
-      setWsConnected(connected)
-    })
-    return unsubscribe
-  }, [])
 
   // 导入设置：仅用于派生轮询间隔；与 useImportForm 共享同一查询缓存
   const settingsQuery = useQuery({
@@ -95,17 +86,15 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
   const importSettings: MemoryImportSettings = settingsQuery.data?.settings ?? {}
   const importPollInterval = useMemo(
     () => Math.max(200, Number(importSettings.poll_interval_ms ?? 1000)),
-    [importSettings.poll_interval_ms],
+    [importSettings.poll_interval_ms]
   )
 
-  const [importAutoPolling, setImportAutoPolling] = useState(true)
-
-  // 导入任务列表：导入面板激活时拉取；WS 未连接且开启自动轮询时由 refetchInterval 兜底
+  // 导入任务列表：轮询保证最终一致性，避免 WS 已连接但进度事件缺失时页面停在旧状态。
   const tasksQuery = useQuery({
     queryKey: ['memory-import', 'tasks'],
     queryFn: () => getMemoryImportTasks(20),
     enabled: active,
-    refetchInterval: active && importAutoPolling && !wsConnected ? importPollInterval : false,
+    refetchInterval: active ? importPollInterval : false,
   })
   const importTasks = useMemo(() => tasksQuery.data?.items ?? [], [tasksQuery.data?.items])
 
@@ -121,7 +110,8 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
   const [selectedImportTaskLoading, setSelectedImportTaskLoading] = useState(false)
   const [selectedImportFileId, setSelectedImportFileId] = useState('')
   const [importChunkOffset, setImportChunkOffset] = useState(0)
-  const [importChunksPayload, setImportChunksPayload] = useState<MemoryImportChunkListPayload | null>(null)
+  const [importChunksPayload, setImportChunksPayload] =
+    useState<MemoryImportChunkListPayload | null>(null)
   const [importChunksLoading, setImportChunksLoading] = useState(false)
 
   // 任务列表查询失败时同步到局部错误文案
@@ -140,7 +130,12 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
       }
       try {
         setImportChunksLoading(true)
-        const payload = await getMemoryImportTaskChunks(taskId, fileId, offset, IMPORT_CHUNK_PAGE_SIZE)
+        const payload = await getMemoryImportTaskChunks(
+          taskId,
+          fileId,
+          offset,
+          IMPORT_CHUNK_PAGE_SIZE
+        )
         if (!payload.success) {
           throw new Error(payload.error || '加载分块详情失败')
         }
@@ -161,7 +156,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
         setImportChunksLoading(false)
       }
     },
-    [toast],
+    [toast]
   )
 
   const loadImportTaskDetail = useCallback(
@@ -215,7 +210,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
         }
       }
     },
-    [importChunkOffset, loadImportChunks, selectedImportFileId, toast],
+    [importChunkOffset, loadImportChunks, selectedImportFileId, toast]
   )
 
   // 命令式刷新队列：触发任务列表查询重拉，并维护选中任务（沿用原 refreshImportQueue 语义）
@@ -252,7 +247,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
         }
       }
     },
-    [tasksQuery, toast],
+    [tasksQuery, toast]
   )
 
   const afterCreated = useCallback(
@@ -263,7 +258,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
         await loadImportTaskDetail(taskId, true)
       }
     },
-    [loadImportTaskDetail, refreshImportQueue],
+    [loadImportTaskDetail, refreshImportQueue]
   )
 
   const selectImportTask = useCallback(
@@ -272,7 +267,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
       setImportChunkOffset(0)
       await loadImportTaskDetail(taskId)
     },
-    [loadImportTaskDetail],
+    [loadImportTaskDetail]
   )
 
   const selectImportFile = useCallback(
@@ -284,7 +279,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
       setImportChunkOffset(0)
       await loadImportChunks(selectedImportTaskId, fileId, 0)
     },
-    [loadImportChunks, selectedImportTaskId],
+    [loadImportChunks, selectedImportTaskId]
   )
 
   const moveImportChunkPage = useCallback(
@@ -302,7 +297,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
       setImportChunkOffset(nextOffset)
       await loadImportChunks(selectedImportTaskId, selectedImportFileId, nextOffset)
     },
-    [importChunkOffset, loadImportChunks, selectedImportFileId, selectedImportTaskId],
+    [importChunkOffset, loadImportChunks, selectedImportFileId, selectedImportTaskId]
   )
 
   const cancelSelectedImportTask = useCallback(async () => {
@@ -352,7 +347,9 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
       }
       toast({
         title: '重试任务已创建',
-        description: nextTaskId ? `重试任务 ${nextTaskId.slice(0, 12)} 已进入队列` : '失败项已提交重试',
+        description: nextTaskId
+          ? `重试任务 ${nextTaskId.slice(0, 12)} 已进入队列`
+          : '失败项已提交重试',
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : '重试失败项失败'
@@ -385,7 +382,10 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
       setImportChunksPayload(null)
       return
     }
-    if (!importTasks.some((task) => task.task_id === selectedImportTaskId) && importTasks.length > 0) {
+    if (
+      !importTasks.some((task) => task.task_id === selectedImportTaskId) &&
+      importTasks.length > 0
+    ) {
       void selectImportTask(importTasks[0].task_id)
       return
     }
@@ -436,11 +436,11 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
   // 派生：任务分组、选中任务的衍生信息、分块分页
   const runningImportTasks = useMemo(
     () => importTasks.filter((task) => RUNNING_IMPORT_STATUS.has(String(task.status ?? '').trim())),
-    [importTasks],
+    [importTasks]
   )
   const queuedImportTasks = useMemo(
     () => importTasks.filter((task) => QUEUED_IMPORT_STATUS.has(String(task.status ?? '').trim())),
-    [importTasks],
+    [importTasks]
   )
   const recentImportTasks = useMemo(
     () =>
@@ -448,7 +448,7 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
         const status = String(task.status ?? '').trim()
         return !RUNNING_IMPORT_STATUS.has(status) && !QUEUED_IMPORT_STATUS.has(status)
       }),
-    [importTasks],
+    [importTasks]
   )
 
   const selectedImportTaskSummary = useMemo(() => {
@@ -481,8 +481,6 @@ export function useImportQueue({ active, buildRetryOverrides }: UseImportQueueOp
     recentImportTasks,
     selectedImportTaskId,
     selectImportTask,
-    importAutoPolling,
-    setImportAutoPolling,
     importPollInterval,
     importErrorText,
     cancelSelectedImportTask,

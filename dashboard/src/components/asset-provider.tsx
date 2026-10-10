@@ -1,13 +1,8 @@
-import { createContext, useContext, useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 import type { ReactNode } from 'react'
 
 import { getAsset } from '@/lib/asset-store'
-
-type AssetStoreContextType = {
-  getAssetUrl: (assetId: string) => Promise<string | undefined>
-}
-
-const AssetStoreContext = createContext<AssetStoreContextType | null>(null)
+import { AssetStoreContext } from '@/lib/asset-store-context'
 
 type AssetStoreProviderProps = {
   children: ReactNode
@@ -44,21 +39,14 @@ export function AssetStoreProvider({ children }: AssetStoreProviderProps) {
 
   // Cleanup: revoke all blob URLs on unmount
   useEffect(() => {
+    const cache = urlCache.current
     return () => {
-      urlCache.current.forEach((url) => {
+      cache.forEach((url) => {
         URL.revokeObjectURL(url)
       })
-      urlCache.current.clear()
+      cache.clear()
     }
   }, [])
 
   return <AssetStoreContext value={value}>{children}</AssetStoreContext>
-}
-
-export function useAssetStore() {
-  const context = useContext(AssetStoreContext)
-  if (!context) {
-    throw new Error('useAssetStore must be used within AssetStoreProvider')
-  }
-  return context
 }

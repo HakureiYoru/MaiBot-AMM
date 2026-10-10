@@ -32,6 +32,11 @@ class ToolAnnotation:
 
     audience: list[str] = field(default_factory=list)
     priority: float | None = None
+    title: str = ""
+    read_only: bool | None = None
+    destructive: bool | None = None
+    idempotent: bool | None = None
+    open_world: bool | None = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -203,6 +208,7 @@ class ToolExecutionResult:
     content_items: list[ToolContentItem] = field(default_factory=list)
     post_history_messages: list[Any] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    stop_after_execution: bool = False
 
     def get_history_content(self) -> str:
         """获取适合写入对话历史的结果文本。

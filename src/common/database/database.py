@@ -89,6 +89,13 @@ _RUNTIME_PERFORMANCE_INDEXES = (
         "CREATE INDEX IF NOT EXISTS ix_jargons_complete_count_id "
         "ON jargons (is_complete, count DESC, id DESC)",
     ),
+    # WebUI 按聊天流取最新一条消息（聊天流列表、时间线等）依赖该组合索引；
+    # 只有 session_id 单列索引时，每组取 max(timestamp) 仍要扫全部行
+    (
+        "ix_mai_messages_session_id_timestamp",
+        "CREATE INDEX IF NOT EXISTS ix_mai_messages_session_id_timestamp "
+        "ON mai_messages (session_id, timestamp DESC)",
+    ),
 )
 
 
@@ -146,11 +153,11 @@ def initialize_database() -> None:
         )
         create_all_start_time = perf_counter()
         SQLModel.metadata.create_all(engine)
-        logger.info(f"数据库模型建表检查完成，耗时={int((perf_counter() - create_all_start_time) * 1000)}ms")
+        logger.debug(f"数据库模型建表检查完成，耗时={int((perf_counter() - create_all_start_time) * 1000)}ms")
         ensure_runtime_performance_indexes()
         finalize_start_time = perf_counter()
         _migration_bootstrapper.finalize_database(migration_state)
-        logger.info(f"数据库 schema 版本收尾完成，耗时={int((perf_counter() - finalize_start_time) * 1000)}ms")
+        logger.debug(f"数据库 schema 版本收尾完成，耗时={int((perf_counter() - finalize_start_time) * 1000)}ms")
         _db_initialized = True
 
 

@@ -163,6 +163,7 @@ class HTMLRenderService:
         self._browser: Any = None
         self._browser_lock: asyncio.Lock = asyncio.Lock()
         self._connected_via_cdp: bool = False
+        self._intentional_browser_close: bool = False
         self._playwright: Any = None
         self._render_count: int = 0
         self._render_semaphore: Optional[asyncio.Semaphore] = None
@@ -263,8 +264,12 @@ class HTMLRenderService:
         """
 
         if self._browser is not None:
-            with contextlib.suppress(Exception):
-                await self._browser.close()
+            self._intentional_browser_close = True
+            try:
+                with contextlib.suppress(Exception):
+                    await self._browser.close()
+            finally:
+                self._intentional_browser_close = False
         self._browser = None
         self._connected_via_cdp = False
         if restart_playwright and self._playwright is not None:
@@ -435,7 +440,10 @@ class HTMLRenderService:
 
         self._browser = None
         self._connected_via_cdp = False
-        logger.warning("HTML 渲染浏览器已断开，将在下次请求时重新建立连接")
+        if self._intentional_browser_close:
+            logger.debug("HTML 渲染浏览器已主动释放")
+            return
+        logger.warning("HTML 渲染浏览器意外断开，将在下次请求时重新建立连接")
 
     def _build_launch_options(self, config: PluginRuntimeRenderConfig) -> Dict[str, Any]:
         """构造本地浏览器启动参数。

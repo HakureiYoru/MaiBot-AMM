@@ -5,7 +5,7 @@ import math
 from datetime import datetime
 from io import BytesIO
 from random import sample
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from PIL import Image as PILImage
 from PIL import ImageDraw, ImageFont
@@ -19,14 +19,13 @@ from src.config.config import config_manager, global_config
 from src.core.tooling import ToolExecutionContext, ToolExecutionResult, ToolInvocation, ToolSpec
 from src.emoji_system.emoji_manager import _is_vlm_task_configured, emoji_manager
 from src.emoji_system.maisaka_tool import send_emoji_for_maisaka
-from src.llm_models.payload_content.message import MessageBuilder, RoleType
+from src.llm_models.payload_content.context_item import ContextItemBuilder, RoleType
 from src.maisaka.context.messages import (
     LLMContextMessage,
     ReferenceMessage,
     ReferenceMessageType,
     SessionBackedMessage,
 )
-from src.maisaka.display.prompt_cli_renderer import PromptCLIVisualizer
 from src.prompt.prompt_manager import prompt_manager
 
 from .context import BuiltinToolRuntimeContext
@@ -36,6 +35,8 @@ logger = get_logger("maisaka_builtin_send_emoji")
 _EMOJI_SUB_AGENT_CONTEXT_LIMIT = 12
 _EMOJI_MAX_CANDIDATE_COUNT = 64
 _EMOJI_CANDIDATE_TILE_SIZE = 256
+_EMOJI_INDEX_BADGE_SIZE = 64
+_EMOJI_INDEX_FONT_SIZE = 32
 _EMOJI_SUCCESS_MESSAGE = "表情包发送成功"
 _EMOJI_VLM_NOT_CONFIGURED_MESSAGE = "错误，没有配置视觉模型，无法使用表情包功能"
 
@@ -132,26 +133,33 @@ def _build_labeled_tile(image_bytes: bytes, index: int, tile_size: int) -> PILIm
     tile.paste(image, (offset_x, offset_y), image)
 
     draw = ImageDraw.Draw(tile)
-    font = ImageFont.load_default()
-    badge_size = 56
+    font = ImageFont.load_default(size=_EMOJI_INDEX_FONT_SIZE)
+    badge_size = _EMOJI_INDEX_BADGE_SIZE
     badge_margin = 14
+    label = str(index)
+    text_bbox = draw.textbbox((0, 0), label, font=font)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    # 全局递增的编号可能超过两位；角标随文字扩宽，超长编号缩小字体。
+    while text_width > tile_size - 2 * badge_margin - 12 and font.size > 8:
+        font = ImageFont.load_default(size=font.size - 1)
+        text_bbox = draw.textbbox((0, 0), label, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+    badge_width = max(badge_size, text_width + 12)
     draw.rounded_rectangle(
         (
             badge_margin,
             badge_margin,
-            badge_margin + badge_size,
+            badge_margin + badge_width,
             badge_margin + badge_size,
         ),
         radius=8,
         fill=(0, 0, 0, 180),
     )
-    label = str(index)
-    text_bbox = draw.textbbox((0, 0), label, font=font)
-    text_width = text_bbox[2] - text_bbox[0]
-    text_height = text_bbox[3] - text_bbox[1]
     draw.text(
         (
-            badge_margin + (badge_size - text_width) / 2,
+            badge_margin + (badge_width - text_width) / 2,
             badge_margin + (badge_size - text_height) / 2 - 1,
         ),
         label,
@@ -161,7 +169,7 @@ def _build_labeled_tile(image_bytes: bytes, index: int, tile_size: int) -> PILIm
     return tile
 
 
-def _merge_emoji_tiles(image_bytes_list: list[bytes]) -> bytes:
+def _merge_emoji_tiles(image_bytes_list: List[bytes], start_index: int = 1) -> bytes:
     """将候选表情图拼接成一张尽量接近矩形的网格图片。"""
 
     tile_size = _EMOJI_CANDIDATE_TILE_SIZE
@@ -170,7 +178,7 @@ def _merge_emoji_tiles(image_bytes_list: list[bytes]) -> bytes:
     grid_rows, grid_columns = _calculate_grid_shape(candidate_count)
     tiles = [
         _build_labeled_tile(image_bytes=image_bytes, index=index, tile_size=tile_size)
-        for index, image_bytes in enumerate(image_bytes_list, start=1)
+        for index, image_bytes in enumerate(image_bytes_list, start=start_index)
     ]
     canvas_width = tile_size * grid_columns + gap * (grid_columns - 1)
     canvas_height = tile_size * grid_rows + gap * (grid_rows - 1)
@@ -209,7 +217,6 @@ async def _build_emoji_candidate_message(emojis: list[MaiEmoji]) -> SessionBacke
 
 def _build_send_emoji_monitor_detail(
     *,
-    request_messages: Optional[list[Any]] = None,
     request_message_count: int = 0,
     reasoning_text: str = "",
     output_text: str = "",
@@ -219,10 +226,7 @@ def _build_send_emoji_monitor_detail(
     """构建 send_emoji 工具统一监控详情。"""
 
     detail: Dict[str, Any] = {}
-    if request_messages:
-        detail["request_messages"] = request_messages
     if request_message_count > 0:
-        detail["request_messages_sanitized"] = bool(request_messages)
         detail["request_message_count"] = request_message_count
     if reasoning_text.strip():
         detail["reasoning_text"] = reasoning_text.strip()
@@ -367,15 +371,14 @@ async def _select_emoji_with_sub_agent(
         display_prefix="[表情包选择任务]",
     )
     request_messages = [
-        MessageBuilder().set_role(RoleType.System).add_text_content(system_prompt).build(),
+        ContextItemBuilder().set_role(RoleType.System).add_text_content(system_prompt).build(),
     ]
-    prompt_llm_message = prompt_message.to_llm_message()
-    if prompt_llm_message is not None:
-        request_messages.append(prompt_llm_message)
-    candidate_to_llm_message = getattr(candidate_message, "to_llm_message", None)
-    candidate_llm_message = candidate_to_llm_message() if callable(candidate_to_llm_message) else None
-    if candidate_llm_message is not None:
-        request_messages.append(candidate_llm_message)
+    prompt_item = prompt_message.to_context_item()
+    if prompt_item is not None:
+        request_messages.append(prompt_item)
+    candidate_item = candidate_message.to_context_item()
+    if candidate_item is not None:
+        request_messages.append(candidate_item)
 
     model_task_name = _resolve_emoji_selector_model_task_name()
     if model_task_name == "vlm" and not _is_vlm_task_configured():
@@ -398,7 +401,9 @@ async def _select_emoji_with_sub_agent(
         "total_tokens": response.total_tokens,
         "overall_ms": selection_duration_ms,
     }
-    if response.prompt_html_uri and selection_metadata is not None:
+    if not response.prompt_html_uri:
+        raise RuntimeError("表情包选择子代理未生成完整 Prompt 记录")
+    if selection_metadata is not None:
         selection_metadata["prompt_html_uri"] = response.prompt_html_uri
 
     try:
@@ -407,10 +412,6 @@ async def _select_emoji_with_sub_agent(
         logger.warning(f"{tool_ctx.runtime.log_prefix} 表情包子代理结果解析失败，将回退到候选首项: {exc}")
         if selection_metadata is not None:
             selection_metadata["monitor_detail"] = _build_send_emoji_monitor_detail(
-                request_messages=PromptCLIVisualizer.build_structured_message_payload(
-                    request_messages,
-                    keep_base64=False,
-                ),
                 request_message_count=len(request_messages),
                 output_text=response.content or "",
                 metrics=selection_metrics,
@@ -427,10 +428,6 @@ async def _select_emoji_with_sub_agent(
     if selection_metadata is not None:
         selection_metadata["reason"] = selection.reason.strip()
         selection_metadata["monitor_detail"] = _build_send_emoji_monitor_detail(
-            request_messages=PromptCLIVisualizer.build_structured_message_payload(
-                request_messages,
-                keep_base64=False,
-            ),
             request_message_count=len(request_messages),
             reasoning_text=selection.reason,
             output_text=response.content or "",

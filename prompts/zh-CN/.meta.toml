@@ -23,6 +23,31 @@ display_name = "回复"
 advanced = false
 description = "Maisaka 回复生成模板，负责根据人格、表达风格、群聊注意事项和待回复上下文生成最终回复。"
 
+[reply_attachments]
+display_name = "回复附件提示"
+advanced = true
+description = "说明回复附带的图片、@ 和表情包由系统发送，避免正文重复输出附件信息。"
+
+[retro_replyer]
+display_name = "复古回复"
+advanced = true
+description = "复古模式（experimental.replyer_retro_prompt）下的群聊回复模板，把全部回复指令集中在一份模板里，整段作为一条消息发送。"
+
+[retro_replyer_light]
+display_name = "复古回复（简短）"
+advanced = true
+description = "复古模式下的群聊简短回复模板，对应旧版 think_level=0 的轻量回复。"
+
+[retro_private_replyer]
+display_name = "复古私聊回复"
+advanced = true
+description = "复古模式下的私聊回复模板，按旧版方式集中回复指令。"
+
+[retro_private_replyer_self]
+display_name = "复古私聊补充回复"
+advanced = true
+description = "复古模式下的私聊补充回复模板，用于在麦麦自己刚刚的发言基础上继续补充。"
+
 [default_expressor]
 display_name = "改写器"
 advanced = true
@@ -127,3 +152,23 @@ description = "用于根据用户的自然语言修改描述和候选记忆，�
 display_name = "中期聊天摘要"
 advanced = true
 description = "用于在上下文裁切时，将被移出的聊天记录概括成 long_summary、brief 和 keywords。"
+
+[webui_ai_search]
+display_name = "WebUI AI 搜索"
+advanced = true
+description = "用于根据自然语言意图从 WebUI 提供的真实页面与配置候选中选择搜索结果。"
+
+[webui_ai_search_final]
+display_name = "WebUI AI 搜索定稿指令"
+advanced = true
+description = "用于在 AI 搜索的工具轮次用尽或未按格式作答时，要求模型停止检索并返回最终 JSON。"
+
+[webui_ai_search_correction]
+display_name = "WebUI AI 搜索纠错指令"
+advanced = true
+description = "用于在 AI 搜索回答未通过证据校验时，要求模型删除无依据内容并重写最终 JSON。"
+
+[webui_ai_search_evidence]
+display_name = "WebUI AI 搜索证据消息"
+advanced = true
+description = "用于把 AI 搜索中只读工具的返回结果包装成无工具请求可用的证据消息。"

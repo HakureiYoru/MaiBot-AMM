@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { AlertTriangle, RotateCcw, Search, Trash2 } from 'lucide-react'
 
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -14,6 +14,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import type {
   MemoryDeleteExecutePayload,
@@ -22,6 +23,7 @@ import type {
 } from '@/lib/memory-api'
 
 const DELETE_PREVIEW_PAGE_SIZE = 8
+const EMPTY_PREVIEW_ITEMS: MemoryDeletePreviewItemPayload[] = []
 
 function formatMode(mode: string): string {
   switch (mode) {
@@ -77,7 +79,8 @@ interface MemoryDeleteDialogProps {
   executing?: boolean
   restoring?: boolean
   error?: string | null
-  onExecute: () => void
+  /** 确认执行时回传的删除原因；为空表示未填写，调用方按默认原因处理 */
+  onExecute: (reason: string) => void
   onRestore?: () => void
 }
 
@@ -97,9 +100,14 @@ export function MemoryDeleteDialog({
 }: MemoryDeleteDialogProps) {
   const [itemSearch, setItemSearch] = useState('')
   const [itemPage, setItemPage] = useState(1)
+  // 删除原因在预览确认时填写，随本次执行写入操作历史
+  const [deleteReason, setDeleteReason] = useState('')
+  const previewResetKey = `${open}:${preview?.mode ?? ''}:${preview?.item_count ?? ''}`
+  const [seenPreviewResetKey, setSeenPreviewResetKey] = useState(previewResetKey)
+  const [seenItemSearch, setSeenItemSearch] = useState(itemSearch)
   const counts = preview?.counts ?? result?.counts ?? {}
   const previewSources = Array.isArray(preview?.sources) ? preview.sources : []
-  const previewItems = Array.isArray(preview?.items) ? preview.items : []
+  const previewItems = Array.isArray(preview?.items) ? preview.items : EMPTY_PREVIEW_ITEMS
   const filteredPreviewItems = useMemo(() => {
     const keyword = itemSearch.trim().toLowerCase()
     if (!keyword) {
@@ -130,20 +138,18 @@ export function MemoryDeleteDialog({
     { key: 'sources', label: '来源', value: Number(counts.sources ?? 0) },
   ].filter((item) => item.value > 0)
 
-  useEffect(() => {
+  if (seenPreviewResetKey !== previewResetKey) {
+    setSeenPreviewResetKey(previewResetKey)
+    setSeenItemSearch('')
     setItemSearch('')
     setItemPage(1)
-  }, [preview?.mode, preview?.item_count, open])
-
-  useEffect(() => {
+    setDeleteReason('')
+  } else if (seenItemSearch !== itemSearch) {
+    setSeenItemSearch(itemSearch)
     setItemPage(1)
-  }, [itemSearch])
-
-  useEffect(() => {
-    if (itemPage > itemPageCount) {
-      setItemPage(itemPageCount)
-    }
-  }, [itemPage, itemPageCount])
+  } else if (itemPage > itemPageCount) {
+    setItemPage(itemPageCount)
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -256,6 +262,19 @@ export function MemoryDeleteDialog({
               </AlertDescription>
             </Alert>
           ) : null}
+
+          {!result?.success ? (
+            <div className="space-y-2">
+              <Label htmlFor="memory-delete-reason">删除原因（可选）</Label>
+              <Input
+                id="memory-delete-reason"
+                value={deleteReason}
+                onChange={(event) => setDeleteReason(event.target.value)}
+                placeholder="例如：清理测试导入批次，会记录在删除历史里"
+                disabled={loadingPreview || executing}
+              />
+            </div>
+          ) : null}
         </DialogBody>
 
         <DialogFooter>
@@ -269,7 +288,12 @@ export function MemoryDeleteDialog({
             </Button>
           ) : null}
           {!result?.success ? (
-            <Button data-dialog-action="confirm" variant="destructive" onClick={onExecute} disabled={loadingPreview || executing || !preview}>
+            <Button
+              data-dialog-action="confirm"
+              variant="destructive"
+              onClick={() => onExecute(deleteReason)}
+              disabled={loadingPreview || executing || !preview}
+            >
               <Trash2 className="mr-2 h-4 w-4" />
               {executing ? '执行中...' : '确认删除'}
             </Button>

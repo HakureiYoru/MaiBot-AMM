@@ -5,9 +5,10 @@ from typing import Any
 
 import pytest
 
-from src.A_memorix.core.retrieval import RetrievalResult
+from src.A_memorix.core.retrieval import RetrievalResult, RetrievalScope
 from src.A_memorix.core.runtime.sdk_memory_kernel import KernelSearchRequest
 from src.A_memorix.core.runtime.sdk_memory_kernel import SDKMemoryKernel
+from src.A_memorix.core.storage import MetadataStore
 
 
 class _DummyMetadataStore:
@@ -76,6 +77,25 @@ class _ScopedSearchMetadataStore:
             "rel-other": [self.paragraphs["para-other-relation"]],
         }
 
+    def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+        del params
+        sql_token = " ".join(str(sql or "").lower().split())
+        if "from paragraphs" in sql_token:
+            return [dict(paragraph) for paragraph in self.paragraphs.values()]
+        if "from relations" in sql_token:
+            return [
+                {
+                    "hash": relation_hash,
+                    "source_paragraph": "",
+                    "paragraph_hash": paragraph["hash"],
+                }
+                for relation_hash, paragraphs in self.relation_paragraphs.items()
+                for paragraph in paragraphs
+            ]
+        if "from paragraph_entities" in sql_token or "from episode_paragraphs" in sql_token:
+            return []
+        raise AssertionError(f"unexpected query: {sql_token}")
+
     def get_paragraphs_by_hashes(self, paragraph_hashes: list[str]) -> dict[str, dict[str, Any]]:
         return {
             paragraph_hash: self.paragraphs[paragraph_hash]
@@ -92,8 +112,9 @@ class _ScopedSearchMetadataStore:
     def get_relation_status_batch(self, hashes: list[str]) -> dict[str, dict[str, Any]]:
         return {str(hash_value): {"is_inactive": False} for hash_value in hashes}
 
-    def reinforce_relations(self, hashes: list[str]) -> None:
-        del hashes
+    def apply_relation_lifecycle_event(self, hashes: list[str], **kwargs: Any) -> list[dict[str, Any]]:
+        del hashes, kwargs
+        return []
 
     def get_paragraph_relations(self, paragraph_hash: str) -> list[dict[str, Any]]:
         del paragraph_hash
@@ -159,8 +180,16 @@ class _ScopedSearchRetriever:
     def __init__(self) -> None:
         self.top_k_values: list[int] = []
 
-    async def retrieve(self, *, query: str, top_k: int, temporal: Any) -> list[RetrievalResult]:
-        del query
+    async def retrieve(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        temporal: Any,
+        enable_ppr: bool,
+        scope: RetrievalScope | None = None,
+    ) -> list[RetrievalResult]:
+        del query, enable_ppr
         self.top_k_values.append(top_k)
         results = [
             RetrievalResult(
@@ -196,20 +225,36 @@ class _ScopedSearchRetriever:
                 metadata={},
             ),
         ]
-        source = str(getattr(temporal, "source", "") or "")
-        if source == "chat_summary:session-current":
-            return [item for item in results if item.hash_value.endswith("current")]
-        if source == "chat_summary:session-other":
-            return [item for item in results if item.hash_value.endswith("other")]
+        if scope is not None:
+            return [
+                item
+                for item in results
+                if (
+                    item.result_type == "paragraph"
+                    and item.hash_value in scope.paragraph_ids
+                )
+                or (
+                    item.result_type == "relation"
+                    and item.hash_value in scope.relation_ids
+                )
+            ][:top_k]
         return results
 
 
 class _RetrievalTypeFilterSearchRetriever:
     config = type("RetrieverConfig", (), {"enable_ppr": False})()
 
-    async def retrieve(self, *, query: str, top_k: int, temporal: Any) -> list[RetrievalResult]:
-        del query, top_k, temporal
-        return [
+    async def retrieve(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        temporal: Any,
+        enable_ppr: bool,
+        scope: RetrievalScope | None = None,
+    ) -> list[RetrievalResult]:
+        del query, temporal, enable_ppr
+        results = [
             RetrievalResult(
                 hash_value="para-stream-other",
                 content="其他聊天流普通记忆。",
@@ -227,6 +272,9 @@ class _RetrievalTypeFilterSearchRetriever:
                 metadata={},
             ),
         ]
+        if scope is not None:
+            results = [item for item in results if item.hash_value in scope.paragraph_ids]
+        return results[:top_k]
 
 
 def _build_kernel(*, entities: list[dict[str, Any]], relations: list[dict[str, Any]]) -> SDKMemoryKernel:
@@ -300,7 +348,13 @@ def _build_retrieval_filter_search_kernel(tmp_path, config: dict[str, Any]) -> S
 async def test_memory_graph_admin_search_orders_and_dedupes_results() -> None:
     kernel = _build_kernel(
         entities=[
-            {"hash": "e1", "name": "Alice", "appearance_count": 5, "is_deleted": 0},
+            {
+                "hash": "e1",
+                "name": "Alice",
+                "appearance_count": 5,
+                "active_evidence_count": 2,
+                "is_deleted": 0,
+            },
             {"hash": "e1", "name": "Alice Duplicate", "appearance_count": 99, "is_deleted": 0},
             {"hash": "e2", "name": "Alice Cooper", "appearance_count": 7, "is_deleted": 0},
             {"hash": "e3", "name": "my alice note", "appearance_count": 11, "is_deleted": 0},
@@ -325,6 +379,8 @@ async def test_memory_graph_admin_search_orders_and_dedupes_results() -> None:
     relation_items = [item for item in payload["items"] if item["type"] == "relation"]
 
     assert [item["entity_hash"] for item in entity_items] == ["e1", "e2", "e3"]
+    assert entity_items[0]["active_evidence_count"] == 2
+    assert entity_items[0]["appearance_count"] == 5
     assert [item["relation_hash"] for item in relation_items] == ["r3", "r1", "r2", ""]
     assert relation_items[0]["confidence"] == pytest.approx(0.9)
     assert relation_items[1]["confidence"] == pytest.approx(0.6)
@@ -371,7 +427,7 @@ async def test_search_memory_filters_hits_to_current_chat_scope(tmp_path) -> Non
 
     assert payload["summary"]
     assert [item["hash"] for item in payload["hits"]] == ["para-current", "rel-current"]
-    assert retriever.top_k_values == [10]
+    assert retriever.top_k_values == [30]
 
 
 @pytest.mark.asyncio
@@ -394,7 +450,130 @@ async def test_search_memory_allows_configured_shared_chat_scope(tmp_path) -> No
         "para-current",
         "rel-current",
     ]
-    assert retriever.top_k_values == [40, 40]
+    assert retriever.top_k_values == [30]
+
+
+def test_retrieval_scope_keeps_explicit_and_legacy_global_data(tmp_path) -> None:
+    kernel, _ = _build_scoped_search_kernel(tmp_path)
+    metadata_store = kernel.metadata_store
+    assert isinstance(metadata_store, _ScopedSearchMetadataStore)
+    metadata_store.paragraphs.update(
+        {
+            "para-explicit-global": {
+                "hash": "para-explicit-global",
+                "content": "新版全局资料。",
+                "source": "web_import:new.txt",
+                "metadata": {"scope_type": "global"},
+            },
+            "para-legacy-global": {
+                "hash": "para-legacy-global",
+                "content": "旧版全局资料。",
+                "source": "web_import:legacy.txt",
+                "metadata": {},
+            },
+            "para-unknown": {
+                "hash": "para-unknown",
+                "content": "来源不明的旧资料。",
+                "source": "manual",
+                "metadata": {},
+            },
+        }
+    )
+    metadata_store.relation_paragraphs["rel-global"] = [
+        metadata_store.paragraphs["para-explicit-global"]
+    ]
+
+    service = kernel._get_search_hit_service()
+    scope = type(service)._resolve_retrieval_scope(service, "session-current")
+
+    assert scope is not None
+    assert scope.paragraph_ids == frozenset(
+        {
+            "para-current",
+            "para-current-relation",
+            "para-explicit-global",
+            "para-legacy-global",
+        }
+    )
+    assert scope.relation_ids == frozenset({"rel-current", "rel-global"})
+
+
+def test_retrieval_scope_filters_real_store_associations_in_sql(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "memory"
+    kernel = SDKMemoryKernel(
+        plugin_root=tmp_path,
+        config={"storage": {"data_dir": str(data_dir)}},
+    )
+    metadata_store = MetadataStore(data_dir=data_dir / "metadata")
+    metadata_store.connect()
+    try:
+        current_paragraph = metadata_store.add_paragraph(
+            "当前聊天范围段落",
+            source="chat_summary:session-current",
+            metadata={"scope_type": "chat", "chat_id": "session-current"},
+        )
+        other_paragraph = metadata_store.add_paragraph(
+            "其他聊天范围段落",
+            source="chat_summary:session-other",
+            metadata={"scope_type": "chat", "chat_id": "session-other"},
+        )
+        global_paragraph = metadata_store.add_paragraph(
+            "旧版全局导入段落",
+            source="web_import:legacy.txt",
+        )
+        current_entity = metadata_store.add_entity("当前范围实体", source_paragraph=current_paragraph)
+        other_entity = metadata_store.add_entity("其他范围实体", source_paragraph=other_paragraph)
+        current_relation = metadata_store.add_relation("当前", "属于", "范围", source_paragraph=current_paragraph)
+        other_relation = metadata_store.add_relation("其他", "属于", "范围", source_paragraph=other_paragraph)
+        metadata_store._conn.execute(
+            "UPDATE entities SET is_deleted = NULL WHERE hash IN (?, ?)",
+            (current_entity, other_entity),
+        )
+        metadata_store._conn.execute(
+            "UPDATE relations SET is_inactive = NULL WHERE hash IN (?, ?)",
+            (current_relation, other_relation),
+        )
+        metadata_store._conn.commit()
+        kernel.metadata_store = metadata_store
+        statements: list[str] = []
+        association_rows: dict[str, list[dict[str, Any]]] = {}
+        original_query = metadata_store.query
+
+        def recording_query(sql: str, params: tuple[Any, ...] | None = None) -> list[dict[str, Any]]:
+            rows = original_query(sql, params)
+            normalized_sql = " ".join(sql.split())
+            if "FROM relations r" in normalized_sql:
+                association_rows["relations"] = rows
+            elif "FROM paragraph_entities pe" in normalized_sql:
+                association_rows["entities"] = rows
+            return rows
+
+        monkeypatch.setattr(metadata_store, "query", recording_query)
+        metadata_store._conn.set_trace_callback(statements.append)
+
+        service = kernel._get_search_hit_service()
+        scope = type(service)._resolve_retrieval_scope(service, "session-current")
+
+        assert scope is not None
+        assert scope.paragraph_ids == frozenset({current_paragraph, global_paragraph})
+        assert current_entity in scope.entity_ids
+        assert other_entity not in scope.entity_ids
+        assert current_relation in scope.relation_ids
+        assert other_relation not in scope.relation_ids
+        assert {row["hash"] for row in association_rows["relations"]} == {current_relation}
+        assert {row["entity_hash"] for row in association_rows["entities"]} == {current_entity}
+        association_queries = [
+            statement
+            for statement in statements
+            if any(table in statement for table in ("FROM relations", "FROM paragraph_entities", "FROM episode_paragraphs"))
+        ]
+        assert len(association_queries) == 3
+        assert all("json_each" in statement for statement in association_queries)
+    finally:
+        metadata_store.close()
 
 
 @pytest.mark.asyncio
@@ -411,7 +590,7 @@ async def test_search_memory_keeps_global_results_without_chat_id(tmp_path) -> N
     )
 
     assert [item["hash"] for item in payload["hits"]] == ["para-other", "rel-other"]
-    assert retriever.top_k_values == [2]
+    assert retriever.top_k_values == [30]
 
 
 def test_retrieval_type_filter_is_disabled_by_default() -> None:
