@@ -1,5 +1,5 @@
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List, NamedTuple
 
 from sqlalchemy import desc, func, or_
 from sqlmodel import col, select
@@ -18,6 +18,7 @@ DASHBOARD_STATISTICS_CACHE_VERSION = 2
 DEFAULT_DASHBOARD_CACHE_MAX_AGE_SECONDS = 20 * 60
 DEFAULT_DASHBOARD_CACHE_HOURS = (24, 168, 720)
 _SPARSE_TIME_SERIES_FIELDS = ("hourly_data", "daily_data")
+MODEL_USAGE_BATCH_SIZE = 1000
 
 
 async def get_dashboard_statistics(hours: int = 24, *, use_cache: bool = True) -> DashboardData:
@@ -429,36 +430,136 @@ def fetch_online_time_since(query_start_time: datetime) -> list[tuple[datetime, 
         return [(record.start_timestamp, record.end_timestamp) for record in records]
 
 
-def fetch_model_usage_since(query_start_time: datetime) -> list[dict[str, object]]:
-    """获取指定时间之后的 LLM 使用记录。"""
+def fetch_model_usage_since(
+    query_start_time: datetime,
+    batch_size: int = MODEL_USAGE_BATCH_SIZE,
+) -> Iterator[dict[str, object]]:
+    """分批获取指定时间之后的 LLM 使用记录，避免一次性物化全部明细。"""
+    if batch_size <= 0:
+        raise ValueError("batch_size 必须大于 0")
+
     with get_db_session(auto_commit=False) as session:
-        statement = select(ModelUsage).where(col(ModelUsage.timestamp) >= query_start_time)
-        records = session.exec(statement).all()
-        return [
-            {
-                "timestamp": record.timestamp,
-                "request_type": record.request_type,
-                "model_api_provider_name": record.model_api_provider_name,
-                "model_assign_name": record.model_assign_name,
-                "model_name": record.model_name,
-                "session_id": record.session_id,
-                "prompt_tokens": record.prompt_tokens,
-                "completion_tokens": record.completion_tokens,
-                "prompt_cache_enabled": bool(getattr(record, "prompt_cache_enabled", False)),
-                "prompt_cache_hit_tokens": getattr(record, "prompt_cache_hit_tokens", 0) or 0,
-                "prompt_cache_miss_tokens": getattr(record, "prompt_cache_miss_tokens", 0) or 0,
-                "cost": record.cost,
-                "time_cost": record.time_cost,
+        max_id = session.exec(
+            select(func.max(col(ModelUsage.id))).where(col(ModelUsage.timestamp) >= query_start_time)
+        ).first()
+    if not isinstance(max_id, int):
+        return
+
+    last_id = 0
+    while last_id < max_id:
+        with get_db_session(auto_commit=False) as session:
+            statement = (
+                select(
+                    col(ModelUsage.id),
+                    col(ModelUsage.timestamp),
+                    col(ModelUsage.request_type),
+                    col(ModelUsage.model_api_provider_name),
+                    col(ModelUsage.model_assign_name),
+                    col(ModelUsage.model_name),
+                    col(ModelUsage.session_id),
+                    col(ModelUsage.prompt_tokens),
+                    col(ModelUsage.completion_tokens),
+                    col(ModelUsage.prompt_cache_enabled),
+                    col(ModelUsage.prompt_cache_hit_tokens),
+                    col(ModelUsage.prompt_cache_miss_tokens),
+                    col(ModelUsage.cost),
+                    col(ModelUsage.time_cost),
+                )
+                .where(
+                    col(ModelUsage.timestamp) >= query_start_time,
+                    col(ModelUsage.id) > last_id,
+                    col(ModelUsage.id) <= max_id,
+                )
+                .order_by(col(ModelUsage.id))
+                .limit(batch_size)
+            )
+            records = session.exec(statement).all()
+        if not records:
+            return
+
+        for record in records:
+            yield {
+                "timestamp": record[1],
+                "request_type": record[2],
+                "model_api_provider_name": record[3],
+                "model_assign_name": record[4],
+                "model_name": record[5],
+                "session_id": record[6],
+                "prompt_tokens": record[7],
+                "completion_tokens": record[8],
+                "prompt_cache_enabled": record[9],
+                "prompt_cache_hit_tokens": record[10],
+                "prompt_cache_miss_tokens": record[11],
+                "cost": record[12],
+                "time_cost": record[13],
             }
-            for record in records
-        ]
+
+        last_id = int(records[-1][0])
 
 
-def fetch_messages_since(query_start_time: datetime) -> list[Messages]:
-    """获取指定时间之后的消息记录。"""
+def fetch_model_duration_aggregates_since(query_start_time: datetime) -> list[dict[str, object]]:
+    """在数据库内聚合指定时间之后的模型耗时统计。"""
     with get_db_session(auto_commit=False) as session:
-        statement = select(Messages).where(col(Messages.timestamp) >= query_start_time)
-        return list(session.exec(statement).all())
+        statement = (
+            select(
+                col(ModelUsage.request_type),
+                col(ModelUsage.model_api_provider_name),
+                col(ModelUsage.model_assign_name),
+                col(ModelUsage.model_name),
+                func.count().label("request_count"),
+                func.sum(col(ModelUsage.time_cost)).label("time_cost_sum"),
+                func.sum(col(ModelUsage.time_cost) * col(ModelUsage.time_cost)).label("time_cost_sq_sum"),
+            )
+            .where(
+                col(ModelUsage.timestamp) >= query_start_time,
+                col(ModelUsage.time_cost) > 0,
+            )
+            .group_by(
+                col(ModelUsage.request_type),
+                col(ModelUsage.model_api_provider_name),
+                col(ModelUsage.model_assign_name),
+                col(ModelUsage.model_name),
+            )
+        )
+        records = session.exec(statement).all()
+
+    return [
+        {
+            "request_type": record[0],
+            "model_api_provider_name": record[1],
+            "model_assign_name": record[2],
+            "model_name": record[3],
+            "count": int(record[4] or 0),
+            "sum": float(record[5] or 0.0),
+            "sum_sq": float(record[6] or 0.0),
+        }
+        for record in records
+    ]
+
+
+class StatisticsMessageRow(NamedTuple):
+    """统计使用的消息投影，避免加载原始消息和图片等大字段。"""
+
+    timestamp: datetime
+    platform: str
+    user_id: str
+    group_id: str | None
+    group_name: str | None
+    user_nickname: str | None
+
+
+def fetch_messages_since(query_start_time: datetime) -> List[StatisticsMessageRow]:
+    """获取指定时间之后的消息记录，仅保留统计实际使用的字段。"""
+    with get_db_session(auto_commit=False) as session:
+        statement = select(
+            col(Messages.timestamp),
+            col(Messages.platform),
+            col(Messages.user_id),
+            col(Messages.group_id),
+            col(Messages.group_name),
+            col(Messages.user_nickname),
+        ).where(col(Messages.timestamp) >= query_start_time)
+        return [StatisticsMessageRow(*row) for row in session.exec(statement).all()]
 
 
 def fetch_tool_records_since(query_start_time: datetime) -> list[ToolRecord]:

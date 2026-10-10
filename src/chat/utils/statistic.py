@@ -57,6 +57,12 @@ def fetch_model_usage_since(*args, **kwargs):
     return impl(*args, **kwargs)
 
 
+def fetch_model_duration_aggregates_since(*args, **kwargs):
+    from src.services.statistics_service import fetch_model_duration_aggregates_since as impl
+
+    return impl(*args, **kwargs)
+
+
 def fetch_online_time_since(*args, **kwargs):
     from src.services.statistics_service import fetch_online_time_since as impl
 
@@ -1032,11 +1038,9 @@ class StatisticOutputTask(AsyncTask):
             "module": defaultdict(lambda: {"count": 0.0, "sum": 0.0, "sum_sq": 0.0}),
         }
 
-        records = fetch_model_usage_since(self.all_time_start_time)
+        # 在 SQLite 内聚合，避免每轮为历史请求创建整份 Python 明细。
+        records = fetch_model_duration_aggregates_since(self.all_time_start_time)
         for record in records:
-            time_cost = cast(float | None, record["time_cost"]) or 0.0
-            if time_cost <= 0:
-                continue
 
             request_type = cast(str | None, record["request_type"]) or "unknown"
             user_id = cast(str | None, record["model_api_provider_name"]) or "unknown"
@@ -1051,9 +1055,9 @@ class StatisticOutputTask(AsyncTask):
                 ("module", module_name),
             ]:
                 item_stats = duration_stats[category][item_name]
-                item_stats["count"] += 1
-                item_stats["sum"] += time_cost
-                item_stats["sum_sq"] += time_cost * time_cost
+                item_stats["count"] += cast(int, record["count"])
+                item_stats["sum"] += cast(float, record["sum"])
+                item_stats["sum_sq"] += cast(float, record["sum_sq"])
 
         for category, avg_key, std_key in [
             ("type", AVG_TIME_COST_BY_TYPE, STD_TIME_COST_BY_TYPE),
